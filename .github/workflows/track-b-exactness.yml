@@ -1,5 +1,5 @@
 name: Track B exactness (one-shot)
-# Recheck promoted combined main.cpp, 2026-10-30.
+# Recheck promoted branchless ASCII token classifier, 2026-10-30.
 # Post-promotion parallel indexing and pthread Docker regression, October 30.
 on:
   push:
