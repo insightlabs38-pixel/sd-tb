@@ -1,5 +1,5 @@
 name: Track B parallel sanitizer qualification
-# Requalify promoted parallel AC and query engine, 2026-10-30.
+# Requalify promoted atomic work-stealing query scheduler, 2026-10-30.
 on:
   push:
     branches: [main]
