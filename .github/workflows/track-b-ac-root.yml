@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: track-b-ac-root
@@ -52,3 +53,16 @@ jobs:
               done
             done
           done
+      - name: Publish comparison status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then state=success; else state=failure; fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"$state\",\"context\":\"track-b/ac-root\",\"description\":\"AC root-transition comparison and full seed checks\",\"target_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
