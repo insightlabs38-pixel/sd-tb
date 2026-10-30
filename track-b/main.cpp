@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <charconv>
 #include <cstdint>
@@ -562,16 +563,20 @@ public:
         const size_t workers = queries.size() >= 1000
             ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
         vector<exception_ptr> errors(workers);
+        atomic<size_t> next_query{0};
         auto evaluate = [&](size_t worker) {
             try {
                 vector<uint32_t> work, tmp;
-                const size_t first = queries.size() * worker / workers;
-                const size_t last = queries.size() * (worker + 1) / workers;
-                for (size_t qi = first; qi < last; ++qi) {
+                for (;;) {
+                    const size_t first = next_query.fetch_add(64, memory_order_relaxed);
+                    if (first >= queries.size()) break;
+                    const size_t last = min(first + 64, queries.size());
+                    for (size_t qi = first; qi < last; ++qi) {
                     const Query &q = queries[qi];
                     results[qi] = precomputed_pattern[qi] >= 0
                         ? pattern_results[precomputed_pattern[qi]]
                         : (q.phrase ? run_phrase(q) : run_bool(q, work, tmp));
+                    }
                 }
             } catch (...) {
                 errors[worker] = current_exception();
