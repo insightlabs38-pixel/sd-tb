@@ -1,4 +1,4 @@
-name: Track B branchless ASCII comparison
+name: Track B branchless ASCII production-flags repeat
 on:
   push:
     branches: [main]
@@ -22,10 +22,10 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
-          g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/ascii-base
-          for variant in token both; do
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/ascii-base
+          for variant in token; do
             python3 experiments/branchless_ascii.py track-b/main.cpp "/tmp/ascii-$variant.cpp" "$variant"
-            g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra "/tmp/ascii-$variant.cpp" -o "/tmp/ascii-$variant"
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/ascii-$variant.cpp" -o "/tmp/ascii-$variant"
             python3 tests/differential.py "/tmp/ascii-$variant"
           done
       - name: Generate two full seeds and independent seed-2 reference
@@ -42,7 +42,7 @@ jobs:
           mkdir -p /tmp/ascii-out
           for seed in 1 2; do
             for repeat in 1 2 3; do
-              for variant in base token both; do
+              for variant in base token; do
                 echo "ASCII_COMPARE seed=$seed repeat=$repeat variant=$variant"
                 /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
                   "/tmp/ascii-$variant" --data "/tmp/ascii-data-$seed" --out /tmp/ascii-out
@@ -54,3 +54,16 @@ jobs:
               done
             done
           done
+      - name: Offline pinned Docker and unprivileged read-only-root sample
+        run: |
+          set -euo pipefail
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/ascii-sample
+          mkdir -p /tmp/ascii-docker /tmp/ascii-docker-out
+          cp track-b/Dockerfile /tmp/ascii-docker/Dockerfile
+          cp /tmp/ascii-token.cpp /tmp/ascii-docker/main.cpp
+          docker build --network=none -t sd-ascii-token:verify /tmp/ascii-docker
+          chmod 777 /tmp/ascii-docker-out
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/ascii-sample:/data:ro -v /tmp/ascii-docker-out:/out:rw \
+            sd-ascii-token:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/ascii-docker-out/results.txt' | sha256sum -c -
