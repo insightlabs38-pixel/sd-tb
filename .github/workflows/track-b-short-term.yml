@@ -19,6 +19,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Publish pending comparison run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"pending\",\"context\":\"track-b/short-term\",\"description\":\"Full-seed comparison running\",\"target_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
       - name: Prepare organizer reference and challenger
         run: |
           set -euo pipefail
