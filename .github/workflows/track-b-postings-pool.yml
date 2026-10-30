@@ -1,0 +1,71 @@
+name: Track B postings allocator comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-postings-pool.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-postings-pool
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and differential-test allocator challengers
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/pool-organizer
+          python3 -m py_compile experiments/pool_postings.py
+          for variant in pool monotonic; do
+            python3 experiments/pool_postings.py "$variant" track-b/main.cpp "/tmp/pool-$variant.cpp"
+          done
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/pool-base
+          for variant in pool monotonic; do
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/pool-$variant.cpp" -o "/tmp/pool-$variant"
+            python3 tests/differential.py "/tmp/pool-$variant"
+            echo "SOURCE_NONBLANK $variant $(grep -cv '^[[:space:]]*$' "/tmp/pool-$variant.cpp")"
+          done
+      - name: Generate two full seeds and independent oracle
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/pool-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/pool-data-$seed"
+          done
+          mkdir -p /tmp/pool-ref-2
+          python3 /tmp/pool-organizer/reference/b_index.py --data /tmp/pool-data-2 --out /tmp/pool-ref-2
+      - name: Three interleaved full-seed comparisons
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pool-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in base pool monotonic; do
+                echo "POOL_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/pool-$variant" --data "/tmp/pool-data-$seed" --out /tmp/pool-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/pool-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/pool-out/results.txt /tmp/pool-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Offline Docker and sanitizer exactness
+        run: |
+          set -euo pipefail
+          python3 /tmp/pool-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/pool-sample
+          for variant in pool monotonic; do
+            mkdir -p "/tmp/pool-docker-$variant" "/tmp/pool-out-$variant"
+            chmod 777 "/tmp/pool-out-$variant"
+            cp track-b/Dockerfile "/tmp/pool-docker-$variant/Dockerfile"
+            cp "/tmp/pool-$variant.cpp" "/tmp/pool-docker-$variant/main.cpp"
+            docker build --network=none -t "sd-pool-$variant:verify" "/tmp/pool-docker-$variant"
+            docker run --rm --user 65534:65534 --network=none --read-only \
+              -v /tmp/pool-sample:/data:ro -v "/tmp/pool-out-$variant:/out:rw" "sd-pool-$variant:verify"
+            echo "eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/pool-out-$variant/results.txt" | sha256sum -c -
+          done
