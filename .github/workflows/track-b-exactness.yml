@@ -1,5 +1,5 @@
 name: Track B exactness (one-shot)
-# Post-promotion AC root-transition regression, October 30.
+# Post-promotion parallel indexing and pthread Docker regression, October 30.
 on:
   push:
     branches: [main]
