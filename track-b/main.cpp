@@ -156,10 +156,20 @@ class Engine {
     vector<vector<uint32_t>> postings;
     vector<uint32_t> seen;
     vector<uint32_t> tape;
+    vector<uint16_t> tape16;
+    vector<uint32_t> phrase_token;
+    bool compact_tape = false;
     vector<uint32_t> offsets;
     vector<Query> queries;
     vector<int32_t> precomputed_pattern;
     vector<Result> pattern_results;
+
+    uint32_t tape_at(uint32_t i) const {
+        return compact_tape ? tape16[i] : tape[i];
+    }
+    uint32_t phrase_id(uint32_t term) const {
+        return compact_tape ? phrase_token[term] : term + 1;
+    }
 
     struct ACNode {
         unordered_map<uint32_t, uint32_t> edges;
@@ -193,7 +203,7 @@ class Engine {
             precomputed_pattern[qi] = static_cast<int32_t>(pid);
             uint32_t state = 0;
             for (uint32_t t : q.terms) {
-                const uint32_t tok = t + 1;
+                const uint32_t tok = phrase_id(t);
                 auto edge = nodes[state].edges.find(tok);
                 if (edge == nodes[state].edges.end()) {
                     uint32_t next = static_cast<uint32_t>(nodes.size());
@@ -238,7 +248,7 @@ class Engine {
                     const uint32_t doc = static_cast<uint32_t>(d);
                     uint32_t state = 0;
                     for (uint32_t i = offsets[doc]; i < offsets[doc + 1]; ++i) {
-                        uint32_t tok = tape[i];
+                        uint32_t tok = tape_at(i);
                         while (state) {
                             auto edge = nodes[state].edges.find(tok);
                             if (edge != nodes[state].edges.end()) {
@@ -326,9 +336,24 @@ class Engine {
         }
     }
 
+    void configure_tape() {
+        phrase_token.assign(postings.size(), 0);
+        uint32_t next = 0;
+        for (const Query &q : queries) {
+            if (!q.phrase) continue;
+            for (uint32_t term : q.terms)
+                if (!phrase_token[term]) phrase_token[term] = ++next;
+        }
+        compact_tape = next <= numeric_limits<uint16_t>::max();
+        fprintf(stderr, "PHRASE_TAPE16=%d PHRASE_TERMS=%u QUERY_TERMS=%zu\n",
+                int(compact_tape), next, postings.size());
+        if (!compact_tape) phrase_token.clear();
+    }
+
     void build_index(const MappedFile &input) {
         struct Chunk {
             vector<uint32_t> tape;
+            vector<uint16_t> tape16;
             vector<uint32_t> offsets;
             vector<vector<uint32_t>> postings;
             vector<uint32_t> seen;
@@ -354,10 +379,11 @@ class Engine {
                 c.postings.resize(postings.size());
                 c.seen.assign(postings.size(), numeric_limits<uint32_t>::max());
                 const char *p = bounds[idx], *stop = bounds[idx + 1];
-                c.tape.reserve(static_cast<size_t>(stop - p) / 7);
+                if (compact_tape) c.tape16.reserve(static_cast<size_t>(stop - p) / 7);
+                else c.tape.reserve(static_cast<size_t>(stop - p) / 7);
                 c.offsets.reserve(static_cast<size_t>(stop - p) / 500);
                 while (p < stop) {
-                    c.offsets.push_back(static_cast<uint32_t>(c.tape.size()));
+                    c.offsets.push_back(static_cast<uint32_t>(compact_tape ? c.tape16.size() : c.tape.size()));
                     const char *line_end = static_cast<const char *>(memchr(p, '\n', stop - p));
                     if (!line_end) line_end = stop;
                     const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
@@ -384,7 +410,9 @@ class Engine {
                         if (!hash) hash = 1;
                         uint32_t term = dictionary.lookup(string_view(start, s - start), hash);
                         uint32_t id = term == numeric_limits<uint32_t>::max() ? 0 : term + 1;
-                        c.tape.push_back(id);
+                        if (compact_tape)
+                            c.tape16.push_back(id ? static_cast<uint16_t>(phrase_token[id - 1]) : 0);
+                        else c.tape.push_back(id);
                         if (id && c.seen[id - 1] != doc) {
                             c.seen[id - 1] = doc;
                             c.postings[id - 1].push_back(doc);
@@ -392,7 +420,7 @@ class Engine {
                     }
                     p = line_end < stop ? line_end + 1 : stop;
                 }
-                c.offsets.push_back(static_cast<uint32_t>(c.tape.size()));
+                c.offsets.push_back(static_cast<uint32_t>(compact_tape ? c.tape16.size() : c.tape.size()));
             } catch (...) {
                 errors[idx] = current_exception();
             }
@@ -406,22 +434,24 @@ class Engine {
 
         size_t total_tokens = 0, total_docs = 0;
         for (const Chunk &c : chunks) {
-            total_tokens += c.tape.size();
+            total_tokens += compact_tape ? c.tape16.size() : c.tape.size();
             total_docs += c.docs;
         }
-        tape.reserve(total_tokens);
+        if (compact_tape) tape16.reserve(total_tokens);
+        else tape.reserve(total_tokens);
         offsets.reserve(total_docs + 1);
         uint32_t expected_doc = 0;
         for (const Chunk &c : chunks) {
             if (c.docs && c.first_doc != expected_doc)
                 throw runtime_error("nonconsecutive document chunks");
             expected_doc += static_cast<uint32_t>(c.docs);
-            const uint32_t base = static_cast<uint32_t>(tape.size());
+            const uint32_t base = static_cast<uint32_t>(compact_tape ? tape16.size() : tape.size());
             for (size_t j = 0; j < c.docs; ++j)
                 offsets.push_back(base + c.offsets[j]);
-            tape.insert(tape.end(), c.tape.begin(), c.tape.end());
+            if (compact_tape) tape16.insert(tape16.end(), c.tape16.begin(), c.tape16.end());
+            else tape.insert(tape.end(), c.tape.begin(), c.tape.end());
         }
-        offsets.push_back(static_cast<uint32_t>(tape.size()));
+        offsets.push_back(static_cast<uint32_t>(compact_tape ? tape16.size() : tape.size()));
         for (size_t term = 0; term < postings.size(); ++term) {
             size_t total = 0;
             for (const Chunk &c : chunks) total += c.postings[term].size();
@@ -438,12 +468,12 @@ class Engine {
         const uint32_t begin = offsets[doc], end = offsets[doc + 1];
         const size_t k = terms.size();
         if (end - begin < k) return false;
-        const uint32_t key = terms[anchor] + 1;
+        const uint32_t key = phrase_id(terms[anchor]);
         for (uint32_t i = begin + anchor; i + k - anchor <= end; ++i) {
-            if (tape[i] != key) continue;
+            if (tape_at(i) != key) continue;
             const uint32_t start = i - static_cast<uint32_t>(anchor);
             size_t j = 0;
-            while (j < k && tape[start + j] == terms[j] + 1) ++j;
+            while (j < k && tape_at(start + j) == phrase_id(terms[j])) ++j;
             if (j == k) return true;
         }
         return false;
@@ -560,6 +590,7 @@ public:
     void run(const string &data_dir, const string &out_dir) {
         MappedFile query_file(data_dir + "/queries.txt");
         parse_queries(query_file);
+        configure_tape();
         MappedFile docs_file(data_dir + "/docs.txt");
         build_index(docs_file);
         precompute_common_phrases();
