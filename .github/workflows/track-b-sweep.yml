@@ -1,0 +1,63 @@
+name: Track B architecture sweep (one-shot)
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-sweep.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get public generator and prepare full seed-1/2 datasets
+        run: |
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          for seed in 1 2; do
+            python3 /tmp/sd-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/sd-full-$seed"
+          done
+          mkdir -p /tmp/sd-reference-2
+          python3 /tmp/sd-organizer/reference/b_index.py --data /tmp/sd-full-2 --out /tmp/sd-reference-2
+          sha256sum /tmp/sd-reference-2/results.txt
+      - name: Compile six phrase-crossover variants
+        run: |
+          for threshold in 0 100 250 500 1000 1250; do
+            sed "s/const size_t threshold = 500;/const size_t threshold = $threshold;/" track-b/main.cpp > "/tmp/sd-variant-$threshold.cpp"
+            grep -q "const size_t threshold = $threshold;" "/tmp/sd-variant-$threshold.cpp"
+            g++ -std=c++20 -O3 -DNDEBUG "/tmp/sd-variant-$threshold.cpp" -o "/tmp/sd-variant-$threshold"
+          done
+      - name: Two-run exact full-scale comparison on each seed
+        run: |
+          mkdir -p /tmp/sd-variant-out
+          for seed in 1 2; do
+            for threshold in 0 100 250 500 1000 1250; do
+              for repeat in 1 2; do
+                echo "SWEEP seed=$seed threshold=$threshold repeat=$repeat"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/sd-variant-$threshold" --data "/tmp/sd-full-$seed" --out /tmp/sd-variant-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/sd-variant-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/sd-variant-out/results.txt /tmp/sd-reference-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Publish sweep status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then state=success; else state=failure; fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"$state\",\"context\":\"track-b/sweep\",\"description\":\"Six phrase crossovers on two full seeds\",\"target_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
