@@ -1,5 +1,5 @@
 name: Track B exactness (one-shot)
-# Recheck promoted branchless ASCII token classifier, 2026-10-30.
+# Recheck promoted dynamic query scheduling, 2026-10-30.
 # Post-promotion parallel indexing and pthread Docker regression, October 30.
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
       - name: Get published organizer generator
         run: git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
       - name: Compile candidate
-        run: g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic track-b/main.cpp -o /tmp/sd-track-b
+        run: g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra -pedantic track-b/main.cpp -o /tmp/sd-track-b
       - name: Differential oracle on seven deterministic seeds
         run: python3 tests/differential.py /tmp/sd-track-b
       - name: Generate sample and compare official hash
