@@ -107,7 +107,7 @@ class Engine {
     };
 
     void precompute_common_phrases() {
-        const size_t threshold = max<size_t>(1024, (offsets.size() - 1) / 200);
+        const size_t threshold = 500;
         precomputed_pattern.assign(queries.size(), -1);
         vector<ACNode> nodes(1);
         unordered_map<string, uint32_t> dedup;
