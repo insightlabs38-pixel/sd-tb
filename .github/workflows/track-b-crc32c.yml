@@ -1,0 +1,66 @@
+name: Track B CRC32C token fingerprint qualification
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-crc32c.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-crc32c
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, differential, and collision tests
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/crc-organizer
+          python3 experiments/crc32c_tokens.py track-b/main.cpp /tmp/crc-candidate.cpp
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/crc-baseline
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra /tmp/crc-candidate.cpp -o /tmp/crc-candidate
+          python3 tests/differential.py /tmp/crc-candidate
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer /tmp/crc-candidate.cpp -o /tmp/crc-asan
+          python3 /tmp/crc-organizer/generators/b_index.py --seed 1 --scale tiny --out /tmp/crc-tiny
+          mkdir -p /tmp/crc-asan-out
+          ASAN_OPTIONS=detect_leaks=1 /tmp/crc-asan --data /tmp/crc-tiny --out /tmp/crc-asan-out
+      - name: Generate independent full-seed oracle
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/crc-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/crc-data-$seed"
+          done
+          mkdir -p /tmp/crc-ref-2
+          python3 /tmp/crc-organizer/reference/b_index.py --data /tmp/crc-data-2 --out /tmp/crc-ref-2
+      - name: Interleaved three-pair full-seed timing and exactness
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/crc-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in baseline candidate; do
+                echo "CRC_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/crc-$variant" --data "/tmp/crc-data-$seed" --out /tmp/crc-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/crc-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/crc-out/results.txt /tmp/crc-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Pinned offline Docker, unprivileged and read-only root
+        run: |
+          set -euo pipefail
+          python3 /tmp/crc-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/crc-sample
+          mkdir -p /tmp/crc-docker /tmp/crc-docker-out
+          chmod 777 /tmp/crc-docker-out
+          cp track-b/Dockerfile /tmp/crc-docker/Dockerfile
+          cp /tmp/crc-candidate.cpp /tmp/crc-docker/main.cpp
+          docker build --network=none -t sd-crc32c:verify /tmp/crc-docker
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/crc-sample:/data:ro -v /tmp/crc-docker-out:/out:rw sd-crc32c:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/crc-docker-out/results.txt' | sha256sum -c -
