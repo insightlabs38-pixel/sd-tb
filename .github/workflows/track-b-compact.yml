@@ -1,0 +1,59 @@
+name: Track B compact hash challenger
+on:
+  push:
+    branches: [track-b/compact-hash-challenger]
+    paths: [.github/workflows/track-b-compact.yml]
+permissions:
+  contents: read
+  statuses: write
+concurrency:
+  group: track-b-compact
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compile champion and compact challenger
+        run: |
+          git show a65cf3ba886adbf11008de5c83d6cbb749354d62:track-b/main.cpp > /tmp/champion.cpp
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic /tmp/champion.cpp -o /tmp/champion
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic track-b/main.cpp -o /tmp/compact
+      - name: Differential and full-seed comparison
+        run: |
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          python3 tests/differential.py /tmp/compact
+          mkdir -p /tmp/out /tmp/ref2
+          for seed in 1 2; do
+            python3 /tmp/sd-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/sd-full-$seed"
+            if [ "$seed" = 2 ]; then
+              python3 /tmp/sd-organizer/reference/b_index.py --data "/tmp/sd-full-$seed" --out /tmp/ref2
+            fi
+            for repeat in 1 2; do
+              for candidate in champion compact; do
+                echo "BENCHMARK seed=$seed candidate=$candidate repeat=$repeat"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/$candidate" --data "/tmp/sd-full-$seed" --out /tmp/out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/ref2/results.txt /tmp/out/results.txt
+                fi
+              done
+            done
+          done
+      - name: Publish result
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then state=success; else state=failure; fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"$state\",\"context\":\"track-b/compact\",\"description\":\"32-bit dictionary two-full-seed oracle and timing\",\"target_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
