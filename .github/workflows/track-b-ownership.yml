@@ -1,0 +1,85 @@
+name: Track B zero-copy index ownership comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-ownership.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-ownership
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and differential-test zero-copy challengers
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/own-organizer
+          python3 experiments/move_postings.py track-b/main.cpp /tmp/own-move.cpp
+          python3 experiments/segmented_compact.py track-b/main.cpp /tmp/own-seg.cpp
+          python3 experiments/move_postings.py /tmp/own-seg.cpp /tmp/own-segmove.cpp
+          cp track-b/main.cpp /tmp/own-base.cpp
+          for variant in base move seg segmove; do
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra               "/tmp/own-$variant.cpp" -o "/tmp/own-$variant"
+          done
+          for variant in move seg segmove; do
+            python3 tests/differential.py "/tmp/own-$variant"
+          done
+      - name: Generate full seeds and independent reference
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/own-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/own-data-$seed"
+          done
+          mkdir -p /tmp/own-ref-2
+          python3 /tmp/own-organizer/reference/b_index.py --data /tmp/own-data-2 --out /tmp/own-ref-2
+      - name: Three interleaved full-seed comparisons
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/own-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in base move seg segmove; do
+                echo "OWN_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M'                   "/tmp/own-$variant" --data "/tmp/own-data-$seed" --out /tmp/own-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/own-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/own-out/results.txt /tmp/own-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Verify high-vocabulary 32-bit fallback
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/own-fallback/data /tmp/own-fallback/base /tmp/own-fallback/out
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('/tmp/own-fallback/data')
+          (root / 'docs.txt').write_text('0\ttok0 tok40000\n1\ttok1\n')
+          (root / 'queries.txt').write_text(''.join(
+              f'PHRASE "tok{i} tok{i+40000}"\n' for i in range(40000)))
+          PY
+          /tmp/own-base --data /tmp/own-fallback/data --out /tmp/own-fallback/base
+          for variant in move seg segmove; do
+            /tmp/own-$variant --data /tmp/own-fallback/data --out /tmp/own-fallback/out
+            cmp /tmp/own-fallback/base/results.txt /tmp/own-fallback/out/results.txt
+          done
+      - name: Offline Docker and unprivileged sample correctness
+        run: |
+          set -euo pipefail
+          python3 /tmp/own-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/own-sample
+          for variant in move seg segmove; do
+            mkdir -p "/tmp/own-docker-$variant" "/tmp/own-out-$variant"
+            chmod 777 "/tmp/own-out-$variant"
+            cp track-b/Dockerfile "/tmp/own-docker-$variant/Dockerfile"
+            cp "/tmp/own-$variant.cpp" "/tmp/own-docker-$variant/main.cpp"
+            docker build --network=none -t "sd-own-$variant:verify" "/tmp/own-docker-$variant"
+            docker run --rm --user 65534:65534 --network=none --read-only               -v /tmp/own-sample:/data:ro -v "/tmp/own-out-$variant:/out:rw" "sd-own-$variant:verify"
+            echo "eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/own-out-$variant/results.txt" | sha256sum -c -
+          done
