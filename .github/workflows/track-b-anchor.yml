@@ -5,6 +5,10 @@ on:
     paths: [.github/workflows/track-b-anchor.yml]
 permissions:
   contents: read
+  statuses: write
+concurrency:
+  group: track-b-anchor
+  cancel-in-progress: true
 jobs:
   compare:
     runs-on: ubuntu-24.04
@@ -36,3 +40,16 @@ jobs:
               echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/compare-out/results.txt' | sha256sum -c -
             done
           done
+      - name: Publish comparison result
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then state=success; else state=failure; fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"$state\",\"context\":\"track-b/anchor\",\"description\":\"Boolean anchor full-seed oracle and paired timing\",\"target_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
