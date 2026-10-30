@@ -1,0 +1,54 @@
+name: Track B rare-anchor phrase comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-phrase-anchor.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-b-phrase-anchor
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare phrase challenger and oracle
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          python3 experiments/phrase_anchor.py track-b/main.cpp /tmp/phrase-anchor.cpp
+          g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/phrase-base
+          g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra /tmp/phrase-anchor.cpp -o /tmp/phrase-anchor
+          python3 tests/differential.py /tmp/phrase-anchor
+      - name: Generate full datasets and seed-2 reference
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/sd-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/phrase-data-$seed"
+          done
+          mkdir -p /tmp/phrase-reference-2
+          python3 /tmp/sd-organizer/reference/b_index.py --data /tmp/phrase-data-2 --out /tmp/phrase-reference-2
+      - name: Compare exact full runs
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/phrase-output
+          for seed in 1 2; do
+            for repeat in 1 2; do
+              for variant in base anchor; do
+                echo "PHRASE_ANCHOR_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/phrase-$variant" --data "/tmp/phrase-data-$seed" --out /tmp/phrase-output
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/phrase-output/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/phrase-output/results.txt /tmp/phrase-reference-2/results.txt
+                fi
+              done
+            done
+          done
