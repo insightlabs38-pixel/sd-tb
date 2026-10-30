@@ -1,0 +1,62 @@
+name: Track B full-seed phase and vocabulary profile
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-profile.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-b-profile
+  cancel-in-progress: true
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build instrumented champion and generate full inputs
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/profile-organizer
+          python3 experiments/profile_phases.py track-b/main.cpp /tmp/profile-b.cpp
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread /tmp/profile-b.cpp -o /tmp/profile-b
+          for seed in 1 2; do
+            python3 /tmp/profile-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/profile-data-$seed"
+          done
+      - name: Count exact query vocabulary and input distributions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          for seed in (1, 2):
+              terms = set()
+              n_bool = n_phrase = 0
+              for line in Path(f"/tmp/profile-data-{seed}/queries.txt").read_text().splitlines():
+                  if line.startswith("BOOL "):
+                      terms.update(line[5:].split(" ")[::2])
+                      n_bool += 1
+                  elif line.startswith('PHRASE "'):
+                      terms.update(line[8:-1].split(" "))
+                      n_phrase += 1
+                  else:
+                      raise ValueError("invalid query")
+              print(f"QUERY_CENSUS seed={seed} unique_terms={len(terms)} bool={n_bool} phrase={n_phrase} uint16_fit={len(terms)<65535}")
+          PY
+      - name: Full-seed phase timing and exactness
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/profile-out
+          for seed in 1 2; do
+            for repeat in 1 2; do
+              echo "PROFILE_RUN seed=$seed repeat=$repeat"
+              /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                /tmp/profile-b --data "/tmp/profile-data-$seed" --out /tmp/profile-out
+              if [ "$seed" = 1 ]; then
+                echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/profile-out/results.txt' | sha256sum -c -
+              fi
+            done
+          done
