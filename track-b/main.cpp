@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <queue>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -96,6 +97,88 @@ class Engine {
     vector<uint32_t> tape;
     vector<uint32_t> offsets;
     vector<Query> queries;
+    vector<int32_t> precomputed_pattern;
+    vector<Result> pattern_results;
+
+    struct ACNode {
+        unordered_map<uint32_t, uint32_t> edges;
+        uint32_t fail = 0;
+        vector<uint32_t> outputs;
+    };
+
+    void precompute_common_phrases() {
+        const size_t threshold = max<size_t>(1024, (offsets.size() - 1) / 200);
+        precomputed_pattern.assign(queries.size(), -1);
+        vector<ACNode> nodes(1);
+        unordered_map<string, uint32_t> dedup;
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            const Query &q = queries[qi];
+            if (!q.phrase) continue;
+            size_t least = numeric_limits<size_t>::max();
+            for (uint32_t t : q.terms) least = min(least, postings[t].size());
+            if (least < threshold) continue;
+            string key;
+            key.reserve(q.terms.size() * sizeof(uint32_t));
+            for (uint32_t t : q.terms)
+                key.append(reinterpret_cast<const char *>(&t), sizeof(t));
+            auto it = dedup.find(key);
+            if (it != dedup.end()) {
+                precomputed_pattern[qi] = static_cast<int32_t>(it->second);
+                continue;
+            }
+            uint32_t pid = static_cast<uint32_t>(pattern_results.size());
+            dedup.emplace(move(key), pid);
+            pattern_results.emplace_back();
+            precomputed_pattern[qi] = static_cast<int32_t>(pid);
+            uint32_t state = 0;
+            for (uint32_t t : q.terms) {
+                const uint32_t tok = t + 1;
+                auto edge = nodes[state].edges.find(tok);
+                if (edge == nodes[state].edges.end()) {
+                    uint32_t next = static_cast<uint32_t>(nodes.size());
+                    nodes[state].edges.emplace(tok, next);
+                    nodes.emplace_back();
+                    state = next;
+                } else state = edge->second;
+            }
+            nodes[state].outputs.push_back(pid);
+        }
+        if (pattern_results.empty()) return;
+        queue<uint32_t> bfs;
+        for (const auto &[tok, next] : nodes[0].edges) {
+            nodes[next].fail = 0;
+            bfs.push(next);
+        }
+        while (!bfs.empty()) {
+            uint32_t state = bfs.front(); bfs.pop();
+            for (const auto &[tok, next] : nodes[state].edges) {
+                uint32_t f = nodes[state].fail;
+                while (f && !nodes[f].edges.contains(tok)) f = nodes[f].fail;
+                auto it = nodes[f].edges.find(tok);
+                nodes[next].fail = it == nodes[f].edges.end() ? 0 : it->second;
+                const auto &suffix = nodes[nodes[next].fail].outputs;
+                nodes[next].outputs.insert(nodes[next].outputs.end(), suffix.begin(), suffix.end());
+                bfs.push(next);
+            }
+        }
+        vector<uint32_t> last(pattern_results.size(), numeric_limits<uint32_t>::max());
+        for (uint32_t doc = 0; doc + 1 < offsets.size(); ++doc) {
+            uint32_t state = 0;
+            for (uint32_t i = offsets[doc]; i < offsets[doc + 1]; ++i) {
+                uint32_t tok = tape[i];
+                while (state && !nodes[state].edges.contains(tok)) state = nodes[state].fail;
+                auto edge = nodes[state].edges.find(tok);
+                state = edge == nodes[state].edges.end() ? 0 : edge->second;
+                for (uint32_t pid : nodes[state].outputs) {
+                    if (last[pid] != doc) {
+                        last[pid] = doc;
+                        pattern_results[pid].add(doc);
+                    }
+                }
+            }
+        }
+    }
+
 
     uint32_t intern(string_view word) {
         auto it = dictionary.find(word);
@@ -251,12 +334,16 @@ public:
         parse_queries(query_file);
         MappedFile docs_file(data_dir + "/docs.txt");
         build_index(docs_file);
+        precompute_common_phrases();
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
         if (!output) throw runtime_error("cannot open output");
         vector<uint32_t> work, tmp;
-        for (const Query &q : queries) {
-            Result r = q.phrase ? run_phrase(q) : run_bool(q, work, tmp);
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            const Query &q = queries[qi];
+            Result r = precomputed_pattern[qi] >= 0
+                ? pattern_results[precomputed_pattern[qi]]
+                : (q.phrase ? run_phrase(q) : run_bool(q, work, tmp));
             r.print(output);
         }
         if (!output) throw runtime_error("output write failure");
