@@ -1,4 +1,4 @@
-name: Track B fingerprint-filter comparison
+name: Track B filter and token-equality independent repeat
 on:
   push:
     branches: [experiment/bloom-lookup]
@@ -18,14 +18,16 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Compile and differential-test the two candidates
+      - name: Compile and differential-test filter and branchless equality
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/bloom-organizer
           g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/bloom-base
-          python3 -m py_compile experiments/bloom_lookup.py
-          for variant in one two; do
-            python3 experiments/bloom_lookup.py track-b/main.cpp "/tmp/bloom-$variant.cpp" "$variant"
+          python3 -m py_compile experiments/bloom_lookup.py experiments/fold_equal.py
+          python3 experiments/bloom_lookup.py track-b/main.cpp /tmp/bloom-two.cpp two
+          python3 experiments/fold_equal.py track-b/main.cpp /tmp/bloom-fold.cpp
+          python3 experiments/fold_equal.py /tmp/bloom-two.cpp /tmp/bloom-twofold.cpp
+          for variant in two fold twofold; do
             g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/bloom-$variant.cpp" -o "/tmp/bloom-$variant"
             python3 tests/differential.py "/tmp/bloom-$variant"
           done
@@ -43,7 +45,7 @@ jobs:
           mkdir -p /tmp/bloom-out
           for seed in 1 2; do
             for repeat in 1 2 3; do
-              for variant in base one two; do
+              for variant in base two fold twofold; do
                 echo "BLOOM_COMPARE seed=$seed repeat=$repeat variant=$variant"
                 /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
                   "/tmp/bloom-$variant" --data "/tmp/bloom-data-$seed" --out /tmp/bloom-out
@@ -55,14 +57,14 @@ jobs:
               done
             done
           done
-      - name: Pinned offline Docker smoke test for two-probe candidate
+      - name: Pinned offline Docker smoke test for combined challenger
         run: |
           set -euo pipefail
           python3 /tmp/bloom-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/bloom-sample
           mkdir -p /tmp/bloom-docker /tmp/bloom-docker-out
           chmod 777 /tmp/bloom-docker-out
           cp track-b/Dockerfile /tmp/bloom-docker/Dockerfile
-          cp /tmp/bloom-two.cpp /tmp/bloom-docker/main.cpp
+          cp /tmp/bloom-twofold.cpp /tmp/bloom-docker/main.cpp
           docker build --network=none -t sd-bloom:verify /tmp/bloom-docker
           docker run --rm --user 65534:65534 --network=none --read-only \
             -v /tmp/bloom-sample:/data:ro -v /tmp/bloom-docker-out:/out:rw \
