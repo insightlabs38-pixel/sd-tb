@@ -1,0 +1,70 @@
+name: Track B fused token hash comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-fused-hash.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-b-fused-hash
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile baseline and two independently testable challengers
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/fh-organizer
+          python3 -m py_compile experiments/fused_hash.py
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/fh-base
+          for variant in fold or; do
+            python3 experiments/fused_hash.py track-b/main.cpp "/tmp/fh-$variant.cpp" "$variant"
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/fh-$variant.cpp" -o "/tmp/fh-$variant"
+            python3 tests/differential.py "/tmp/fh-$variant"
+          done
+      - name: Generate two full seeds and independent seed-2 oracle
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/fh-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/fh-data-$seed"
+          done
+          mkdir -p /tmp/fh-ref-2
+          python3 /tmp/fh-organizer/reference/b_index.py --data /tmp/fh-data-2 --out /tmp/fh-ref-2
+      - name: Interleaved full-seed exactness and timing
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fh-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in base fold or; do
+                echo "FH_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/fh-$variant" --data "/tmp/fh-data-$seed" --out /tmp/fh-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/fh-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/fh-out/results.txt /tmp/fh-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Offline Docker sample and unprivileged runtime
+        run: |
+          set -euo pipefail
+          python3 /tmp/fh-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/fh-sample
+          mkdir -p /tmp/fh-docker /tmp/fh-docker-out
+          chmod 777 /tmp/fh-docker-out
+          cp track-b/Dockerfile /tmp/fh-docker/Dockerfile
+          cp /tmp/fh-or.cpp /tmp/fh-docker/main.cpp
+          docker build --network=none -t sd-fh-or:verify /tmp/fh-docker
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/fh-sample:/data:ro -v /tmp/fh-docker-out:/out:rw \
+            sd-fh-or:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/fh-docker-out/results.txt' | sha256sum -c -
