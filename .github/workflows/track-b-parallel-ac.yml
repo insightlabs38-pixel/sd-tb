@@ -1,4 +1,5 @@
 name: Track B parallel-AC comparison
+# Post-parallel-query targeted AC-scan comparison, 2026-10-30.
 on:
   push:
     branches: [main]
