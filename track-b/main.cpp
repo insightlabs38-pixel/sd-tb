@@ -69,6 +69,68 @@ struct FoldEqual {
     }
 };
 
+class FlatDictionary {
+    struct Slot {
+        uint64_t hash = 0;
+        uint32_t id = 0;
+    };
+    vector<Slot> slots;
+    vector<string_view> keys;
+
+    static uint64_t fingerprint(string_view word) {
+        uint64_t hash = static_cast<uint64_t>(FoldHash{}(word));
+        return hash ? hash : 1;
+    }
+    void rehash(size_t capacity) {
+        vector<Slot> fresh(capacity);
+        for (const Slot &slot : slots) {
+            if (!slot.hash) continue;
+            size_t i = slot.hash & (capacity - 1);
+            while (fresh[i].hash) i = (i + 1) & (capacity - 1);
+            fresh[i] = slot;
+        }
+        slots.swap(fresh);
+    }
+public:
+    void reserve(size_t count) {
+        keys.reserve(count);
+        size_t capacity = 16;
+        while (capacity < count * 2) capacity *= 2;
+        rehash(capacity);
+    }
+    pair<uint32_t, bool> intern(string_view word) {
+        if (slots.empty()) rehash(16);
+        if ((keys.size() + 1) * 10 >= slots.size() * 7)
+            rehash(slots.size() * 2);
+        const uint64_t hash = fingerprint(word);
+        size_t i = hash & (slots.size() - 1);
+        for (;;) {
+            Slot &slot = slots[i];
+            if (!slot.hash) {
+                uint32_t id = static_cast<uint32_t>(keys.size());
+                keys.push_back(word);
+                slot = {hash, id};
+                return {id, true};
+            }
+            if (slot.hash == hash && FoldEqual{}(keys[slot.id], word))
+                return {slot.id, false};
+            i = (i + 1) & (slots.size() - 1);
+        }
+    }
+    uint32_t lookup(string_view word) const {
+        if (slots.empty()) return numeric_limits<uint32_t>::max();
+        const uint64_t hash = fingerprint(word);
+        size_t i = hash & (slots.size() - 1);
+        for (;;) {
+            const Slot &slot = slots[i];
+            if (!slot.hash) return numeric_limits<uint32_t>::max();
+            if (slot.hash == hash && FoldEqual{}(keys[slot.id], word))
+                return slot.id;
+            i = (i + 1) & (slots.size() - 1);
+        }
+    }
+};
+
 struct Query {
     bool phrase = false;
     vector<uint32_t> terms;
@@ -91,7 +153,7 @@ struct Result {
 };
 
 class Engine {
-    unordered_map<string_view, uint32_t, FoldHash, FoldEqual> dictionary;
+    FlatDictionary dictionary;
     vector<vector<uint32_t>> postings;
     vector<uint32_t> seen;
     vector<uint32_t> tape;
@@ -181,12 +243,11 @@ class Engine {
 
 
     uint32_t intern(string_view word) {
-        auto it = dictionary.find(word);
-        if (it != dictionary.end()) return it->second;
-        uint32_t id = static_cast<uint32_t>(postings.size());
-        dictionary.emplace(word, id);
-        postings.emplace_back();
-        seen.push_back(numeric_limits<uint32_t>::max());
+        auto [id, fresh] = dictionary.intern(word);
+        if (fresh) {
+            postings.emplace_back();
+            seen.push_back(numeric_limits<uint32_t>::max());
+        }
         return id;
     }
 
@@ -247,8 +308,8 @@ class Engine {
                 if (s == line_end) break;
                 const char *start = s;
                 do { ++s; } while (s < line_end && token_char(static_cast<unsigned char>(*s)));
-                auto it = dictionary.find(string_view(start, s - start));
-                uint32_t id = it == dictionary.end() ? 0 : it->second + 1;
+                uint32_t term = dictionary.lookup(string_view(start, s - start));
+                uint32_t id = term == numeric_limits<uint32_t>::max() ? 0 : term + 1;
                 tape.push_back(id);
                 if (id && seen[id - 1] != doc) {
                     seen[id - 1] = doc;
