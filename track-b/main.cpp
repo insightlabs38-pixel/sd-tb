@@ -71,14 +71,18 @@ struct FoldEqual {
 
 class FlatDictionary {
     struct Slot {
-        uint64_t hash = 0;
+        uint32_t hash = 0;
         uint32_t id = 0;
     };
     vector<Slot> slots;
     vector<string_view> keys;
 
-    static uint64_t fingerprint(string_view word) {
-        uint64_t hash = static_cast<uint64_t>(FoldHash{}(word));
+    static uint32_t fingerprint(string_view word) {
+        uint32_t hash = 2166136261u;
+        for (unsigned char c : word) {
+            hash ^= lower_ascii(c);
+            hash *= 16777619u;
+        }
         return hash ? hash : 1;
     }
     void rehash(size_t capacity) {
@@ -102,7 +106,7 @@ public:
         if (slots.empty()) rehash(16);
         if ((keys.size() + 1) * 10 >= slots.size() * 7)
             rehash(slots.size() * 2);
-        const uint64_t hash = fingerprint(word);
+        const uint32_t hash = fingerprint(word);
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             Slot &slot = slots[i];
@@ -119,7 +123,7 @@ public:
     }
     uint32_t lookup(string_view word) const {
         if (slots.empty()) return numeric_limits<uint32_t>::max();
-        const uint64_t hash = fingerprint(word);
+        const uint32_t hash = fingerprint(word);
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             const Slot &slot = slots[i];
