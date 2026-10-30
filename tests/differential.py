@@ -84,6 +84,18 @@ def test(binary):
     assert oracle(docs, queries) == expected
     assert run(binary, docs, queries) == expected
     print("Organizer worked example: PASS")
+    # Distinct query tokens with identical 32-bit FNV-1a fingerprints.
+    # The index must compare the actual bytes, not only the fingerprint.
+    collision_docs = [b"petzsquj", b"elwueqcv",
+                      b"petzsquj elwueqcv", b"PETZSQUJ", b"ELWUEQCV"]
+    collision_queries = [b"BOOL petzsquj", b"BOOL elwueqcv",
+                         b"BOOL petzsquj AND elwueqcv",
+                         b"BOOL petzsquj NOT elwueqcv",
+                         b'PHRASE "petzsquj elwueqcv"',
+                         b'PHRASE "elwueqcv petzsquj"']
+    assert run(binary, collision_docs, collision_queries) == oracle(
+        collision_docs, collision_queries), "fingerprint collision mismatch"
+    print("Fingerprint collision: PASS")
     vocab = [b"the", b"of", b"and", b"or", b"not", b"bail", b"bond",
              b"007", b"7", b"z", b"rich", b"s", b"habeas", b"corpus", b"absent"]
     separators = [b" ", b". ", b"-", b"/", b"'", b"\xe2\x80\x94", b"\xc2\xa0"]
