@@ -3,7 +3,7 @@
 from pathlib import Path
 import sys
 
-if len(sys.argv) != 4 or sys.argv[3] not in ("packed", "dynamic", "combined"):
+if len(sys.argv) != 4 or sys.argv[3] not in ("packed", "dynamic", "combined", "dynamic16", "dynamic256"):
     raise SystemExit("usage: tape_query.py SOURCE OUTPUT packed|dynamic|combined")
 src = Path(sys.argv[1]).read_text()
 variant = sys.argv[3]
@@ -33,7 +33,7 @@ if variant in ("packed", "combined"):
          "            for (uint32_t tok : c.tape)\n"
          "                tape.push_back({static_cast<uint8_t>(tok), static_cast<uint8_t>(tok >> 8), static_cast<uint8_t>(tok >> 16)});")
 
-if variant in ("dynamic", "combined"):
+if variant in ("dynamic", "combined", "dynamic16", "dynamic256"):
     swap("#include <algorithm>\n", "#include <algorithm>\n#include <atomic>\n")
     swap("        vector<exception_ptr> errors(workers);\n        auto evaluate = [&](size_t worker) {",
          "        vector<exception_ptr> errors(workers);\n"
@@ -51,5 +51,12 @@ if variant in ("dynamic", "combined"):
          "                }\n            } catch",
          "                        : (q.phrase ? run_phrase(q) : run_bool(q, work, tmp));\n"
          "                    }\n                }\n            } catch")
+
+if variant in ("dynamic16", "dynamic256"):
+    batch = 16 if variant == "dynamic16" else 256
+    swap("next_query.fetch_add(64, memory_order_relaxed)",
+         f"next_query.fetch_add({batch}, memory_order_relaxed)")
+    swap("min(first + 64, queries.size())",
+         f"min(first + {batch}, queries.size())")
 
 Path(sys.argv[2]).write_text(src)
