@@ -1,0 +1,29 @@
+name: Track B exactness (one-shot)
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-exactness.yml]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get published organizer generator
+        run: git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+      - name: Compile candidate
+        run: g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic track-b/main.cpp -o /tmp/sd-track-b
+      - name: Generate sample and compare official hash
+        run: |
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/sd-sample
+          mkdir -p /tmp/sd-sample-out
+          /usr/bin/time -v /tmp/sd-track-b --data /tmp/sd-sample --out /tmp/sd-sample-out
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/sd-sample-out/results.txt' | sha256sum -c -
+      - name: Generate full and compare official hash
+        run: |
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale full --out /tmp/sd-full
+          mkdir -p /tmp/sd-full-out
+          /usr/bin/time -v /tmp/sd-track-b --data /tmp/sd-full --out /tmp/sd-full-out
+          echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/sd-full-out/results.txt' | sha256sum -c -
