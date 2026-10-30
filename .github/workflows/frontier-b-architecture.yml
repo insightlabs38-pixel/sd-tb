@@ -63,11 +63,11 @@ jobs:
             else
               expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1)
             fi
-            python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --results /tmp/evidence/measurements.jsonl frontier:official frontier:development frontier:candidate
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --results /tmp/evidence/measurements.jsonl frontier:official frontier:development frontier:candidate
           done
-          python3 experiments/frontier/compare.py --data /tmp/sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl frontier:candidate
+          sudo python3 experiments/frontier/compare.py --data /tmp/sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl frontier:candidate
           expected=$(sha256sum /tmp/ref-tiny/results.txt | cut -d' ' -f1)
-          python3 experiments/frontier/compare.py --data /tmp/tiny --expected "$expected" --timer /tmp/bin/sd-timer --seed 7 --repeat 1 --results /tmp/evidence/tiny.jsonl frontier:candidate
+          sudo python3 experiments/frontier/compare.py --data /tmp/tiny --expected "$expected" --timer /tmp/bin/sd-timer --seed 7 --repeat 1 --results /tmp/evidence/tiny.jsonl frontier:candidate
       - name: Canonical source and dependency axes
         run: |
           set -euo pipefail

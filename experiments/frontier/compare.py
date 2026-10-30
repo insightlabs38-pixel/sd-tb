@@ -17,6 +17,8 @@ p.add_argument("--seed", type=int, required=True)
 p.add_argument("--repeat", type=int, default=3)
 p.add_argument("images", nargs="+")
 a = p.parse_args()
+if os.geteuid() != 0:
+    p.error("Run with sudo so the protected timing directory is owned by container root")
 for path in a.data.iterdir():
     with path.open("rb") as f:
         while f.read(8 << 20):
