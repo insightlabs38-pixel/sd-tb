@@ -50,8 +50,8 @@ static inline unsigned char lower_ascii(unsigned char c) {
     return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + 32) : c;
 }
 static inline bool token_char(unsigned char c) {
-    c = lower_ascii(c);
-    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    const unsigned folded = static_cast<unsigned>(c | 0x20u);
+    return ((folded - 'a') < 26u) | ((static_cast<unsigned>(c) - '0') < 10u);
 }
 struct FoldEqual {
     using is_transparent = void;
