@@ -1,0 +1,38 @@
+name: Track B Boolean-anchor challenger
+on:
+  push:
+    branches: [track-b/and-anchor-challenger]
+    paths: [.github/workflows/track-b-anchor.yml]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile frozen champion and challenger
+        run: |
+          git show 19da998cde1d9378e694e617657efe091be6e43a:track-b/main.cpp > /tmp/baseline.cpp
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic /tmp/baseline.cpp -o /tmp/baseline
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic track-b/main.cpp -o /tmp/challenger
+      - name: Differential and sample holdout oracle
+        run: |
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          python3 tests/differential.py /tmp/challenger
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 2 --scale sample --out /tmp/sd-sample-2
+          mkdir -p /tmp/holdout-reference /tmp/holdout-challenger
+          python3 /tmp/sd-organizer/reference/b_index.py --data /tmp/sd-sample-2 --out /tmp/holdout-reference
+          /tmp/challenger --data /tmp/sd-sample-2 --out /tmp/holdout-challenger
+          cmp /tmp/holdout-reference/results.txt /tmp/holdout-challenger/results.txt
+      - name: Full seed-1 baseline/challenger exactness and time
+        run: |
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale full --out /tmp/sd-full
+          mkdir -p /tmp/compare-out
+          for repeat in 1 2 3; do
+            for candidate in baseline challenger; do
+              echo "BENCHMARK candidate=$candidate repeat=$repeat"
+              /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/$candidate" --data /tmp/sd-full --out /tmp/compare-out
+              echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/compare-out/results.txt' | sha256sum -c -
+            done
+          done
