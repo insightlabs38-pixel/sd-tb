@@ -352,6 +352,49 @@ class Engine {
             for (uint32_t id : initial) r.add(id);
             return r;
         }
+        // A final AND/NOT suffix can only remove documents from its AND terms.
+        size_t last_or = q.ops.size();
+        for (size_t i = 0; i < q.ops.size(); ++i)
+            if (q.ops[i] == 'O') last_or = i;
+        size_t anchor = last_or == q.ops.size() ? 0 : q.terms.size();
+        for (size_t i = 0; i < q.ops.size(); ++i) {
+            if (q.ops[i] != 'A' || (last_or != q.ops.size() && i <= last_or))
+                continue;
+            if (anchor == q.terms.size() ||
+                postings[q.terms[i + 1]].size() < postings[q.terms[anchor]].size())
+                anchor = i + 1;
+        }
+        if (anchor != q.terms.size()) {
+            const auto &candidates = postings[q.terms[anchor]];
+            uint64_t merge_work = initial.size();
+            for (size_t i = 1; i < q.terms.size(); ++i)
+                merge_work += postings[q.terms[i]].size();
+            if (candidates.empty() ||
+                (candidates.size() <= 8192 &&
+                 candidates.size() * (q.terms.size() * 12) < merge_work)) {
+                Result result;
+                for (uint32_t doc : candidates) {
+                    bool match = anchor == 0 ||
+                        binary_search(initial.begin(), initial.end(), doc);
+                    if (!match && last_or == q.ops.size()) continue;
+                    for (size_t step = 0; step < q.ops.size(); ++step) {
+                        const auto &rhs = postings[q.terms[step + 1]];
+                        bool present = step + 1 == anchor ||
+                            binary_search(rhs.begin(), rhs.end(), doc);
+                        switch (q.ops[step]) {
+                            case 'A': match = match && present; break;
+                            case 'O': match = match || present; break;
+                            case 'N': match = match && !present; break;
+                            default: throw runtime_error("invalid boolean operator");
+                        }
+                        if (!match && (last_or == q.ops.size() || step >= last_or))
+                            break;
+                    }
+                    if (match) result.add(doc);
+                }
+                return result;
+            }
+        }
         work.assign(initial.begin(), initial.end());
         for (size_t step = 0; step < q.ops.size(); ++step) {
             const vector<uint32_t> &rhs = postings[q.terms[step + 1]];
