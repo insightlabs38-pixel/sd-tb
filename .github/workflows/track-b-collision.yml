@@ -1,0 +1,47 @@
+name: Track B compact dictionary collision and Docker gate
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-collision.yml]
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile optimized and sanitized binaries
+        run: |
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -pedantic track-b/main.cpp -o /tmp/fast
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer track-b/main.cpp -o /tmp/sanitized
+      - name: Exact differential and deliberate FNV32 collision
+        run: |
+          python3 tests/differential.py /tmp/fast
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/differential.py /tmp/sanitized
+      - name: Official sample hash and offline Docker
+        run: |
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/sd-sample
+          mkdir -p /tmp/out /tmp/docker-out
+          /tmp/fast --data /tmp/sd-sample --out /tmp/out
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/out/results.txt' | sha256sum -c -
+          docker build --network=none -t sd-b-compact:verify ./track-b
+          chmod 777 /tmp/docker-out
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/sd-sample:/data:ro -v /tmp/docker-out:/out:rw sd-b-compact:verify
+          cmp /tmp/out/results.txt /tmp/docker-out/results.txt
+      - name: Publish result
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then state=success; else state=failure; fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"$state\",\"context\":\"track-b/collision\",\"description\":\"FNV32 collision, sanitizers, official sample, offline Docker\",\"target_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
