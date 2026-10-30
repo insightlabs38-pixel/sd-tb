@@ -1,0 +1,72 @@
+name: Track B packed tape and balanced query comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-tape-query.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-b-tape-query
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare isolated challengers and differential oracle
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/tq-organizer
+          python3 -m py_compile experiments/tape_query.py
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/tq-base
+          for variant in packed dynamic combined; do
+            python3 experiments/tape_query.py track-b/main.cpp "/tmp/tq-$variant.cpp" "$variant"
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/tq-$variant.cpp" -o "/tmp/tq-$variant"
+            python3 tests/differential.py "/tmp/tq-$variant"
+          done
+      - name: Generate two full seeds and independent reference
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/tq-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/tq-data-$seed"
+          done
+          mkdir -p /tmp/tq-ref-2
+          python3 /tmp/tq-organizer/reference/b_index.py --data /tmp/tq-data-2 --out /tmp/tq-ref-2
+      - name: Interleaved full-seed exactness and timing
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tq-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in base packed dynamic combined; do
+                echo "TQ_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/tq-$variant" --data "/tmp/tq-data-$seed" --out /tmp/tq-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/tq-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/tq-out/results.txt /tmp/tq-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Offline Docker and unprivileged sample for packed variants
+        run: |
+          set -euo pipefail
+          python3 /tmp/tq-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/tq-sample
+          mkdir -p /tmp/tq-docker /tmp/tq-docker-out
+          cp track-b/Dockerfile /tmp/tq-docker/Dockerfile
+          chmod 777 /tmp/tq-docker-out
+          for variant in packed combined; do
+            cp "/tmp/tq-$variant.cpp" /tmp/tq-docker/main.cpp
+            docker build --network=none -t "sd-tq-$variant:verify" /tmp/tq-docker
+            docker run --rm --user 65534:65534 --network=none --read-only \
+              -v /tmp/tq-sample:/data:ro -v /tmp/tq-docker-out:/out:rw \
+              "sd-tq-$variant:verify"
+            echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/tq-docker-out/results.txt' | sha256sum -c -
+          done
