@@ -110,6 +110,21 @@ def test(binary):
         want = oracle(docs, queries)
         assert got == want, f"seed {seed}: byte mismatch"
         print(f"seed {seed}: PASS")
+    # Exercise the high-frequency automaton path, including duplicate and suffix patterns.
+    rng = random.Random(734)
+    common = [b"the", b"of", b"and", b"not", b"bail", b"bond", b"a", b"x"]
+    docs = []
+    for _ in range(1200):
+        words = [rng.choice(common[:5] if rng.random() < .8 else common)
+                 for _ in range(rng.randint(20, 110))]
+        docs.append(b" ".join(words))
+    queries = [b'PHRASE "' + b" ".join(rng.choices(common, k=rng.randint(2, 6))) + b'"'
+               for _ in range(220)]
+    queries += [b'PHRASE "the of"'] * 80
+    queries += [b'PHRASE "the of the"'] * 80
+    queries += [b'PHRASE "the the"'] * 80
+    assert run(binary, docs, queries) == oracle(docs, queries), "automaton path mismatch"
+    print("Common-phrase automaton and suffix cases: PASS")
     print("All differential checks passed")
 
 if __name__ == "__main__":
