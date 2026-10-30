@@ -202,8 +202,10 @@ class Engine {
             nodes[state].outputs.push_back(pid);
         }
         if (pattern_results.empty()) return;
+        vector<uint32_t> root_edges(postings.size() + 1, 0);
         queue<uint32_t> bfs;
         for (const auto &[tok, next] : nodes[0].edges) {
+            root_edges[tok] = next;
             nodes[next].fail = 0;
             bfs.push(next);
         }
@@ -224,9 +226,15 @@ class Engine {
             uint32_t state = 0;
             for (uint32_t i = offsets[doc]; i < offsets[doc + 1]; ++i) {
                 uint32_t tok = tape[i];
-                while (state && !nodes[state].edges.contains(tok)) state = nodes[state].fail;
-                auto edge = nodes[state].edges.find(tok);
-                state = edge == nodes[state].edges.end() ? 0 : edge->second;
+                while (state) {
+                    auto edge = nodes[state].edges.find(tok);
+                    if (edge != nodes[state].edges.end()) {
+                        state = edge->second;
+                        break;
+                    }
+                    state = nodes[state].fail;
+                }
+                if (!state) state = root_edges[tok];
                 for (uint32_t pid : nodes[state].outputs) {
                     if (last[pid] != doc) {
                         last[pid] = doc;
