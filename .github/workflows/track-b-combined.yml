@@ -1,0 +1,73 @@
+name: Track B combined architecture qualification
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-combined.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-b-combined
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile combined variants and run differential oracle
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          python3 experiments/parallel_ac.py track-b/main.cpp /tmp/combined-ac.cpp
+          python3 experiments/and_gallop.py /tmp/combined-ac.cpp /tmp/combined-ac-and.cpp 16
+          python3 experiments/phrase_anchor.py /tmp/combined-ac-and.cpp /tmp/combined-ac-and-phrase.cpp
+          g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/combined-base
+          for variant in ac-and ac-and-phrase; do
+            g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra "/tmp/combined-$variant.cpp" -o "/tmp/combined-$variant"
+            python3 tests/differential.py "/tmp/combined-$variant"
+          done
+      - name: Generate full seeds and independent reference
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/sd-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/combined-data-$seed"
+          done
+          mkdir -p /tmp/combined-reference-2
+          python3 /tmp/sd-organizer/reference/b_index.py --data /tmp/combined-data-2 --out /tmp/combined-reference-2
+      - name: Compare three variants on two full seeds
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/combined-output
+          for seed in 1 2; do
+            for repeat in 1 2; do
+              for variant in base ac-and ac-and-phrase; do
+                echo "COMBINED_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/combined-$variant" --data "/tmp/combined-data-$seed" --out /tmp/combined-output
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/combined-output/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/combined-output/results.txt /tmp/combined-reference-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Offline Docker and read-only-root sample qualification
+        run: |
+          set -euo pipefail
+          python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/combined-sample
+          for variant in ac-and ac-and-phrase; do
+            mkdir -p "/tmp/combined-docker-$variant" "/tmp/combined-out-$variant"
+            cp track-b/Dockerfile "/tmp/combined-docker-$variant/Dockerfile"
+            cp "/tmp/combined-$variant.cpp" "/tmp/combined-docker-$variant/main.cpp"
+            docker build --network=none -t "sd-combined-$variant:verify" "/tmp/combined-docker-$variant"
+            chmod 777 "/tmp/combined-out-$variant"
+            docker run --rm --user 65534:65534 --network=none --read-only \
+              -v /tmp/combined-sample:/data:ro -v "/tmp/combined-out-$variant":/out:rw \
+              "sd-combined-$variant:verify"
+            echo "eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/combined-out-$variant/results.txt" | sha256sum -c -
+          done
