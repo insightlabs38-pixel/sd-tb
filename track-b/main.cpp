@@ -59,7 +59,7 @@ struct FoldEqual {
     bool operator()(string_view a, string_view b) const noexcept {
         if (a.size() != b.size()) return false;
         for (size_t i = 0; i < a.size(); ++i)
-            if (lower_ascii(static_cast<unsigned char>(a[i])) != lower_ascii(static_cast<unsigned char>(b[i]))) return false;
+            if ((static_cast<unsigned char>(a[i]) | 0x20u) != (static_cast<unsigned char>(b[i]) | 0x20u)) return false;
         return true;
     }
 };
@@ -291,7 +291,7 @@ class Engine {
 
     void parse_queries(const MappedFile &input) {
         const char *p = input.data, *end = p + input.size;
-        dictionary.reserve(160000);
+        dictionary.reserve(40000);
         while (p < end) {
             const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
             if (!line_end) line_end = end;
