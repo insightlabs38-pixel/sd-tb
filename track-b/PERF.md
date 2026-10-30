@@ -37,3 +37,7 @@ On that **GitHub-hosted runner, not the scoring machine**, the compiled candidat
 ## AC root-transition direct table (October 30)
 
 [Paired full-seed comparison 41087839664](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41087839664) compared the verified 32-bit dictionary champion to an AC automaton with direct root transitions and one lookup per non-root state. Seed 1 full: champion **3.62/3.59 s**, challenger **3.19/3.19 s** (11.5% mean faster). Seed 2 full: champion **3.55/3.50 s**, challenger **3.10/3.07 s** (12.5% mean faster). Peak RSS remained about **662 MiB / 654 MiB** on the runner. All seed-1 outputs matched the published SHA-256; seed-2 outputs matched the independent Python reference. Seven differential seeds, fingerprint collision, and common-phrase/suffix tests passed. Promoted source blob: `68bc2544bd842de00269c5797b7e33cb44cd6f54`. These are runner-local times, not official leaderboard scores.
+
+## Short-token direct table challenger (not promoted)
+
+[Two-seed comparison 41088809876](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41088809876) evaluated a collision-free 1–3-byte token lookup table atop the AC-root champion. Seed 1 full: champion **4.25/4.10 s**, challenger **3.91/4.23 s**; seed 2 full: champion **4.26/3.90 s**, challenger **4.15/4.05 s**. The seed-1 mean improved only 2.5% and seed-2 mean regressed 0.5%; RSS increased slightly. All full outputs and differential tests passed, but the inconsistent timing does not justify additional source and maintenance. The AC-root champion remains unchanged.
