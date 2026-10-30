@@ -223,26 +223,57 @@ class Engine {
                 bfs.push(next);
             }
         }
-        vector<uint32_t> last(pattern_results.size(), numeric_limits<uint32_t>::max());
-        for (uint32_t doc = 0; doc + 1 < offsets.size(); ++doc) {
-            uint32_t state = 0;
-            for (uint32_t i = offsets[doc]; i < offsets[doc + 1]; ++i) {
-                uint32_t tok = tape[i];
-                while (state) {
-                    auto edge = nodes[state].edges.find(tok);
-                    if (edge != nodes[state].edges.end()) {
-                        state = edge->second;
-                        break;
+        const size_t doc_count = offsets.size() - 1;
+        const size_t workers = doc_count >= 1000
+            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
+        vector<vector<Result>> partial(workers, vector<Result>(pattern_results.size()));
+        vector<exception_ptr> errors(workers);
+        auto scan = [&](size_t worker) {
+            try {
+                vector<uint32_t> last(pattern_results.size(), numeric_limits<uint32_t>::max());
+                const size_t first_doc = doc_count * worker / workers;
+                const size_t last_doc = doc_count * (worker + 1) / workers;
+                for (size_t d = first_doc; d < last_doc; ++d) {
+                    const uint32_t doc = static_cast<uint32_t>(d);
+                    uint32_t state = 0;
+                    for (uint32_t i = offsets[doc]; i < offsets[doc + 1]; ++i) {
+                        uint32_t tok = tape[i];
+                        while (state) {
+                            auto edge = nodes[state].edges.find(tok);
+                            if (edge != nodes[state].edges.end()) {
+                                state = edge->second;
+                                break;
+                            }
+                            state = nodes[state].fail;
+                        }
+                        if (!state) state = root_edges[tok];
+                        for (uint32_t pid : nodes[state].outputs) {
+                            if (last[pid] != doc) {
+                                last[pid] = doc;
+                                partial[worker][pid].add(doc);
+                            }
+                        }
                     }
-                    state = nodes[state].fail;
                 }
-                if (!state) state = root_edges[tok];
-                for (uint32_t pid : nodes[state].outputs) {
-                    if (last[pid] != doc) {
-                        last[pid] = doc;
-                        pattern_results[pid].add(doc);
-                    }
-                }
+            } catch (...) {
+                errors[worker] = current_exception();
+            }
+        };
+        vector<thread> threads;
+        threads.reserve(workers - 1);
+        for (size_t i = 1; i < workers; ++i) threads.emplace_back(scan, i);
+        scan(0);
+        for (thread &t : threads) t.join();
+        for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
+        for (size_t pid = 0; pid < pattern_results.size(); ++pid) {
+            Result &dst = pattern_results[pid];
+            for (size_t worker = 0; worker < workers; ++worker) {
+                const Result &src = partial[worker][pid];
+                const size_t kept = min<size_t>(dst.count, dst.first.size());
+                const size_t add = min<size_t>(src.count, dst.first.size() - kept);
+                for (size_t i = 0; i < add; ++i) dst.first[kept + i] = src.first[i];
+                dst.count += src.count;
+                dst.sum += src.sum;
             }
         }
     }
@@ -394,14 +425,17 @@ class Engine {
         }
     }
 
-    bool contains_phrase(uint32_t doc, const vector<uint32_t> &terms) const {
+    bool contains_phrase(uint32_t doc, const vector<uint32_t> &terms,
+                         size_t anchor) const {
         const uint32_t begin = offsets[doc], end = offsets[doc + 1];
         const size_t k = terms.size();
         if (end - begin < k) return false;
-        for (uint32_t i = begin; i + k <= end; ++i) {
-            if (tape[i] != terms[0] + 1) continue;
-            size_t j = 1;
-            while (j < k && tape[i + j] == terms[j] + 1) ++j;
+        const uint32_t key = terms[anchor] + 1;
+        for (uint32_t i = begin + anchor; i + k - anchor <= end; ++i) {
+            if (tape[i] != key) continue;
+            const uint32_t start = i - static_cast<uint32_t>(anchor);
+            size_t j = 0;
+            while (j < k && tape[start + j] == terms[j] + 1) ++j;
             if (j == k) return true;
         }
         return false;
@@ -413,7 +447,7 @@ class Engine {
             if (postings[q.terms[i]].size() < postings[q.terms[best]].size()) best = i;
         Result r;
         for (uint32_t doc : postings[q.terms[best]])
-            if (contains_phrase(doc, q.terms)) r.add(doc);
+            if (contains_phrase(doc, q.terms, best)) r.add(doc);
         return r;
     }
 
@@ -473,11 +507,21 @@ class Engine {
             char op = q.ops[step];
             tmp.clear();
             if (op == 'A') {
-                size_t i = 0, j = 0;
-                while (i < work.size() && j < rhs.size()) {
-                    if (work[i] < rhs[j]) ++i;
-                    else if (rhs[j] < work[i]) ++j;
-                    else { tmp.push_back(work[i]); ++i; ++j; }
+                if (work.size() * 16 < rhs.size()) {
+                    for (uint32_t doc : work)
+                        if (binary_search(rhs.begin(), rhs.end(), doc))
+                            tmp.push_back(doc);
+                } else if (rhs.size() * 16 < work.size()) {
+                    for (uint32_t doc : rhs)
+                        if (binary_search(work.begin(), work.end(), doc))
+                            tmp.push_back(doc);
+                } else {
+                    size_t i = 0, j = 0;
+                    while (i < work.size() && j < rhs.size()) {
+                        if (work[i] < rhs[j]) ++i;
+                        else if (rhs[j] < work[i]) ++j;
+                        else { tmp.push_back(work[i]); ++i; ++j; }
+                    }
                 }
             } else if (op == 'O') {
                 size_t i = 0, j = 0;
