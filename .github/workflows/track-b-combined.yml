@@ -1,4 +1,4 @@
-name: Track B combined architecture qualification
+name: Track B lightweight versus combined comparison
 on:
   push:
     branches: [main]
@@ -25,8 +25,10 @@ jobs:
           python3 experiments/parallel_ac.py track-b/main.cpp /tmp/combined-ac.cpp
           python3 experiments/and_gallop.py /tmp/combined-ac.cpp /tmp/combined-ac-and.cpp 16
           python3 experiments/phrase_anchor.py /tmp/combined-ac-and.cpp /tmp/combined-ac-and-phrase.cpp
+          python3 experiments/and_gallop.py track-b/main.cpp /tmp/combined-and.cpp 16
+          python3 experiments/phrase_anchor.py /tmp/combined-and.cpp /tmp/combined-and-phrase.cpp
           g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/combined-base
-          for variant in ac-and ac-and-phrase; do
+          for variant in ac-and ac-and-phrase and-phrase; do
             g++ -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra "/tmp/combined-$variant.cpp" -o "/tmp/combined-$variant"
             python3 tests/differential.py "/tmp/combined-$variant"
           done
@@ -44,7 +46,7 @@ jobs:
           mkdir -p /tmp/combined-output
           for seed in 1 2; do
             for repeat in 1 2; do
-              for variant in base ac-and ac-and-phrase; do
+              for variant in base and-phrase ac-and-phrase; do
                 echo "COMBINED_COMPARE seed=$seed repeat=$repeat variant=$variant"
                 /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
                   "/tmp/combined-$variant" --data "/tmp/combined-data-$seed" --out /tmp/combined-output
@@ -60,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 /tmp/sd-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/combined-sample
-          for variant in ac-and ac-and-phrase; do
+          for variant in and-phrase; do
             mkdir -p "/tmp/combined-docker-$variant" "/tmp/combined-out-$variant"
             cp track-b/Dockerfile "/tmp/combined-docker-$variant/Dockerfile"
             cp "/tmp/combined-$variant.cpp" "/tmp/combined-docker-$variant/main.cpp"
