@@ -1,0 +1,78 @@
+name: Track B phrase-only compact tape comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-phrase-tape16.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-phrase-tape16
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and differential-test isolated challenger
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/pt16-organizer
+          python3 -m py_compile experiments/phrase_tape16.py
+          python3 experiments/phrase_tape16.py track-b/main.cpp /tmp/pt16-new.cpp
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/pt16-base
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra /tmp/pt16-new.cpp -o /tmp/pt16-new
+          python3 tests/differential.py /tmp/pt16-new
+      - name: Generate full seeds and independent reference
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/pt16-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/pt16-data-$seed"
+          done
+          mkdir -p /tmp/pt16-ref-2
+          python3 /tmp/pt16-organizer/reference/b_index.py --data /tmp/pt16-data-2 --out /tmp/pt16-ref-2
+      - name: Three paired full-seed comparisons
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pt16-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in base new; do
+                echo "PT16_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/pt16-$variant" --data "/tmp/pt16-data-$seed" --out /tmp/pt16-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/pt16-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/pt16-out/results.txt /tmp/pt16-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Exact 32-bit fallback with over 65535 distinct phrase tokens
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pt16-fallback/data /tmp/pt16-fallback/base /tmp/pt16-fallback/new
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('/tmp/pt16-fallback/data')
+          (root / 'docs.txt').write_text('0\ttok0 tok40000\n1\ttok1\n')
+          (root / 'queries.txt').write_text(''.join(
+              f'PHRASE "tok{i} tok{i+40000}"\n' for i in range(40000)))
+          PY
+          /tmp/pt16-base --data /tmp/pt16-fallback/data --out /tmp/pt16-fallback/base
+          /tmp/pt16-new --data /tmp/pt16-fallback/data --out /tmp/pt16-fallback/new
+          cmp /tmp/pt16-fallback/base/results.txt /tmp/pt16-fallback/new/results.txt
+      - name: Offline Docker, unprivileged sample hash
+        run: |
+          set -euo pipefail
+          python3 /tmp/pt16-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/pt16-sample
+          mkdir -p /tmp/pt16-docker /tmp/pt16-docker-out
+          chmod 777 /tmp/pt16-docker-out
+          cp track-b/Dockerfile /tmp/pt16-docker/Dockerfile
+          cp /tmp/pt16-new.cpp /tmp/pt16-docker/main.cpp
+          docker build --network=none -t sd-pt16:verify /tmp/pt16-docker
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/pt16-sample:/data:ro -v /tmp/pt16-docker-out:/out:rw sd-pt16:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/pt16-docker-out/results.txt' | sha256sum -c -
