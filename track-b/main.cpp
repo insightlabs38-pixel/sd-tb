@@ -291,6 +291,47 @@ class Engine {
             for (uint32_t id : initial) r.add(id);
             return r;
         }
+        // After the final OR, every AND term bounds the final answer.
+        // Probe the smallest necessary posting when merging would be expensive.
+        size_t last_or = q.ops.size();
+        for (size_t i = 0; i < q.ops.size(); ++i)
+            if (q.ops[i] == 'O') last_or = i;
+        size_t anchor = q.terms.size();
+        if (last_or == q.ops.size()) anchor = 0;
+        for (size_t i = 0; i < q.ops.size(); ++i) {
+            if (q.ops[i] != 'A' || (last_or != q.ops.size() && i <= last_or))
+                continue;
+            const size_t term = i + 1;
+            if (anchor == q.terms.size() ||
+                postings[q.terms[term]].size() < postings[q.terms[anchor]].size())
+                anchor = term;
+        }
+        if (anchor != q.terms.size()) {
+            const auto &candidates = postings[q.terms[anchor]];
+            uint64_t merge_work = initial.size();
+            for (size_t i = 1; i < q.terms.size(); ++i)
+                merge_work += postings[q.terms[i]].size();
+            if (candidates.empty() ||
+                (candidates.size() <= 8192 &&
+                 candidates.size() * (q.terms.size() * 12) < merge_work)) {
+                Result result;
+                for (uint32_t doc : candidates) {
+                    bool match = binary_search(initial.begin(), initial.end(), doc);
+                    for (size_t step = 0; step < q.ops.size(); ++step) {
+                        const auto &rhs = postings[q.terms[step + 1]];
+                        bool present = binary_search(rhs.begin(), rhs.end(), doc);
+                        switch (q.ops[step]) {
+                            case 'A': match = match && present; break;
+                            case 'O': match = match || present; break;
+                            case 'N': match = match && !present; break;
+                            default: throw runtime_error("invalid boolean operator");
+                        }
+                    }
+                    if (match) result.add(doc);
+                }
+                return result;
+            }
+        }
         work.assign(initial.begin(), initial.end());
         for (size_t step = 0; step < q.ops.size(); ++step) {
             const vector<uint32_t> &rhs = postings[q.terms[step + 1]];
