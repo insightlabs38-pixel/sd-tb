@@ -51,14 +51,6 @@ static inline bool token_char(unsigned char c) {
     c = lower_ascii(c);
     return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
 }
-struct FoldHash {
-    using is_transparent = void;
-    size_t operator()(string_view s) const noexcept {
-        uint64_t h = 14695981039346656037ULL;
-        for (unsigned char c : s) { h ^= lower_ascii(c); h *= 1099511628211ULL; }
-        return static_cast<size_t>(h);
-    }
-};
 struct FoldEqual {
     using is_transparent = void;
     bool operator()(string_view a, string_view b) const noexcept {
