@@ -1,4 +1,5 @@
 name: Track B short-token direct-table comparison
+# Compare on the promoted AC root-transition champion.
 on:
   push:
     branches: [main]
