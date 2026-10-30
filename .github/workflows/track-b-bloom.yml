@@ -1,4 +1,4 @@
-name: Track B dictionary-capacity and equality crossover
+name: Track B compact dictionary independent qualification
 on:
   push:
     branches: [experiment/bloom-lookup]
@@ -13,65 +13,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  compare:
+  qualify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Compile dictionary footprint candidates and differential-test
+      - name: Compile baseline and compact dictionary, run differential oracle
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/bloom-organizer
-          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/bloom-base
-          python3 -m py_compile experiments/bloom_lookup.py experiments/fold_equal.py experiments/dictionary_capacity.py
-          python3 experiments/bloom_lookup.py track-b/main.cpp /tmp/bloom-two.cpp two
-          python3 experiments/fold_equal.py track-b/main.cpp /tmp/bloom-fold.cpp
-          python3 experiments/fold_equal.py /tmp/bloom-two.cpp /tmp/bloom-twofold.cpp
-          for cap in 40000 80000; do
-            python3 experiments/dictionary_capacity.py /tmp/bloom-fold.cpp "/tmp/bloom-fold$cap.cpp" "$cap"
-          done
-          for variant in fold twofold fold40000 fold80000; do
-            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/bloom-$variant.cpp" -o "/tmp/bloom-$variant"
-          done
-          for variant in fold40000 fold80000; do
-            python3 tests/differential.py "/tmp/bloom-$variant"
-          done
-      - name: Generate full seeds and independent oracle
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/cap-organizer
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/cap-base
+          python3 experiments/fold_equal.py track-b/main.cpp /tmp/cap-fold.cpp
+          python3 experiments/dictionary_capacity.py /tmp/cap-fold.cpp /tmp/cap-candidate.cpp 40000
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra /tmp/cap-candidate.cpp -o /tmp/cap-candidate
+          python3 tests/differential.py /tmp/cap-candidate
+      - name: Generate three full seeds and independent reference outputs
         run: |
           set -euo pipefail
-          for seed in 1 2; do
-            python3 /tmp/bloom-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/bloom-data-$seed"
+          for seed in 1 2 3; do
+            python3 /tmp/cap-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/cap-data-$seed"
           done
-          mkdir -p /tmp/bloom-ref-2
-          python3 /tmp/bloom-organizer/reference/b_index.py --data /tmp/bloom-data-2 --out /tmp/bloom-ref-2
-      - name: Interleaved exact full-seed comparisons
+          for seed in 2 3; do
+            mkdir -p "/tmp/cap-ref-$seed"
+            python3 /tmp/cap-organizer/reference/b_index.py --data "/tmp/cap-data-$seed" --out "/tmp/cap-ref-$seed"
+          done
+      - name: Interleaved exact full-seed comparison
         run: |
           set -euo pipefail
-          mkdir -p /tmp/bloom-out
-          for seed in 1 2; do
+          mkdir -p /tmp/cap-out
+          for seed in 1 2 3; do
             for repeat in 1 2 3; do
-              for variant in base fold twofold fold40000 fold80000; do
-                echo "BLOOM_COMPARE seed=$seed repeat=$repeat variant=$variant"
+              for variant in base candidate; do
+                echo "CAP_COMPARE seed=$seed repeat=$repeat variant=$variant"
                 /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
-                  "/tmp/bloom-$variant" --data "/tmp/bloom-data-$seed" --out /tmp/bloom-out
+                  "/tmp/cap-$variant" --data "/tmp/cap-data-$seed" --out /tmp/cap-out
                 if [ "$seed" = 1 ]; then
-                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/bloom-out/results.txt' | sha256sum -c -
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/cap-out/results.txt' | sha256sum -c -
                 else
-                  cmp /tmp/bloom-out/results.txt /tmp/bloom-ref-2/results.txt
+                  cmp /tmp/cap-out/results.txt "/tmp/cap-ref-$seed/results.txt"
                 fi
               done
             done
           done
-      - name: Pinned offline Docker smoke test for branchless equality
+      - name: Offline Docker and sanitizer sample qualification
         run: |
           set -euo pipefail
-          python3 /tmp/bloom-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/bloom-sample
-          mkdir -p /tmp/bloom-docker /tmp/bloom-docker-out
-          chmod 777 /tmp/bloom-docker-out
-          cp track-b/Dockerfile /tmp/bloom-docker/Dockerfile
-          cp /tmp/bloom-fold.cpp /tmp/bloom-docker/main.cpp
-          docker build --network=none -t sd-bloom:verify /tmp/bloom-docker
+          python3 /tmp/cap-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/cap-sample
+          mkdir -p /tmp/cap-docker /tmp/cap-docker-out
+          chmod 777 /tmp/cap-docker-out
+          cp track-b/Dockerfile /tmp/cap-docker/Dockerfile
+          cp /tmp/cap-candidate.cpp /tmp/cap-docker/main.cpp
+          docker build --network=none -t sd-cap:verify /tmp/cap-docker
           docker run --rm --user 65534:65534 --network=none --read-only \
-            -v /tmp/bloom-sample:/data:ro -v /tmp/bloom-docker-out:/out:rw \
-            sd-bloom:verify
-          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/bloom-docker-out/results.txt' | sha256sum -c -
+            -v /tmp/cap-sample:/data:ro -v /tmp/cap-docker-out:/out:rw \
+            sd-cap:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/cap-docker-out/results.txt' | sha256sum -c -
+          g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -pthread /tmp/cap-candidate.cpp -o /tmp/cap-asan
+          mkdir -p /tmp/cap-asan-out
+          ASAN_OPTIONS=detect_leaks=1 /tmp/cap-asan --data /tmp/cap-sample --out /tmp/cap-asan-out
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/cap-asan-out/results.txt' | sha256sum -c -
