@@ -1,0 +1,54 @@
+name: Track B AC root-transition comparison
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-ac-root.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: track-b-ac-root
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare organizer reference and challenger
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/sd-organizer
+          python3 experiments/ac_root_direct.py track-b/main.cpp /tmp/ac-root.cpp
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra track-b/main.cpp -o /tmp/ac-champion
+          g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra /tmp/ac-root.cpp -o /tmp/ac-challenger
+          python3 tests/differential.py /tmp/ac-challenger
+      - name: Generate full independent datasets and seed-2 oracle
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/sd-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/ac-data-$seed"
+          done
+          mkdir -p /tmp/ac-reference-2
+          python3 /tmp/sd-organizer/reference/b_index.py --data /tmp/ac-data-2 --out /tmp/ac-reference-2
+      - name: Compare two interleaved runs per seed, exact bytes and RSS
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ac-output
+          for seed in 1 2; do
+            for repeat in 1 2; do
+              for variant in champion challenger; do
+                echo "AC_COMPARE seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' \
+                  "/tmp/ac-$variant" --data "/tmp/ac-data-$seed" --out /tmp/ac-output
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/ac-output/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/ac-output/results.txt /tmp/ac-reference-2/results.txt
+                fi
+              done
+            done
+          done
