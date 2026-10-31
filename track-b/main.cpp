@@ -503,9 +503,8 @@ class Engine {
         }
         vector<int32_t> anchor_head(term_count, -1);
         query_count = queries.size();
-        size_t bool_count = static_cast<size_t>(count_if(queries.begin(), queries.end(), [](const Query &q) { return !q.phrase; }));
-        boolean_queries.reserve(bool_count);
-        phrases.reserve(query_count - bool_count);
+        boolean_queries.reserve(queries.size());
+        phrases.reserve(queries.size());
         vector<uint32_t> boolean_column(term_count, numeric_limits<uint32_t>::max());
         {   // Frequent Boolean terms take the first columns and permanent bitmap rows.
             vector<uint32_t> hot;
@@ -532,10 +531,11 @@ class Engine {
                 boolean_queries.push_back(plan);
                 continue;
             }
+            // The rarest sampled term anchors a phrase; ties prefer longer words.
+            auto rarity = [&](uint32_t t) { return make_pair(frequency[t], -static_cast<long>(dictionary.term_length(t))); };
             size_t best = 0;
             for (size_t i = 1; i < q.term_count; ++i)
-                if (frequency[q.terms[i]] < frequency[q.terms[best]] ||
-                    (frequency[q.terms[i]] == frequency[q.terms[best]] && dictionary.term_length(q.terms[i]) > dictionary.term_length(q.terms[best]))) best = i;
+                if (rarity(q.terms[i]) < rarity(q.terms[best])) best = i;
             uint32_t term = q.terms[best];
             PhrasePlan plan;
             for (size_t i = 0; i < q.term_count; ++i) plan.keys[i] = dictionary.phrase_key(q.terms[i]);
