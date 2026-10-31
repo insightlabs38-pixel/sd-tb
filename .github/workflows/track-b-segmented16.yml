@@ -1,0 +1,66 @@
+name: Track B segmented phrase tape qualification
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/track-b-segmented16.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-segmented16
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and differential-test zero-copy challenger
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/seg-organizer
+          python3 experiments/segmented_tape16.py track-b/main.cpp /tmp/seg-candidate.cpp
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/seg-baseline
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra /tmp/seg-candidate.cpp -o /tmp/seg-candidate
+          python3 tests/differential.py /tmp/seg-candidate
+          python3 /tmp/seg-organizer/generators/b_index.py --seed 1 --scale tiny --out /tmp/seg-tiny
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer /tmp/seg-candidate.cpp -o /tmp/seg-asan
+          mkdir -p /tmp/seg-asan-out
+          ASAN_OPTIONS=detect_leaks=1 /tmp/seg-asan --data /tmp/seg-tiny --out /tmp/seg-asan-out
+      - name: Generate two independent full seeds
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/seg-organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/seg-data-$seed"
+          done
+          mkdir -p /tmp/seg-ref-2
+          python3 /tmp/seg-organizer/reference/b_index.py --data /tmp/seg-data-2 --out /tmp/seg-ref-2
+      - name: Three interleaved pairs with exactness and peak RSS
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/seg-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in baseline candidate; do
+                echo "SEGMENTED16 seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/seg-$variant" --data "/tmp/seg-data-$seed" --out /tmp/seg-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/seg-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/seg-out/results.txt /tmp/seg-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Pinned offline Docker as unprivileged user
+        run: |
+          set -euo pipefail
+          python3 /tmp/seg-organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/seg-sample
+          mkdir -p /tmp/seg-docker /tmp/seg-docker-out
+          chmod 777 /tmp/seg-docker-out
+          cp track-b/Dockerfile /tmp/seg-docker/Dockerfile
+          cp /tmp/seg-candidate.cpp /tmp/seg-docker/main.cpp
+          docker build --network=none -t sd-segmented16:verify /tmp/seg-docker
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/seg-sample:/data:ro -v /tmp/seg-docker-out:/out:rw sd-segmented16:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/seg-docker-out/results.txt' | sha256sum -c -
