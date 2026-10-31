@@ -257,21 +257,20 @@ public:
     void prefetch(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
     // Returns the metadata word, or zero on a miss; long-token matches are verified byte for byte.
     uint64_t resolve(const Probe &probe) const {
-        for (size_t b = probe.hash & bucket_mask;; b = (b + 1) & bucket_mask) {
-            const Bucket &bucket = buckets[b];
-            if (unsigned hit = match_mask(bucket, probe.key); __builtin_expect(hit != 0, 1)) {
-                if (__builtin_expect((probe.key >> 62) != 2, 1)) return bucket.meta[countr_zero(hit)];
-                return resolve_long(probe, b);
-            }
-            if (bucket.keys[3] == 0) return 0;
-        }
+        const size_t b = probe.hash & bucket_mask;
+        const Bucket &bucket = buckets[b];
+        const unsigned hit = match_mask(bucket, probe.key);
+        // Misses in a full bucket and long-token candidates are the only cases needing a loop.
+        if (__builtin_expect(((probe.key >> 62) == 2) | ((hit == 0) & (bucket.keys[3] != 0)), 0)) return resolve_slow(probe, b);
+        return bucket.meta[countr_zero(hit) & 3] & -uint64_t(hit != 0);
     }
-    // Equal 32-bit fingerprints may name different words, so every candidate is compared.
-    uint64_t resolve_long(const Probe &probe, size_t b) const {
+    // Equal 32-bit fingerprints may name different words, so long-token candidates are compared in full.
+    uint64_t resolve_slow(const Probe &probe, size_t b) const {
+        const bool exact = (probe.key >> 62) != 2;
         for (;; b = (b + 1) & bucket_mask) {
             const Bucket &bucket = buckets[b];
             for (unsigned i = 0; i < 4; ++i)
-                if (bucket.keys[i] == probe.key && FoldEqual{}(keys[term_id(bucket.meta[i])], probe.word)) return bucket.meta[i];
+                if (bucket.keys[i] == probe.key && (exact || FoldEqual{}(keys[term_id(bucket.meta[i])], probe.word))) return bucket.meta[i];
             if (bucket.keys[3] == 0) return 0;
         }
     }
@@ -715,12 +714,7 @@ class Engine {
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
-                    for (size_t column = 0; column < hot_columns; ++column) {
-                        const uint64_t *hot_row = matrix.data() + (column + 1) * words;
-                        uint64_t any = 0;
-                        for (size_t w = 0; w < words; ++w) any |= hot_row[w];
-                        active[column] = any ? column + 1 : 0;
-                    }
+                    for (size_t column = 0; column < hot_columns; ++column) active[column] = column + 1;
                     evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
                     matrix.resize(base_rows * words);
                     fill(matrix.begin() + words, matrix.end(), 0);
