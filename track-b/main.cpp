@@ -589,6 +589,7 @@ class Engine {
                 vector<uint64_t> matrix(words);
                 matrix.reserve(words * (boolean_count + 1));
                 vector<uint32_t> active(boolean_count);
+                vector<uint32_t> last_seen(boolean_count, numeric_limits<uint32_t>::max());
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
@@ -633,6 +634,8 @@ class Engine {
                             uint32_t column = entry->column();
                             if (column) {
                                 --column;
+                                if (last_seen[column] == doc) continue;
+                                last_seen[column] = doc;
                                 uint32_t &row = active[column];
                                 if (!row) {
                                     row = singleton | static_cast<uint32_t>(in_block);
