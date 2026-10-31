@@ -269,6 +269,10 @@ Parameters at the correct worker count ([sweep 41247879158](https://github.com/i
 base **0.320 s**; hot threshold 2 / 8 / 16 **0.322 / 0.324 / 0.322 s** (flat, noise); prefetch distance 16 **0.319 s** (flat); block size 1,024 **0.331 s** (+3.5%),
 1,536 **0.351 s** (+10%), 3,072 **0.360 s** (+13%). 2,048 documents per block, threshold 4 and distance 8 stay.
 
+Micro-variants at 4 workers ([sweep 41248666184](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41248666184), 7 paired runs): base **0.282 s**;
+without the cold-state prefetch **0.282 s**, prefetch distance 4 / 12 **0.284 / 0.281 s**, 24-byte `Probe` **0.282 s** (all noise; champion 0.453 s).
+Exactness across worker counts: seed-2 output equals the independent Python reference for 1, 2, 3, 5, 7, 12, 16 and 24 workers, and under ASan/UBSan with 3 and 12 workers.
+
 ### Handoff for Luna (exact source)
 
 * Source: `track-b/main.cpp` at `a84e0b5d0ddd844bfe5a8b7eb7318ce09bf277a6` on `branch/festive-hawking-wn31k1`, blob
