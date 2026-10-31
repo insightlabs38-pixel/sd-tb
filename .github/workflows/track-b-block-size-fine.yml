@@ -1,0 +1,121 @@
+name: Track B fine block-size qualification
+on:
+  push:
+    branches: [track-b/block-size-11]
+    paths: [.github/workflows/track-b-block-size-fine.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-block-size-fine
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pinned build and variants
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          docker pull gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce
+          docker pull debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+          mkdir -p /tmp/bin /tmp/evidence
+          docker build --network=none -t frontier:b1024 track-b
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bin/sd-timer
+          for size in 768 896 1152 1280; do
+            mkdir -p "/tmp/b$size"
+            cp track-b/Dockerfile "/tmp/b$size/Dockerfile"
+            python3 - "$size" <<'PY'
+          import sys
+          from pathlib import Path
+          n = sys.argv[1]
+          original = Path("track-b/main.cpp").read_text()
+          assert original.count("scan_corpus<1024>(docs_file, workers)") == 1
+          Path(f"/tmp/b{n}/main.cpp").write_text(original.replace(
+              "scan_corpus<1024>(docs_file, workers)",
+              f"scan_corpus<{n}>(docs_file, workers)"))
+          PY
+            docker build --network=none -t "frontier:b$size" "/tmp/b$size"
+            g++ -std=c++20 -O3 -march=x86-64-v3 -pthread -Wall -Wextra "/tmp/b$size/main.cpp" -o "/tmp/bin/b$size"
+          done
+      - name: Exact differential and adversarial checks
+        run: |
+          set -euo pipefail
+          for size in 768 896 1152 1280; do
+            python3 tests/differential.py "/tmp/bin/b$size"
+            python3 tests/frontier_adversarial.py "/tmp/bin/b$size"
+          done
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie /tmp/b896/main.cpp -o /tmp/bin/asan896
+          python3 tests/differential.py /tmp/bin/asan896
+          python3 tests/frontier_adversarial.py /tmp/bin/asan896
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie /tmp/b768/main.cpp -o /tmp/bin/tsan768
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/tsan768
+      - name: Independent full seeds and references
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"
+            if [ "$seed" != 1 ]; then
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/data-$seed" --out "/tmp/ref-$seed"
+            fi
+          done
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/sample
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/tiny
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/tiny --out /tmp/ref-tiny
+      - name: Paired Docker timing and exact hashes
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then
+              expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else
+              expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1)
+            fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --results /tmp/evidence/measurements.jsonl frontier:b1024 frontier:b768 frontier:b896 frontier:b1152 frontier:b1280
+          done
+          for image in frontier:b768 frontier:b896 frontier:b1152 frontier:b1280; do
+            sudo python3 experiments/frontier/compare.py --data /tmp/sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl "$image"
+            expected=$(sha256sum /tmp/ref-tiny/results.txt | cut -d' ' -f1)
+            sudo python3 experiments/frontier/compare.py --data /tmp/tiny --expected "$expected" --timer /tmp/bin/sd-timer --seed 7 --repeat 1 --results /tmp/evidence/tiny.jsonl "$image"
+          done
+      - name: Canonical K comparison
+        run: |
+          set -euo pipefail
+          python3 -m pip install clang-format==23.1.3
+          curl -fL https://github.com/boyter/scc/releases/download/v4.1.0/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
+          echo 'c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b  /tmp/scc.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/scc.tar.gz -C /tmp/bin scc
+          mkdir -p /tmp/count
+          clang-format --style=LLVM track-b/main.cpp > /tmp/count/main.cpp
+          cp track-b/Dockerfile /tmp/count/
+          /tmp/bin/scc --format json /tmp/count > /tmp/evidence/static.json
+          python3 - <<'PY'
+          import json, statistics, sys
+          from pathlib import Path
+          sys.path.insert(0, "/tmp/organizer/harness")
+          from scoring import k_from_measurements
+          root = Path("/tmp/evidence")
+          calibration = json.loads(Path("/tmp/organizer/harness/calibration-seed1.json").read_text())["tracks"]["b"]
+          reference = dict(T=calibration["T_ref_s"], M=calibration["M_ref_bytes"], S=91, D=1)
+          rows = [json.loads(x) for x in (root / "measurements.jsonl").read_text().splitlines()]
+          S = sum(x["Code"] for x in json.loads((root / "static.json").read_text()))
+          for seed in (1, 2, 3):
+              scores = {}
+              for size in (1024, 768, 896, 1152, 1280):
+                  selected = [x for x in rows if x["seed"] == seed and x["image"] == f"frontier:b{size}"]
+                  axes = dict(T=statistics.median(x["T"] for x in selected), M=max(x["M"] for x in selected), S=S, D=1)
+                  k = k_from_measurements(reference, axes)
+                  scores[size] = k
+                  print(json.dumps(dict(seed=seed, size=size, **axes, K_local=k)), flush=True)
+              for size in (768, 896, 1152, 1280):
+                  print("seed", seed, "size", size, "K ratio to 1024:", scores[size] / scores[1024], flush=True)
+          print("Runner-local estimates only, no official leaderboard claim.", flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: track-b-block-size-evidence
+          path: /tmp/evidence/
