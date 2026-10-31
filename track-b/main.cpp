@@ -232,18 +232,21 @@ public:
         }
     }
     struct Probe {
-        string_view word;
-        uint32_t hash;
+        const char *ptr;
         uint64_t key;
+        uint32_t hash, length;
     };
+    static_assert(sizeof(Probe) == 24);
     Probe prepare(string_view word, const char *read_end = nullptr) const {
         const auto [hash, key] = fingerprint(word, read_end);
         __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
-        return {word, hash, key};
+        return {word.data(), key, hash, static_cast<uint32_t>(word.size())};
     }
     const Slot *resolve(const Probe &probe) const {
         if (slots.empty()) return nullptr;
-        const auto &[word, hash, key] = probe;
+        const string_view word(probe.ptr, probe.length);
+        const uint32_t hash = probe.hash;
+        const uint64_t key = probe.key;
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             const Slot &slot = slots[i];
@@ -265,7 +268,7 @@ public:
     bool phrase_equal(uint64_t expected, const Probe &probe) const {
         if ((expected >> 62) != 2) return expected == probe.key;
         return probe.key == ((uint64_t(1) << 63) | static_cast<uint32_t>(expected)) &&
-            FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
+            FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], string_view(probe.ptr, probe.length));
     }
     void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
         // The frozen query limit keeps IDs/columns within 20 bits and heads within 24.
