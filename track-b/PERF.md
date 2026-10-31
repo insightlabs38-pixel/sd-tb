@@ -139,7 +139,7 @@ Rejected or superseded local variants: document-local phrase matching plus retai
 
 Each median uses three rotated paired runs; M is the largest cgroup peak. Canonical formatter/counter versions are 23.1.3/4.1.0; official S=721, development S=765, D=1 throughout. K_local applies the frozen board reference axes to runner measurements, not a new official score. Native TSan additionally passed the parallel adversarial fixture locally. The initial qualification attempt `41146390617` passed build/sanitizer gates but failed the benchmark helper's mount ownership before timing; `5641b8f` fixes the helper without changing production code.
 
-## Prefetched dictionary and sparse block rows (frontier v2, qualification pending)
+## Prefetched dictionary and sparse block rows (frontier v2, subsequently qualified)
 
 Rollback is the pinned-qualified `b7d7c90` source from PR #1. This challenger allocates bitmap rows only for Boolean terms present in the current 2,048-document block. Dictionary probes are prepared and prefetched in document-local batches. Exact 1–8-byte keys occupy the dictionary slot directly; long-token fingerprints enter a tagged key space and retain full-byte verification. Every byte of a valid token participates in its fingerprint. Slots also carry the Boolean column, avoiding another dependent lookup. The first worker transfers result ownership instead of allocating a second global result buffer.
 
@@ -157,7 +157,24 @@ The word-occupancy hybrid was refined across scalar cutoffs 2/4/8 and a SIMD pre
 | Full seed | Official T / M | Prior frontier T / M | New frontier T / M | New S/D | New K_local | K ratio vs prior / official |
 |---|---|---|---|---|---|---|
 | 1 | 1.539492 s / 525,185,024 B | 0.850198 s / 55,320,576 B | 0.678716 s / 56,356,864 B | 672 / 1 | 14.049360 | 1.098189 / 2.378497 |
-| 2 | 1.568309 s / 525,172,736 B | 0.809549 s / 55,054,336 B | 0.648939 s / 59,478,016 B | 672 / 1 | 14.214015 | 1.083125 / 2.428779 |
+| 2 | 1.568309 s / 525,172,736 B | 0.809549 s / 55,054,336 B | 0.648939 s / 59,478,016 B | 672 / 1 | 14.214015 | 1.083127 / 2.428779 |
 | 3 | 1.516786 s / 526,163,968 B | 0.824705 s / 55,058,432 B | 0.651839 s / 59,068,416 B | 672 / 1 | 14.201972 | 1.092310 / 2.387426 |
 
 T is the three-run median; M is the largest cgroup peak. Runtime improved about 20%, but the four-worker cgroup peaks increased, so the full-K gain over the prior frontier is 8.3–9.8%, below the local two-CPU estimate. These are runner results, not official board scores. Next memory work targets transient bitmap-row reallocation copies and query/result representation, while preserving this verified rollback point.
+
+
+## Compact plans and exact phrase probes (frontier v3)
+
+[Production qualification 41157659217](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41157659217) passes pinned GCC 15 offline Docker, ASan/UBSan, TSan, seven randomized differential seeds, exhaustive Boolean assignments, all byte classes at every SIMD alignment, long CRC collisions with reversed/repeated phrases, 338,000-term dictionary growth, published sample/full hashes, tiny seed 7, and independent full seed-2/3 references. Immutable production source: `338c7cf8e1585ae770e2faa12834fa50b8138bd2`; rollback: `4069aa9` (v2).
+
+Fixed query records compile into separate inline Boolean/phrase plans, then release the parse array. Dictionary metadata packs term ID, Boolean column and phrase head into one word. Phrase candidates are collected during resolution; exact short keys and collision-checked long fingerprints reuse the document's lookup probes, eliminating the token-ID buffer and repeated anchor lookups. Bitmap capacity reserves its exact upper bound before scanning, avoiding transient growth copies. SIMD sampling and bounded `to_chars` output reduce startup/serialization costs.
+
+| Full seed | v2 median T / peak M | v3 median T / peak M | v3 S/D | v3 K_local | K ratio vs v2 |
+|---|---|---|---|---|---|
+| 1 | 0.676918456 s / 59,858,944 B | 0.578750112 s / 43,130,880 B | 742 / 1 | 15.750712 | 1.133194 |
+| 2 | 0.671495305 s / 58,978,304 B | 0.573402319 s / 42,942,464 B | 742 / 1 | 15.823991 | 1.130540 |
+| 3 | 0.668224612 s / 56,344,576 B | 0.575259689 s / 42,889,216 B | 742 / 1 | 15.798424 | 1.115721 |
+
+Each T is the median of three rotated restricted-container runs; M is the maximum cgroup peak. Canonical clang-format 23.1.3/scc 4.1.0 gives S=742, D=1. All three peaks are below the frozen 43,999,232-byte memory cap, so further memory savings alone earn no K. These are runner-equivalent K values, not official scores. The live board independently scored Luna's v2 integration (`6bf7383`, run `run-071238af51d9`) at T=0.558953 s, M=56,795,136 B, S=672, D=1, K=15.457529; v3 has no official receipt yet.
+
+Rejected local refinements: frequency-selected direct lookup caches (64–4,096 slots, including selective-prefetch controls) cost about 0.98–1.13 s versus 0.92–0.94 s on two full seeds. A positive-witness Boolean candidate bitmap initially regressed; moving marking to block flush recovered the regression but did not offset its source cost. Start/end-mask tokenization was inconsistent across seeds. Pooled first-ten summaries reduce eight-worker/1,024-document-block peak memory from about 50.3 MB to 38.8 MB; higher-core throughput remains unmeasured on matching hardware and is experimental.
