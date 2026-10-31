@@ -273,6 +273,12 @@ Micro-variants at 4 workers ([sweep 41248666184](https://github.com/insightlabs3
 without the cold-state prefetch **0.282 s**, prefetch distance 4 / 12 **0.284 / 0.281 s**, 24-byte `Probe` **0.282 s** (all noise; champion 0.453 s).
 Exactness across worker counts: seed-2 output equals the independent Python reference for 1, 2, 3, 5, 7, 12, 16 and 24 workers, and under ASan/UBSan with 3 and 12 workers.
 
+Independent repeat on the final tree ([run 41249438140](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41249438140), source `7706b5b`, same `main.cpp` blob; a faster runner draw):
+champion T 0.318 / 0.322 / 0.317 s, candidate **0.188 / 0.193 / 0.188 s**, M 23 MB, K_local 20.57 -> 25.99, 20.44 -> 25.65, 20.59 -> 26.04, K ratio **1.264 / 1.255 / 1.265**.
+Runner-to-runner variance is large (champion 0.32-0.54 s), so only paired ratios are meaningful.
+Serial phases on the runner (phase-lap build, 4 workers): query parse 12.1 ms, compile 8.7 ms, scan 298 ms, output 5.3 ms; on a 12-thread host these ~26 ms
+become ~20% of T, so parallelizing query interning (sharded buckets) is the most valuable remaining item.
+
 ### Handoff for Luna (exact source)
 
 * Source: `track-b/main.cpp` at `a84e0b5d0ddd844bfe5a8b7eb7318ce09bf277a6` on `branch/festive-hawking-wn31k1`, blob
