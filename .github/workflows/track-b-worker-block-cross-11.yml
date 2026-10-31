@@ -1,0 +1,118 @@
+name: Track B worker-block crossover 11
+on:
+  push:
+    branches: [track-b/worker-block-cross-11]
+    paths: [track-b/main.cpp, .github/workflows/track-b-worker-block-cross-11.yml]
+permissions:
+  contents: read
+concurrency:
+  group: track-b-worker-block-cross-11
+  cancel-in-progress: false
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build exact baseline and worker-block variants
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          mkdir -p /tmp/b11 /tmp/b11-out /tmp/b11-evidence /tmp/b11-bin
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/b11-bin/sd-timer
+          git show d7845bc6ac6a77547121daf1fda751e34999b325:track-b/main.cpp > /tmp/b11/base.cpp
+          git show 134a0f9b70d72e474c00a40d77768af90ee066dc:track-b/main.cpp > /tmp/b11/legacy.cpp
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('/tmp/b11/base.cpp').read_text()
+          worker = 'const size_t workers = docs_file.size >= (8u << 20) ? 12 : 1;'
+          block = 'scan_corpus<2048>(docs_file, workers);'
+          assert source.count(worker) == source.count(block) == 1
+          for w in (6, 8, 12):
+              for b in (1024, 1152, 2048):
+                  text = source.replace(worker, worker.replace('? 12 : 1;', f'? {w} : 1;')).replace(block, f'scan_corpus<{b}>(docs_file, workers);')
+                  assert text != source or (w == 12 and b == 2048)
+                  Path(f'/tmp/b11/{w}-{b}.cpp').write_text(text)
+          assert Path('track-b/main.cpp').read_text() == Path('/tmp/b11/12-1152.cpp').read_text()
+          PY
+          for v in legacy 6-1024 6-1152 6-2048 8-1024 8-1152 8-2048 12-1024 12-1152 12-2048; do
+            mkdir -p "/tmp/b11/build-$v"
+            cp track-b/Dockerfile "/tmp/b11/build-$v/Dockerfile"
+            cp "/tmp/b11/$v.cpp" "/tmp/b11/build-$v/main.cpp"
+            docker build --network=none -q -t "b11:$v" "/tmp/b11/build-$v"
+          done
+          g++ -std=c++20 -O3 -march=x86-64-v3 -pthread track-b/main.cpp -o /tmp/b11-bin/candidate
+      - name: Differential and sanitizer qualification
+        run: |
+          set -euo pipefail
+          python3 tests/differential.py /tmp/b11-bin/candidate
+          python3 tests/frontier_adversarial.py /tmp/b11-bin/candidate
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/b11-bin/sanitized
+          python3 tests/differential.py /tmp/b11-bin/sanitized
+          python3 tests/frontier_adversarial.py /tmp/b11-bin/sanitized
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/b11-bin/tsan
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/b11-bin/tsan
+      - name: Generate independent full references and published small scales
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/b11-data-$seed"
+            if [ "$seed" != 1 ]; then
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/b11-data-$seed" --out "/tmp/b11-ref-$seed"
+            fi
+          done
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/b11-sample
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/b11-tiny
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/b11-tiny --out /tmp/b11-ref-tiny
+      - name: Interleaved restricted Docker full-corpus measurements
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then
+              expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else
+              expected=$(sha256sum "/tmp/b11-ref-$seed/results.txt" | cut -d' ' -f1)
+            fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/b11-data-$seed" --expected "$expected" --timer /tmp/b11-bin/sd-timer --seed "$seed" --repeat 3 --results /tmp/b11-evidence/measurements.jsonl b11:legacy b11:6-1024 b11:6-1152 b11:6-2048 b11:8-1024 b11:8-1152 b11:8-2048 b11:12-1024 b11:12-1152 b11:12-2048
+          done
+          sudo python3 experiments/frontier/compare.py --data /tmp/b11-sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/b11-bin/sd-timer --seed 1 --repeat 1 --results /tmp/b11-evidence/sample.jsonl b11:12-1152
+          expected=$(sha256sum /tmp/b11-ref-tiny/results.txt | cut -d' ' -f1)
+          sudo python3 experiments/frontier/compare.py --data /tmp/b11-tiny --expected "$expected" --timer /tmp/b11-bin/sd-timer --seed 7 --repeat 1 --results /tmp/b11-evidence/tiny.jsonl b11:12-1152
+      - name: Compute paired local K and preserve receipts
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, math, statistics, sys
+          from collections import defaultdict
+          from pathlib import Path
+          sys.path.insert(0, '/tmp/organizer/harness')
+          from scoring import k_from_measurements
+          calibration = json.loads(Path('/tmp/organizer/harness/calibration-seed1.json').read_text())['tracks']['b']
+          ref = dict(T=calibration['T_ref_s'], M=calibration['M_ref_bytes'], S=91, D=1)
+          groups = defaultdict(list)
+          for line in Path('/tmp/b11-evidence/measurements.jsonl').read_text().splitlines():
+              row = json.loads(line)
+              groups[row['seed'], row['image'].split(':')[1]].append(row)
+          results = {}
+          for (seed, name), rows in sorted(groups.items()):
+              S = 874 if name == 'legacy' else 925
+              axes = dict(T=statistics.median(r['T'] for r in rows), M=max(r['M'] for r in rows), S=S, D=1)
+              K = k_from_measurements(ref, axes)
+              results[seed, name] = K
+              print(json.dumps(dict(seed=seed, variant=name, **axes, K_local=K)), flush=True)
+          aggregate = []
+          for name in sorted({name for _, name in groups}):
+              vals = [results[seed, name] for seed in (1, 2, 3)]
+              gm = math.exp(sum(math.log(x) for x in vals) / len(vals))
+              aggregate.append((gm, name))
+          print('GEOMEAN_LOCAL_K_RANKING', sorted(aggregate, reverse=True), flush=True)
+          Path('/tmp/b11-evidence/summary.json').write_text(json.dumps(dict(axes_source='S values from previously pinned scc qualifications; runner-local T/M', geomean=sorted(aggregate, reverse=True), seeds={f'{s}/{n}': k for (s,n),k in results.items()}), indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: track-b-worker-block-cross-11
+          path: /tmp/b11-evidence/
