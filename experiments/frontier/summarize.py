@@ -19,7 +19,7 @@ rows = [
 summary = []
 for seed in sorted({row["seed"] for row in rows}):
     coefficients = {}
-    for variant in ("official", "development", "candidate"):
+    for variant in ("official", "development", "previous", "candidate"):
         selected = [
             row
             for row in rows
@@ -38,6 +38,7 @@ for seed in sorted({row["seed"] for row in rows}):
         summary.append(entry)
         print(json.dumps(entry))
     assert coefficients["candidate"] > coefficients["development"], coefficients
+    assert coefficients["candidate"] > coefficients["previous"], coefficients
     print(
         "seed",
         seed,

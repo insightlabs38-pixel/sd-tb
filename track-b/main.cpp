@@ -126,45 +126,66 @@ struct FoldEqual {
 };
 
 class FlatDictionary {
+public:
+    // ASCII token bytes leave bit 63 clear; long-token fingerprints set it.
     struct Slot {
-        uint32_t hash = 0;
+        uint64_t key = 0;
         uint32_t id = 0;
+        uint32_t column = numeric_limits<uint32_t>::max();
     };
+private:
     vector<Slot> slots;
     vector<string_view> keys;
 
-    static uint32_t fingerprint(string_view word) {
-        uint64_t hash = 2166136261u;
-        const char *p = word.data();
-        size_t size = word.size();
-        while (size >= 8) {
-            uint64_t bytes;
-            memcpy(&bytes, p, 8);
-            hash = _mm_crc32_u64(hash, bytes | 0x2020202020202020ULL);
-            p += 8;
-            size -= 8;
+    static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
+        if (word.size() <= 8) {
+            uint64_t key = 0;
+            size_t count = word.size();
+            const uint64_t mask = ~uint64_t(0) >> (64 - count * 8);
+            if (read_end && read_end - word.data() >= 8) memcpy(&key, word.data(), 8);
+            else {
+                const char *p = word.data();
+                unsigned shift = 0;
+                if (count & 4) { uint32_t bytes; memcpy(&bytes, p, 4); key = bytes; p += 4; shift = 32; }
+                if (count & 2) { uint16_t bytes; memcpy(&bytes, p, 2); key |= uint64_t(bytes) << shift; p += 2; shift += 16; }
+                if (count & 1) key |= uint64_t(static_cast<unsigned char>(*p)) << shift;
+                if (count == 8) memcpy(&key, word.data(), 8);
+            }
+            key = (key | 0x2020202020202020ULL) & mask;
+            uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+            return {hash ? hash : 1, key};
         }
-        if (size & 4) {
-            uint32_t bytes;
-            memcpy(&bytes, p, 4);
-            hash = _mm_crc32_u32(static_cast<uint32_t>(hash), bytes | 0x20202020u);
-            p += 4;
+        uint64_t first;
+        memcpy(&first, word.data(), 8);
+        first |= 0x2020202020202020ULL;
+        uint64_t last;
+        memcpy(&last, word.data() + word.size() - 8, 8);
+        last |= 0x2020202020202020ULL;
+        uint64_t hash64 = _mm_crc32_u64(2166136261u, first);
+        // The frozen 32-byte maximum makes these chunks cover every token byte.
+        if (word.size() > 16) {
+            uint64_t middle;
+            memcpy(&middle, word.data() + 8, 8);
+            hash64 = _mm_crc32_u64(hash64, middle | 0x2020202020202020ULL);
         }
-        if (size & 2) {
-            uint16_t bytes;
-            memcpy(&bytes, p, 2);
-            hash = _mm_crc32_u16(static_cast<uint32_t>(hash), bytes | 0x2020u);
-            p += 2;
+        if (word.size() > 24) {
+            uint64_t middle;
+            memcpy(&middle, word.data() + 16, 8);
+            hash64 = _mm_crc32_u64(hash64, middle | 0x2020202020202020ULL);
         }
-        if (size & 1) hash = _mm_crc32_u8(static_cast<uint32_t>(hash), static_cast<unsigned char>(*p) | 0x20u);
-        return hash ? static_cast<uint32_t>(hash) : 1;
+        uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(hash64, last ^ word.size()));
+        hash = hash ? hash : 1;
+        return {hash, (uint64_t(1) << 63) | hash};
     }
     void rehash(size_t capacity) {
         vector<Slot> fresh(capacity);
         for (const Slot &slot : slots) {
-            if (!slot.hash) continue;
-            size_t i = slot.hash & (capacity - 1);
-            while (fresh[i].hash) i = (i + 1) & (capacity - 1);
+            if (!slot.key) continue;
+            uint32_t hash = slot.key >> 63 ? static_cast<uint32_t>(slot.key)
+                : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
+            if (!hash) hash = 1;
+            size_t i = hash & (capacity - 1);
+            while (fresh[i].key) i = (i + 1) & (capacity - 1);
             fresh[i] = slot;
         }
         slots.swap(fresh);
@@ -180,33 +201,52 @@ public:
         if (slots.empty()) rehash(16);
         if ((keys.size() + 1) * 10 >= slots.size() * 7)
             rehash(slots.size() * 2);
-        const uint32_t hash = fingerprint(word);
+        const auto [hash, key] = fingerprint(word);
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             Slot &slot = slots[i];
-            if (!slot.hash) {
+            if (!slot.key) {
                 uint32_t id = static_cast<uint32_t>(keys.size());
                 keys.push_back(word);
-                slot = {hash, id};
+                slot = {key, id, numeric_limits<uint32_t>::max()};
                 return {id, true};
             }
-            if (slot.hash == hash && FoldEqual{}(keys[slot.id], word))
+            if (slot.key == key && (!(key >> 63) || FoldEqual{}(keys[slot.id], word)))
                 return {slot.id, false};
             i = (i + 1) & (slots.size() - 1);
         }
     }
-    uint32_t lookup(string_view word, uint32_t known_hash = 0) const {
-        if (slots.empty()) return numeric_limits<uint32_t>::max();
-        const uint32_t hash = known_hash ? known_hash : fingerprint(word);
+    struct Probe {
+        string_view word;
+        uint32_t hash;
+        uint64_t key;
+    };
+    Probe prepare(string_view word, const char *read_end = nullptr) const {
+        const auto [hash, key] = fingerprint(word, read_end);
+        __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
+        return {word, hash, key};
+    }
+    const Slot *resolve(const Probe &probe) const {
+        if (slots.empty()) return nullptr;
+        const auto &[word, hash, key] = probe;
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             const Slot &slot = slots[i];
-            if (!slot.hash) return numeric_limits<uint32_t>::max();
-            if (slot.hash == hash && FoldEqual{}(keys[slot.id], word))
-                return slot.id;
+            if (!slot.key) return nullptr;
+            if (slot.key == key && (!(key >> 63) || FoldEqual{}(keys[slot.id], word)))
+                return &slot;
             i = (i + 1) & (slots.size() - 1);
         }
     }
+    uint32_t lookup(string_view word, const char *read_end = nullptr) const {
+        const Slot *slot = resolve(prepare(word, read_end));
+        return slot ? slot->id : numeric_limits<uint32_t>::max();
+    }
+
+    void configure_columns(const vector<uint32_t> &columns) {
+        for (Slot &slot : slots) if (slot.key) slot.column = columns[slot.id];
+    }
+
 };
 
 struct Query {
@@ -232,12 +272,11 @@ struct Result {
 
 class Engine {
     FlatDictionary dictionary;
-    static constexpr size_t block_docs = 1024, words = block_docs / 64;
+    static constexpr size_t block_docs = 2048, words = block_docs / 64;
     size_t term_count = 0;
     vector<Query> queries;
     vector<int32_t> anchor_head, anchor_next;
     vector<uint32_t> anchor_position;
-    vector<uint32_t> boolean_column;
     size_t boolean_count = 0;
     struct BooleanQuery {
         array<uint32_t, 6> terms{};
@@ -264,8 +303,7 @@ class Engine {
         anchor_head.assign(term_count, -1);
         anchor_next.assign(queries.size(), -1);
         anchor_position.resize(queries.size());
-        boolean_column.assign(term_count, numeric_limits<uint32_t>::max());
-        answers.resize(queries.size());
+        vector<uint32_t> boolean_column(term_count, numeric_limits<uint32_t>::max());
         for (size_t qi = 0; qi < queries.size(); ++qi) {
             const Query &q = queries[qi];
             if (!q.phrase) {
@@ -287,6 +325,7 @@ class Engine {
             anchor_next[qi] = anchor_head[term];
             anchor_head[term] = static_cast<int32_t>(qi);
         }
+        dictionary.configure_columns(boolean_column);
 
     }
 
@@ -309,7 +348,7 @@ class Engine {
         }
     }
 
-    void evaluate_block(const vector<uint64_t> &matrix, const vector<unsigned char> &active,
+    void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
                         size_t in_block, uint32_t block_base, vector<Result> &results) const {
         for (const BooleanQuery &q : boolean_queries) {
             const size_t qi = q.output;
@@ -320,9 +359,9 @@ class Engine {
             }
             if (!possible) continue;
             array<uint64_t, words> value;
-            copy_n(matrix.data() + q.terms[0] * words, words, value.data());
+            copy_n(matrix.data() + active[q.terms[0]] * words, words, value.data());
             for (size_t i = 0; i < size_t(q.count - 1); ++i) {
-                const uint64_t *rhs = matrix.data() + q.terms[i + 1] * words;
+                const uint64_t *rhs = matrix.data() + active[q.terms[i + 1]] * words;
                 if (q.ops[i] == 'A') for (size_t w = 0; w < words; ++w) value[w] &= rhs[w];
                 else if (q.ops[i] == 'O') for (size_t w = 0; w < words; ++w) value[w] |= rhs[w];
                 else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
@@ -374,19 +413,22 @@ class Engine {
             try {
                 Chunk &c = chunks[idx];
                 c.results.resize(queries.size());
-                vector<uint64_t> matrix(boolean_count * words);
-                vector<unsigned char> active(boolean_count);
+                vector<uint64_t> matrix(words);
+                matrix.reserve(words * 8192);
+                vector<uint32_t> active(boolean_count);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
                     evaluate_block(matrix, active, in_block, block_base, c.results);
-                    fill(matrix.begin(), matrix.end(), 0);
+                    matrix.resize(words);
                     fill(active.begin(), active.end(), 0);
                     in_block = 0;
                 };
                 vector<uint32_t> last(queries.size(), numeric_limits<uint32_t>::max());
                 vector<uint32_t> tokens;
+                vector<FlatDictionary::Probe> probes;
                 tokens.reserve(1024);
+                probes.reserve(1024);
                 const char *p = bounds[idx], *stop = bounds[idx + 1];
                 while (p < stop) {
                     const char *line_end = static_cast<const char *>(memchr(p, '\n', stop - p));
@@ -402,17 +444,22 @@ class Engine {
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     tokens.clear();
+                    probes.clear();
                     TokenScanner scanner(tab + 1, line_end);
                     string_view word;
-                    while (scanner.next(word)) {
-                        uint32_t term = dictionary.lookup(word);
-                        uint32_t id = term == numeric_limits<uint32_t>::max() ? 0 : term + 1;
-                        tokens.push_back(id);
-                        if (id) {
-                            uint32_t column = boolean_column[term];
+                    while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    for (const auto &probe : probes) {
+                        const auto *entry = dictionary.resolve(probe);
+                        tokens.push_back(entry ? entry->id + 1 : 0);
+                        if (entry) {
+                            uint32_t column = entry->column;
                             if (column != numeric_limits<uint32_t>::max()) {
-                                matrix[column * words + in_block / 64] |= uint64_t(1) << (in_block % 64);
-                                active[column] = 1;
+                                uint32_t &row = active[column];
+                                if (!row) {
+                                    row = static_cast<uint32_t>(matrix.size() / words);
+                                    matrix.resize(matrix.size() + words, 0);
+                                }
+                                matrix[row * words + in_block / 64] |= uint64_t(1) << (in_block % 64);
                             }
                         }
                     }
@@ -428,11 +475,12 @@ class Engine {
         parse_chunk(0);
         for (thread &t : threads) t.join();
         for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
+        answers.swap(chunks[0].results);
         uint32_t expected_doc = 0;
         for (const Chunk &c : chunks) {
             if (c.docs && c.first_doc != expected_doc) throw runtime_error("nonconsecutive document chunks");
             expected_doc += static_cast<uint32_t>(c.docs);
-            for (size_t qi = 0; qi < queries.size(); ++qi) {
+            for (size_t qi = 0; qi < c.results.size(); ++qi) {
                 Result &dst = answers[qi];
                 const Result &src = c.results[qi];
                 size_t kept = min<size_t>(dst.count, dst.first.size());

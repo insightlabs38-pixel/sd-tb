@@ -4,11 +4,11 @@ A C++20, standard-library-only solution to [Track B](https://github.com/hackatho
 
 ## Approach
 
-Queries select a collision-safe ASCII token dictionary. Up to four workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints, always comparing full token bytes. Boolean terms populate reusable 1,024-document bitmaps; compact plans apply every operator strictly left to right. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency in document-local token buffers. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
+Queries select a collision-safe ASCII token dictionary. Up to four workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints with exact packed short keys and full-byte long-token verification. Document-local batches prefetch dictionary probes, whose slots include Boolean column IDs. Boolean terms populate reusable 2,048-document bitmaps with rows allocated only for terms present in the block; compact plans apply every operator strictly left to right. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency in document-local token buffers. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
 
 ## Validation
 
-[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41147462315) passed three independent full seeds, published sample/full hashes, an independent tiny reference, differential and adversarial oracles, restricted offline Docker, and ASan/UBSan. Native TSan passed the parallel adversarial fixture locally. See PERF.md for paired T/M/S/D/K evidence. Runner measurements are not official board scores.
+The preceding architecture is qualified in [run 41147462315](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41147462315). This version adds sparse bitmap rows and a prefetched dictionary; its independent pinned qualification is pending. Local full seeds 1/2, expanded differential/adversarial suites and ASan/UBSan pass. The expanded oracle covers dictionary growth beyond 338,000 terms and both short- and long-token CRC32C collisions. Runner measurements are not official board scores.
 
 ## Dependencies
 

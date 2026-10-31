@@ -97,3 +97,62 @@ queries = [
 ]
 assert d.run(binary, docs, queries) == d.oracle(docs, queries)
 print("CRC32C collision with distinct full tokens: PASS")
+
+prefix, suffix = b"abcdefgh", b"ijklmnop"
+words = [prefix + middle * 16 + suffix for middle in (b"a", b"b", b"c")]
+docs = [words[0], words[1], words[2], b" ".join(words), words[1].upper()]
+queries = [b"BOOL " + word for word in words]
+queries += [b"BOOL " + words[0] + b" NOT " + words[1]]
+queries += [b'PHRASE "' + words[0] + b" " + words[1] + b'"']
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("Distinct long tokens with identical hash endpoints: PASS")
+
+words = [(b"abc123xyz" * 4)[:size] for size in range(1, 33)]
+docs = [b"." * pad + word + b" END" for word in words for pad in range(64)]
+queries = [b"BOOL " + word for word in words]
+queries += [b'PHRASE "' + word + b' end"' for word in words]
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("All token lengths and SIMD boundary offsets: PASS")
+
+words = [
+    (f"t{index:07x}" if index % 2 else f"longprefix{index:08x}").encode()
+    for index in range(338000)
+]
+queries = []
+position = 0
+for _ in range(31000):
+    queries.append(b"BOOL " + b" OR ".join(words[position : position + 6]))
+    position += 6
+for _ in range(19000):
+    queries.append(b'PHRASE "' + b" ".join(words[position : position + 8]) + b'"')
+    position += 8
+assert position == len(words)
+docs = [
+    b" ".join(words[:8]),
+    b" ".join(words[-16:]),
+    b" ".join(words[91744:91760]).upper(),
+    b" ".join(words[183496:183512]),
+] + [b""] * 996
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("338,000 distinct terms across dictionary growth and mixed key lengths: PASS")
+
+seen = {}
+pair = None
+for _ in range(300000):
+    word = bytes(rng.randrange(97, 123) for _ in range(24))
+    encoded = word[:16] + bytes([word[16] ^ 24]) + word[17:]
+    fingerprint = 2166136261
+    for value in encoded:
+        fingerprint = table[(fingerprint ^ value) & 255] ^ (fingerprint >> 8)
+    fingerprint = fingerprint or 1
+    if fingerprint in seen and seen[fingerprint] != word:
+        pair = (seen[fingerprint], word)
+        break
+    seen[fingerprint] = word
+assert pair
+x, y = pair
+docs = [x, y, x + b" " + y, x.upper(), y.upper()]
+queries = [b"BOOL " + x, b"BOOL " + y, b"BOOL " + x + b" NOT " + y]
+queries += [b'PHRASE "' + x + b" " + y + b'"']
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("Long-token CRC32C collision with full-byte identity checks: PASS")
