@@ -4,11 +4,11 @@ A C++20, standard-library-only solution to [Track B](https://github.com/hackatho
 
 ## Approach
 
-Queries select a collision-safe ASCII token dictionary. Up to six workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints with exact packed short keys and full-byte long-token verification. Document-local batches prefetch dictionary probes, whose slots pack term IDs, Boolean columns and phrase heads. Boolean terms populate 1,024-document bitmaps using lazy singleton rows and packed summaries; compact plans apply every operator strictly left to right. Mandatory-term pruning skips blocks that cannot satisfy a left-associative Boolean query. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency against the same exact lookup probes. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
+Queries select a collision-safe ASCII token dictionary. Up to six workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints with exact packed short keys and full-byte long-token verification. Document-local batches prefetch dictionary probes, whose slots pack term IDs, Boolean columns and phrase heads. Boolean terms populate 1,152-document bitmaps using lazy singleton rows and packed summaries; compact plans apply every operator strictly left to right. Mandatory-term pruning skips blocks that cannot satisfy a left-associative Boolean query. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency against the same exact lookup probes. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
 
 ## Validation
 
-[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41191969092) passes three full seeds, published sample/full hashes, an independent tiny reference, ASan/UBSan, TSan, expanded differential/adversarial oracles and restricted offline Docker. The oracle covers 338,000-term dictionary growth, all token lengths/alignment offsets all byte classes at every SIMD alignment, and deliberate short/long CRC32C collisions including repeated and reversed phrase terms. See PERF.md for full T/M/S/D/K comparisons. Runner measurements are not official board scores.
+[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41199946808) passes three full seeds, published sample/full hashes, an independent tiny reference, ASan/UBSan, TSan, expanded differential/adversarial oracles and restricted offline Docker. The oracle covers 338,000-term dictionary growth, all token lengths/alignment offsets all byte classes at every SIMD alignment, and deliberate short/long CRC32C collisions including repeated and reversed phrase terms. See PERF.md for full T/M/S/D/K comparisons. Runner measurements are not official board scores.
 
 ## Dependencies
 
@@ -16,4 +16,4 @@ None beyond the C++ standard library and system C runtime. Build image is the pi
 
 ## Next optimization targets
 
-Retain the verified 1,024-document baseline while evaluating isolated challengers against exact reference outputs and the full T/M/S/D coefficient. The official integrator owns promotion and board measurements.
+Retain the verified 1,152-document baseline while evaluating isolated challengers against exact reference outputs and the full T/M/S/D coefficient. The official integrator owns promotion and board measurements.
