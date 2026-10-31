@@ -49,28 +49,21 @@ struct MappedFile {
 
 class TokenScanner {
     const char *cursor, *end, *base;
-    uint64_t valid = 0;
-    static uint32_t classify(const char *load) {
-        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(load));
-        __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
-        __m256i letters = _mm256_and_si256(
-            _mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)),
-            _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
-        __m256i digits = _mm256_and_si256(
-            _mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)),
-            _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
-        return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
-    }
+    uint32_t valid = 0;
     void refill() {
         base = cursor;
-        size_t count = min<size_t>(end - cursor, 64);
-        alignas(32) char tail[64]{};
+        size_t count = min<size_t>(end - cursor, 32);
+        alignas(32) char tail[32]{};
         const char *load = cursor;
-        if (count < 64) {
+        if (count < 32) {
             memcpy(tail, cursor, count);
             load = tail;
         }
-        valid = uint64_t(classify(load)) | (uint64_t(classify(load + 32)) << 32);
+        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(load));
+        __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
+        __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
+        __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
+        valid = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
         cursor += count;
     }
 public:
@@ -83,17 +76,17 @@ public:
         unsigned first = countr_zero(valid);
         const char *start = base + first;
         unsigned count = countr_one(valid >> first);
-        if (first + count < 64) {
-            valid &= ~((uint64_t(1) << (first + count)) - 1);
+        if (first + count < 32) {
+            valid &= ~((uint32_t(1) << (first + count)) - 1);
             word = string_view(start, count);
             return true;
         }
         do {
             refill();
             count = countr_one(valid);
-        } while (count == 64);
+        } while (count == 32);
         const char *stop = base + count;
-        valid &= ~((uint64_t(1) << count) - 1);
+        valid &= ~((uint32_t(1) << count) - 1);
         word = string_view(start, stop - start);
         return true;
     }
@@ -387,7 +380,33 @@ public:
 
 class Engine {
     FlatDictionary dictionary;
-    static constexpr uint32_t singleton = 0x80000000u;
+    // Five sorted 12-bit positions fit below the count tag; bit 60 marks a query-local bitmap.
+    static constexpr unsigned small_shift = 61, position_bits = 12, small_limit = 5;
+    static unsigned small_count(uint64_t state) { return static_cast<unsigned>(state >> small_shift); }
+    static uint32_t small_position(uint64_t state, unsigned index) {
+        return static_cast<uint32_t>(state >> (index * position_bits)) & 4095u;
+    }
+    static uint64_t small_union(uint64_t a, uint64_t b) {
+        unsigned i = 0, j = 0, size = 0, na = small_count(a), nb = small_count(b);
+        uint64_t result = 0;
+        while (i < na || j < nb) {
+            uint32_t x = i < na ? small_position(a, i) : numeric_limits<uint32_t>::max();
+            uint32_t y = j < nb ? small_position(b, j) : numeric_limits<uint32_t>::max();
+            uint32_t position = min(x, y);
+            if (size == small_limit) return 0;
+            result |= uint64_t(position) << (size++ * position_bits);
+            if (x == position) ++i;
+            if (y == position) ++j;
+        }
+        return result | (uint64_t(size) << small_shift);
+    }
+    static bool small_contains(uint64_t state, uint32_t position) {
+        // Unused lanes are ones, so zero-lane detection tests only stored positions.
+        constexpr uint64_t lanes = 0x1001001001001ULL;
+        uint64_t valid = (uint64_t(1) << (small_count(state) * position_bits)) - 1;
+        uint64_t difference = (state ^ (uint64_t(position) * lanes)) | ~valid;
+        return ((difference - lanes) & ~difference & (lanes << 11)) != 0;
+    }
     size_t term_count = 0;
     vector<Query> queries;
     struct PhrasePlan {
@@ -404,7 +423,6 @@ class Engine {
         array<char, 5> ops{};
         uint8_t count = 0;
         uint32_t output = 0;
-        uint32_t required = numeric_limits<uint32_t>::max();
     };
     vector<BooleanQuery> boolean_queries;
     Results answers;
@@ -435,16 +453,6 @@ class Engine {
                 plan.count = static_cast<uint8_t>(q.term_count);
                 for (size_t i = 0; i < q.term_count; ++i) plan.terms[i] = boolean_column[q.terms[i]];
                 plan.ops = q.ops;
-                uint32_t mandatory = q.terms[0];
-                for (size_t i = 0; i + 1 < q.term_count; ++i) {
-                    if (q.ops[i] == 'O') mandatory = numeric_limits<uint32_t>::max();
-                    else if (q.ops[i] == 'A' &&
-                             (mandatory == numeric_limits<uint32_t>::max() ||
-                              frequency[q.terms[i + 1]] < frequency[mandatory]))
-                        mandatory = q.terms[i + 1];
-                }
-                if (mandatory != numeric_limits<uint32_t>::max())
-                    plan.required = boolean_column[mandatory];
                 boolean_queries.push_back(plan);
                 continue;
             }
@@ -489,73 +497,87 @@ class Engine {
     }
 
     template<size_t block_docs>
-    void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
+    void evaluate_block(const vector<uint64_t> &matrix, const vector<uint64_t> &active,
                         size_t in_block, uint32_t block_base, Results &results) const {
         static constexpr size_t words = block_docs / 64;
-        static constexpr uint32_t local_value = 0x40000000u;
+        static constexpr uint64_t local_value = uint64_t(1) << 60;
         for (const BooleanQuery &q : boolean_queries) {
-            if (q.required != numeric_limits<uint32_t>::max() && !active[q.required]) continue;
-            uint32_t state = active[q.terms[0]];
+            uint64_t state = active[q.terms[0]];
             array<uint64_t, words> value;
-            auto materialize = [&] {
-                if (state != local_value) {
-                    copy_n(matrix.data() + state * words, words, value.data());
-                    state = local_value;
-                }
-            };
-            auto present = [&](uint32_t source, uint32_t position) {
+            auto present = [&](uint64_t source, uint32_t position) -> bool {
+                unsigned size = small_count(source);
+                if (size) return small_contains(source, position);
                 const uint64_t *data = source == local_value ? value.data() : matrix.data() + source * words;
                 return (data[position / 64] >> (position % 64)) & 1;
             };
+            auto add_small = [&](uint64_t source) {
+                for (unsigned j = 0, size = small_count(source); j < size; ++j) {
+                    uint32_t position = small_position(source, j);
+                    value[position / 64] |= uint64_t(1) << (position % 64);
+                }
+            };
+            auto materialize = [&] {
+                if (state == local_value) return;
+                if (small_count(state)) { value.fill(0); add_small(state); }
+                else copy_n(matrix.data() + state * words, words, value.data());
+                state = local_value;
+            };
+            auto filter = [&](uint64_t source, uint64_t other, bool keep_matches) {
+                uint64_t result = 0;
+                unsigned kept = 0;
+                for (unsigned j = 0, size = small_count(source); j < size; ++j) {
+                    uint32_t position = small_position(source, j);
+                    if (present(other, position) == keep_matches)
+                        result |= uint64_t(position) << (kept++ * position_bits);
+                }
+                return result | (uint64_t(kept) << small_shift);
+            };
             for (size_t i = 0; i < size_t(q.count - 1); ++i) {
-                uint32_t other = active[q.terms[i+1]];
                 char op = q.ops[i];
+                if (!state && op != 'O') continue;
+                uint64_t other = active[q.terms[i+1]];
                 if (op == 'O') {
                     if (!other || state == other) continue;
                     if (!state) { state = other; continue; }
-                    if (other & singleton) {
-                        uint32_t position = other & ~singleton;
-                        if (state & singleton) {
-                            uint32_t previous = state & ~singleton;
-                            value.fill(0);
-                            value[previous / 64] = uint64_t(1) << (previous % 64);
-                            state = local_value;
-                        } else materialize();
-                        value[position / 64] |= uint64_t(1) << (position % 64);
-                    } else if (state & singleton) {
-                        uint32_t position = state & ~singleton;
+                    unsigned left_size = small_count(state), right_size = small_count(other);
+                    if (left_size && right_size) {
+                        uint64_t merged = small_union(state, other);
+                        if (merged) state = merged;
+                        else { materialize(); add_small(other); }
+                    } else if (right_size) { materialize(); add_small(other); }
+                    else if (left_size) {
+                        uint64_t previous = state;
                         copy_n(matrix.data() + other * words, words, value.data());
-                        value[position / 64] |= uint64_t(1) << (position % 64);
+                        add_small(previous);
                         state = local_value;
                     } else {
                         materialize();
                         const uint64_t *rhs = matrix.data() + other * words;
                         for (size_t w = 0; w < words; ++w) value[w] |= rhs[w];
                     }
-                    continue;
-                }
-                if (!state) continue;
-                if (!other) { if (op == 'A') state = 0; continue; }
-                if (state & singleton) {
-                    uint32_t position = state & ~singleton;
-                    bool hit = other & singleton ? state == other : present(other, position);
-                    if (op == 'A' ? !hit : hit) state = 0;
-                } else if (other & singleton) {
-                    uint32_t position = other & ~singleton;
-                    if (op == 'A') state = present(state, position) ? other : 0;
-                    else {
-                        materialize();
-                        value[position / 64] &= ~(uint64_t(1) << (position % 64));
-                    }
                 } else {
-                    materialize();
-                    const uint64_t *rhs = matrix.data() + other * words;
-                    if (op == 'A') for (size_t w = 0; w < words; ++w) value[w] &= rhs[w];
-                    else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
+                    if (!other) { if (op == 'A') state = 0; continue; }
+                    if (small_count(state)) state = filter(state, other, op == 'A');
+                    else if (small_count(other)) {
+                        if (op == 'A') state = filter(other, state, true);
+                        else {
+                            materialize();
+                            for (unsigned j = 0, size = small_count(other); j < size; ++j) {
+                                uint32_t position = small_position(other, j);
+                                value[position / 64] &= ~(uint64_t(1) << (position % 64));
+                            }
+                        }
+                    } else {
+                        materialize();
+                        const uint64_t *rhs = matrix.data() + other * words;
+                        if (op == 'A') for (size_t w = 0; w < words; ++w) value[w] &= rhs[w];
+                        else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
+                    }
                 }
             }
-            if (state & singleton) results.add(q.output, block_base + (state & ~singleton));
-            else if (state) {
+            if (unsigned size = small_count(state)) {
+                for (unsigned j = 0; j < size; ++j) results.add(q.output, block_base + small_position(state, j));
+            } else if (state) {
                 const uint64_t *data = state == local_value ? value.data() : matrix.data() + state * words;
                 for (size_t w = 0; w < (in_block + 63) / 64; ++w)
                     results.add_bits(q.output, data[w], block_base + static_cast<uint32_t>(w * 64));
@@ -566,6 +588,7 @@ class Engine {
     template<size_t block_docs>
     void scan_corpus(const MappedFile &input, size_t workers) {
         static constexpr size_t words = block_docs / 64;
+        static_assert(block_docs <= (1u << position_bits));
         struct Chunk {
             Results results;
             uint32_t first_doc = 0, last_doc = 0;
@@ -588,7 +611,7 @@ class Engine {
                 c.results.reset(query_count);
                 vector<uint64_t> matrix(words);
                 matrix.reserve(words * (boolean_count + 1));
-                vector<uint32_t> active(boolean_count);
+                vector<uint64_t> active(boolean_count);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
@@ -633,16 +656,25 @@ class Engine {
                             uint32_t column = entry->column();
                             if (column) {
                                 --column;
-                                uint32_t &row = active[column];
-                                if (!row) {
-                                    row = singleton | static_cast<uint32_t>(in_block);
-                                } else if (row & singleton) {
-                                    uint32_t previous = row & ~singleton;
-                                    if (previous != in_block) {
-                                        row = static_cast<uint32_t>(matrix.size() / words);
-                                        matrix.resize(matrix.size() + words, 0);
-                                        matrix[row * words + previous / 64] = uint64_t(1) << (previous % 64);
-                                        matrix[row * words + document_word] |= document_bit;
+                                uint64_t &row = active[column];
+                                unsigned size = small_count(row);
+                                if (!row) row = (uint64_t(1) << small_shift) | in_block;
+                                else if (size) {
+                                    if (small_position(row, size - 1) != in_block) {
+                                        if (size < small_limit) {
+                                            row = (row & ((uint64_t(1) << small_shift) - 1)) |
+                                                (uint64_t(in_block) << (size * position_bits)) |
+                                                (uint64_t(size + 1) << small_shift);
+                                        } else {
+                                            uint64_t previous = row;
+                                            row = matrix.size() / words;
+                                            matrix.resize(matrix.size() + words, 0);
+                                            for (unsigned j = 0; j < small_limit; ++j) {
+                                                uint32_t position = small_position(previous, j);
+                                                matrix[row * words + position / 64] |= uint64_t(1) << (position % 64);
+                                            }
+                                            matrix[row * words + document_word] |= document_bit;
+                                        }
                                     }
                                 } else matrix[row * words + document_word] |= document_bit;
                             }
@@ -720,8 +752,8 @@ public:
         parse_queries(query_file);
         MappedFile docs_file(data_dir + "/docs.txt");
         compile_queries(docs_file);
-        const size_t workers = docs_file.size >= (8u << 20) ? 6 : 1;
-        scan_corpus<1152>(docs_file, workers);
+        const size_t workers = docs_file.size >= (8u << 20) ? 12 : 1;
+        scan_corpus<2048>(docs_file, workers);
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
         if (!output) throw runtime_error("cannot open output");

@@ -220,3 +220,9 @@ Promoted exact challenger in [commit 227b4b9e](https://github.com/insightlabs38-
 ## AND-only Boolean rarity reordering (rejected, October 31)
 
 [Three-seed qualification 41205124157](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41205124157) passed full exact hashes, differential/adversarial tests, ASan/UBSan, TSan and offline Docker. Sorting positive intersections by sampled rarity and applying exclusions last is logically exact for queries without OR, but runner-local K ratios were **1.00440 / 0.99499 / 0.99325**, geometric mean **0.99753** (S 874 to 903). Rejected; the source remains isolated on `track-b/and-only-reorder-11`.
+
+## Qualified compact 12-worker hybrid
+
+Source `ea351a5c9a3eb985faab60326e61387b6366b8b6` combines exact 9–12-letter keys, packed count/sum headers and lazy Boolean evaluation. Full inputs use 12 literal workers with 2,048-document blocks; there is no worker environment override. [Pinned qualification 41165413401](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41165413401) passes production-Docker oracles, ASan/UBSan, TSan, all three full references, published sample/full hashes and tiny seed 7.
+
+Full seeds 1/2/3: organizer five-run trimmed T=0.324628/0.325807/0.326278 s; peak M=42610688/41828352/42856448 B; S=925; D=1; K_local=20.346611/20.309763/20.295099. These are paired four-logical-CPU runner measurements, not official scores or a rejection of higher-core scaling. [Complete evidence and controlled handoff](https://github.com/insightlabs38-pixel/sd-tb/blob/frontier/b-sol-hybrid-qualification/experiments/frontier/HYBRIDS.md). Rollbacks: `b9ab12a`, official `8d5bc54` / PR #3 `338c7cf`, and PR #2 `4069aa9`.
