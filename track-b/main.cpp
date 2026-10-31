@@ -307,10 +307,24 @@ class Results {
         uint32_t count() const { return static_cast<uint32_t>(total >> 35); }
         uint64_t sum() const { return total & ((uint64_t(1) << 35) - 1); }
     };
+    struct Id24 {
+        uint8_t bytes[3]{};
+        Id24 &operator=(uint32_t id) noexcept {
+            bytes[0] = static_cast<uint8_t>(id);
+            bytes[1] = static_cast<uint8_t>(id >> 8);
+            bytes[2] = static_cast<uint8_t>(id >> 16);
+            return *this;
+        }
+        explicit operator uint32_t() const noexcept {
+            return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+                   (uint32_t(bytes[2]) << 16);
+        }
+    };
+    static_assert(sizeof(Id24) == 3);
     vector<Summary> rows;
-    vector<array<uint32_t, kept_ids>> first_ids;
+    vector<array<Id24, kept_ids>> first_ids;
 
-    array<uint32_t, kept_ids> &first_for(Summary &row) {
+    array<Id24, kept_ids> &first_for(Summary &row) {
         if (!row.count()) {
             row.first_offset = static_cast<uint32_t>(first_ids.size());
             first_ids.emplace_back();
@@ -376,7 +390,7 @@ public:
             p = to_chars(p, p + 24, row.sum()).ptr;
             for (size_t i = 0; i < min<size_t>(row.count(), kept_ids); ++i) {
                 *p++ = ' ';
-                p = to_chars(p, p + 24, first_ids[row.first_offset][i]).ptr;
+                p = to_chars(p, p + 24, static_cast<uint32_t>(first_ids[row.first_offset][i])).ptr;
             }
             *p++ = '\n';
             out.write(line.data(), p - line.data());
