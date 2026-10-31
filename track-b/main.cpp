@@ -444,8 +444,10 @@ class Engine {
                         if (q.ops[i] == 'A') positive[positives++] = q.terms[i + 1];
                         else negative[negatives++] = q.terms[i + 1];
                     }
-                    sort(positive.begin(), positive.begin() + positives,
-                         [&](uint32_t a, uint32_t b) { return frequency[a] < frequency[b]; });
+                    for (size_t i = 0; i < positives; ++i)
+                        for (size_t j = i + 1; j < positives; ++j)
+                            if (frequency[positive[j]] < frequency[positive[i]])
+                                swap(positive[i], positive[j]);
                     for (size_t i = 0; i < positives; ++i) {
                         plan.terms[i] = boolean_column[positive[i]];
                         if (i) plan.ops[i - 1] = 'A';
