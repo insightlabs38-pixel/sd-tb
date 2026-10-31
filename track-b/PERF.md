@@ -123,3 +123,11 @@ Promoted source commit [bb940fd216110ceda816fd7bc00a8b7ff9b0088d](https://github
 Full seed 1 baseline wall **0.92/0.87/0.88 s** versus segmented **0.92/0.86/0.86 s**, peak RSS about **622 to 553 MiB**. Full seed 2 baseline **0.86/0.88/0.87 s** versus segmented **0.87/0.86/0.88 s**, peak RSS about **619 to 549 MiB**. Wall improvement is small/noisy; the reproducible 69–71 MiB RSS reduction is the primary benefit. [Earlier independent ownership comparison 41137002236](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41137002236) corroborated the memory reduction, checked the 80,000-phrase-term 32-bit fallback, exact full seeds and offline Docker. Source grew by 16 physical lines, runtime dependencies unchanged.
 
 Promoted exact challenger in [commit 227b4b9e](https://github.com/insightlabs38-pixel/sd-tb/commit/227b4b9e778b74fafb78832247051c3dfa3c7609), source blob `d968fb7e6f744c1b828141f201ed8de692f1f226`. All measurements are GitHub runner-local; official board T/M/K and cgroup peak require Luna's separate submission.
+
+## Compact-tape PMR allocator retest (rejected, October 31)
+
+[Full-seed qualification 41143226088](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41143226088) passed differential, exact full seed-1/2, sanitizer and offline Docker gates. Three-run mean seconds on seed 1: baseline **0.927**, pool **0.940**, monotonic **0.967**; seed 2: baseline **0.947**, pool **0.953**, monotonic **0.947**. Peak RSS increased about **16 MiB** for pool and **116 MiB** for monotonic. Both are scoring-negative versus the 16-bit tape baseline; do not promote.
+
+## CRC32C token fingerprints (qualified, not promoted, October 31)
+
+[Two-seed comparison 41138170073](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41138170073) passed exact outputs, collision checks and offline Docker. Three-run means: seed 1 baseline **1.437 s**, CRC32C **1.403 s**; seed 2 baseline **1.423 s**, CRC32C **1.413 s**; RSS unchanged. The gains are modest, particularly on seed 2, and are from a different runner environment than the segmented-tape qualification. Retain as an experiment until an independent repeat and a same-runner end-to-end scored comparison show improvement beyond source-size cost.
