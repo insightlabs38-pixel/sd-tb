@@ -394,6 +394,7 @@ class Engine {
         uint32_t output = 0;
         int32_t next = -1;
         uint8_t count = 0, anchor = 0;
+        array<uint8_t, 8> check_order{};
         array<uint64_t, 8> keys{};
     };
     vector<PhrasePlan> phrases;
@@ -457,6 +458,11 @@ class Engine {
             plan.output = static_cast<uint32_t>(qi);
             plan.count = q.term_count;
             plan.anchor = static_cast<uint8_t>(best);
+            size_t checks = 0;
+            for (size_t i = 0; i < q.term_count; ++i)
+                if (i != best) plan.check_order[checks++] = static_cast<uint8_t>(i);
+            sort(plan.check_order.begin(), plan.check_order.begin() + checks,
+                 [&](uint8_t a, uint8_t b) { return frequency[q.terms[a]] < frequency[q.terms[b]]; });
             plan.next = anchor_head[term];
             anchor_head[term] = static_cast<int32_t>(phrases.size());
             phrases.push_back(plan);
@@ -475,12 +481,16 @@ class Engine {
                 const PhrasePlan &plan = phrases[pid];
                 const size_t anchor = plan.anchor, count = plan.count;
                 if (pos < anchor || count - anchor > probes.size() - pos) continue;
-                size_t start = pos - anchor, j = 0;
-                while (j < anchor && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
-                if (j != anchor) continue;
-                j = anchor + 1;
-                while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
-                if (j == count) {
+                size_t start = pos - anchor;
+                bool matched = true;
+                for (size_t j = 0; j + 1 < count; ++j) {
+                    uint8_t offset = plan.check_order[j];
+                    if (!dictionary.phrase_equal(plan.keys[offset], probes[start + offset])) {
+                        matched = false;
+                        break;
+                    }
+                }
+                if (matched) {
                     last[pid] = doc;
                     results.add(plan.output, doc);
                 }
