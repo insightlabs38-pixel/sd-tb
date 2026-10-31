@@ -433,18 +433,42 @@ class Engine {
                 BooleanQuery plan;
                 plan.output = static_cast<uint32_t>(qi);
                 plan.count = static_cast<uint8_t>(q.term_count);
-                for (size_t i = 0; i < q.term_count; ++i) plan.terms[i] = boolean_column[q.terms[i]];
-                plan.ops = q.ops;
-                uint32_t mandatory = q.terms[0];
-                for (size_t i = 0; i + 1 < q.term_count; ++i) {
-                    if (q.ops[i] == 'O') mandatory = numeric_limits<uint32_t>::max();
-                    else if (q.ops[i] == 'A' &&
-                             (mandatory == numeric_limits<uint32_t>::max() ||
-                              frequency[q.terms[i + 1]] < frequency[mandatory]))
-                        mandatory = q.terms[i + 1];
+                bool has_or = false;
+                for (size_t i = 0; i < q.op_count; ++i) has_or |= q.ops[i] == 'O';
+                if (!has_or) {
+                    // With no OR, all positive intersections commute with exclusions.
+                    array<uint32_t, 6> positive{}, negative{};
+                    size_t positives = 0, negatives = 0;
+                    positive[positives++] = q.terms[0];
+                    for (size_t i = 0; i < q.op_count; ++i) {
+                        if (q.ops[i] == 'A') positive[positives++] = q.terms[i + 1];
+                        else negative[negatives++] = q.terms[i + 1];
+                    }
+                    sort(positive.begin(), positive.begin() + positives,
+                         [&](uint32_t a, uint32_t b) { return frequency[a] < frequency[b]; });
+                    for (size_t i = 0; i < positives; ++i) {
+                        plan.terms[i] = boolean_column[positive[i]];
+                        if (i) plan.ops[i - 1] = 'A';
+                    }
+                    for (size_t i = 0; i < negatives; ++i) {
+                        plan.terms[positives + i] = boolean_column[negative[i]];
+                        plan.ops[positives + i - 1] = 'N';
+                    }
+                    plan.required = boolean_column[positive[0]];
+                } else {
+                    for (size_t i = 0; i < q.term_count; ++i) plan.terms[i] = boolean_column[q.terms[i]];
+                    plan.ops = q.ops;
+                    uint32_t mandatory = q.terms[0];
+                    for (size_t i = 0; i + 1 < q.term_count; ++i) {
+                        if (q.ops[i] == 'O') mandatory = numeric_limits<uint32_t>::max();
+                        else if (q.ops[i] == 'A' &&
+                                 (mandatory == numeric_limits<uint32_t>::max() ||
+                                  frequency[q.terms[i + 1]] < frequency[mandatory]))
+                            mandatory = q.terms[i + 1];
+                    }
+                    if (mandatory != numeric_limits<uint32_t>::max())
+                        plan.required = boolean_column[mandatory];
                 }
-                if (mandatory != numeric_limits<uint32_t>::max())
-                    plan.required = boolean_column[mandatory];
                 boolean_queries.push_back(plan);
                 continue;
             }
