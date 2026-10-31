@@ -786,7 +786,7 @@ class Engine {
                         const uint32_t column = static_cast<uint32_t>(entry >> 20) & 0xfffffu;
                         const bool hot = column - 1 < hot_columns;
                         hot_rows[(hot ? column : hot_columns + 1) * words + document_word] |= document_bit;
-                        __builtin_prefetch(&active[column > hot_columns ? column - 1 : 0]);
+                        if (!active.empty()) __builtin_prefetch(active.data() + (column > hot_columns ? column - 1 : 0));
                         cold[cold_count] = column;
                         cold_count += column > hot_columns;
                     }
