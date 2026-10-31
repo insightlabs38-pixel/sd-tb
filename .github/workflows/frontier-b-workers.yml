@@ -1,0 +1,46 @@
+name: Frontier B worker scaling qualification
+on:
+  push:
+    branches: [frontier/b-sol-worker-qualification]
+    paths: [experiments/frontier/**, tests/frontier_adversarial.py, .github/workflows/frontier-b-workers.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: frontier-b-worker-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pinned offline production builds
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          docker pull gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce
+          docker pull debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+          python3 experiments/frontier/qualify-workers.py build
+      - name: Production Docker oracles and all worker sanitizers
+        run: python3 experiments/frontier/qualify-workers.py gates
+      - name: Three independent full corpora and references
+        run: python3 experiments/frontier/qualify-workers.py corpus
+      - name: Rotated restricted Docker measurements
+        run: sudo python3 experiments/frontier/qualify-workers.py benchmark
+      - name: Canonical source axes and full coefficients
+        run: |
+          set -euo pipefail
+          python3 -m pip install clang-format==23.1.3
+          curl -fL https://github.com/boyter/scc/releases/download/v4.1.0/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
+          echo 'c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b  /tmp/scc.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/scc.tar.gz -C /tmp/bin scc
+          python3 experiments/frontier/qualify-workers.py summarize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontier-b-worker-evidence
+          path: /tmp/evidence/
