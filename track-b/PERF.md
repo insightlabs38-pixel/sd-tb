@@ -281,9 +281,9 @@ become ~20% of T, so parallelizing query interning (sharded buckets) is the most
 
 ### Handoff for Luna (exact source)
 
-* Source: `track-b/main.cpp` at `a84e0b5d0ddd844bfe5a8b7eb7318ce09bf277a6` on `branch/festive-hawking-wn31k1`, blob
-  `3c5bce7504eae1a0da6deb4a898a597d03214963`. `track-b/Dockerfile` is byte-identical to `sd-sm` (blob `9b064d4031a7...`).
-* Canonical S (clang-format LLVM + scc): 1,103 + 7 Dockerfile lines = 1,110; D = 1; no new dependencies.
+* Source: `track-b/main.cpp` at `c6d232c506ca1dae545f6e2b40d92c3fc6ed5ec8` on `branch/festive-hawking-wn31k1` (PR #9), blob
+  `854acdeda8b5d0f04ce17db0cc4268a5a5f60bd3`; CI on exactly this blob: [run 41251446909](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41251446909), T 0.482 -> 0.314 s, 0.477 -> 0.312 s, 0.478 -> 0.315 s, K ratio **1.206 / 1.204 / 1.198**. Earlier receipts above used the previous blob `3c5bce75...`, which differs only by a plan-reserve and anchor-comparison cleanup (-2 canonical lines). `track-b/Dockerfile` is byte-identical to `sd-sm` (blob `9b064d4031a7...`).
+* Canonical S (clang-format LLVM + scc): 1,101 + 7 Dockerfile lines = 1,108; D = 1; no new dependencies.
 * Suggested A/B: this blob versus `76946cc`, same host and image, five interleaved runs. Expect the scoring host's T to
   fall by 30-40% (local), or ~25-30% if SMT contention behaves like the 4-vCPU runner; memory should stay near 49-55 MB
   (12 workers), so the M term is slightly negative while the cap does not apply.
