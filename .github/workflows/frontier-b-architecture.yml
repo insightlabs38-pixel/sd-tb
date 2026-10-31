@@ -1,7 +1,7 @@
 name: Frontier B architecture qualification
 on:
   push:
-    branches: [frontier/b-sol-architecture, frontier/b-sol-streaming-v2, frontier/b-sol-streaming-v3]
+    branches: [frontier/b-sol-architecture, frontier/b-sol-streaming-v2, frontier/b-sol-streaming-v3, frontier/b-sol-streaming-v4]
     paths: [track-b/main.cpp, tests/frontier_adversarial.py, experiments/frontier/**, .github/workflows/frontier-b-architecture.yml]
   workflow_dispatch:
 permissions:
@@ -24,22 +24,29 @@ jobs:
           git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
           docker pull gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce
           docker pull debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-          mkdir -p /tmp/official /tmp/development /tmp/previous /tmp/bin /tmp/evidence
+          mkdir -p /tmp/official /tmp/development /tmp/previous /tmp/experimental /tmp/bin /tmp/evidence
           cp track-b/Dockerfile /tmp/official/
           cp track-b/Dockerfile /tmp/development/
           cp track-b/Dockerfile /tmp/previous/
-          git show 8902fb9:track-b/main.cpp > /tmp/official/main.cpp
-          git show 763a5f5:track-b/main.cpp > /tmp/development/main.cpp
-          git show 4069aa9:track-b/main.cpp > /tmp/previous/main.cpp
+          git show 4069aa9:track-b/main.cpp > /tmp/official/main.cpp
+          git show 0760832:track-b/main.cpp > /tmp/development/main.cpp
+          git show 338c7cf:track-b/main.cpp > /tmp/previous/main.cpp
           docker build --network=none -t frontier:official /tmp/official
           docker build --network=none -t frontier:development /tmp/development
           docker build --network=none -t frontier:previous /tmp/previous
           docker build --network=none -t frontier:candidate track-b
+          cp track-b/Dockerfile /tmp/experimental/
+          git show ff091f9:track-b/main.cpp > /tmp/experimental/original.cpp
+          sed 's/thread::hardware_concurrency()/12u/g' /tmp/experimental/original.cpp > /tmp/experimental/main.cpp
+          docker build --network=none -t frontier:experimental /tmp/experimental
           gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bin/sd-timer
           g++ -std=c++20 -O3 -march=x86-64-v3 -pthread -Wall -Wextra track-b/main.cpp -o /tmp/bin/candidate
       - name: Differential and adversarial exactness
         run: |
           set -euo pipefail
+          g++ -std=c++20 -O3 -march=x86-64-v3 -pthread -Wall -Wextra /tmp/experimental/main.cpp -o /tmp/bin/experimental
+          python3 tests/differential.py /tmp/bin/experimental
+          python3 tests/frontier_adversarial.py /tmp/bin/experimental
           python3 tests/differential.py /tmp/bin/candidate
           python3 tests/frontier_adversarial.py /tmp/bin/candidate
           g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/bin/sanitized
@@ -47,6 +54,10 @@ jobs:
           python3 tests/frontier_adversarial.py /tmp/bin/sanitized
           g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/bin/thread-sanitized
           TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/thread-sanitized
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie /tmp/experimental/main.cpp -o /tmp/bin/experimental-sanitized
+          python3 tests/frontier_adversarial.py /tmp/bin/experimental-sanitized
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie /tmp/experimental/main.cpp -o /tmp/bin/experimental-thread-sanitized
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/experimental-thread-sanitized
       - name: Independent full corpora and references
         run: |
           set -euo pipefail
@@ -68,7 +79,7 @@ jobs:
             else
               expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1)
             fi
-            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --results /tmp/evidence/measurements.jsonl frontier:official frontier:development frontier:previous frontier:candidate
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --results /tmp/evidence/measurements.jsonl frontier:official frontier:development frontier:previous frontier:candidate frontier:experimental
           done
           sudo python3 experiments/frontier/compare.py --data /tmp/sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl frontier:candidate
           expected=$(sha256sum /tmp/ref-tiny/results.txt | cut -d' ' -f1)
@@ -80,9 +91,9 @@ jobs:
           curl -fL https://github.com/boyter/scc/releases/download/v4.1.0/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
           echo 'c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b  /tmp/scc.tar.gz' | sha256sum -c -
           tar -xzf /tmp/scc.tar.gz -C /tmp/bin scc
-          for variant in official development previous candidate; do
+          for variant in official development previous candidate experimental; do
             mkdir -p "/tmp/count-$variant"
-            if [ "$variant" = candidate ]; then source=track-b/main.cpp; else source="/tmp/$variant/main.cpp"; fi
+            if [ "$variant" = candidate ]; then source=track-b/main.cpp; elif [ "$variant" = experimental ]; then source=/tmp/experimental/original.cpp; else source="/tmp/$variant/main.cpp"; fi
             clang-format --style=LLVM "$source" > "/tmp/count-$variant/main.cpp"
             cp track-b/Dockerfile "/tmp/count-$variant/"
             /tmp/bin/scc --format json "/tmp/count-$variant" > "/tmp/evidence/static-$variant.json"

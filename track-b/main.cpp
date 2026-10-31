@@ -378,7 +378,7 @@ class Engine {
     }
 
     void match_document(uint32_t doc, const vector<FlatDictionary::Probe> &probes,
-                        const vector<pair<uint32_t, int32_t>> &anchors,
+                        span<const pair<uint32_t, int32_t>> anchors,
                         vector<Result> &results, vector<uint32_t> &last) const {
         for (const auto &[pos, head] : anchors) {
             for (int32_t pid = head; pid >= 0; pid = phrases[pid].next) {
@@ -494,17 +494,20 @@ class Engine {
                     c.last_doc = doc;
                     ++c.docs;
                     if (!in_block) block_base = doc;
-                    anchors.clear();
+                    size_t anchor_count = 0;
                     probes.clear();
                     TokenScanner scanner(tab + 1, line_end);
                     string_view word;
                     while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    const uint64_t document_bit = uint64_t(1) << (in_block % 64);
+                    const size_t document_word = in_block / 64;
+                    if (anchors.size() < probes.size()) anchors.resize(probes.size());
                     for (size_t index = 0; index < probes.size(); ++index) {
                         const auto &probe = probes[index];
                         const auto *entry = dictionary.resolve(probe);
                         if (entry) {
                             int32_t head = entry->head();
-                            if (head >= 0) anchors.emplace_back(static_cast<uint32_t>(index), head);
+                            if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
                             uint32_t column = entry->column();
                             if (column) {
                                 --column;
@@ -513,11 +516,11 @@ class Engine {
                                     row = static_cast<uint32_t>(matrix.size() / words);
                                     matrix.resize(matrix.size() + words, 0);
                                 }
-                                matrix[row * words + in_block / 64] |= uint64_t(1) << (in_block % 64);
+                                matrix[row * words + document_word] |= document_bit;
                             }
                         }
                     }
-                    match_document(doc, probes, anchors, c.results, last);
+                    match_document(doc, probes, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
                     if (++in_block == block_docs) flush();
                 }
