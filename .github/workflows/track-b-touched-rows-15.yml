@@ -1,0 +1,117 @@
+name: Track B touched Boolean column qualification
+on:
+  push:
+    branches: [track-b/touched-rows-15]
+    paths: [track-b/main.cpp, .github/workflows/track-b-touched-rows-15.yml]
+permissions:
+  contents: read
+concurrency:
+  group: track-b-touched-rows-15
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build pinned Docker baselines and hybrid variants
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          mkdir -p /tmp/bhybrid /tmp/bhybrid-bin /tmp/bhybrid-evidence
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bhybrid-bin/sd-timer
+          git show 134a0f9b70d72e474c00a40d77768af90ee066dc:track-b/main.cpp > /tmp/bhybrid/legacy.cpp
+          cp track-b/main.cpp /tmp/bhybrid/candidate.cpp
+          for v in legacy candidate; do
+            mkdir -p "/tmp/bhybrid/build-$v"
+            cp track-b/Dockerfile "/tmp/bhybrid/build-$v/Dockerfile"
+            cp "/tmp/bhybrid/$v.cpp" "/tmp/bhybrid/build-$v/main.cpp"
+            docker build --network=none -q -t "bhybrid:$v" "/tmp/bhybrid/build-$v"
+          done
+          for v in candidate; do
+            g++ -std=c++20 -O3 -march=x86-64-v3 -pthread "/tmp/bhybrid/$v.cpp" -o "/tmp/bhybrid-bin/$v"
+          done
+      - name: Differential and sanitizer exactness
+        run: |
+          set -euo pipefail
+          for v in candidate; do
+            python3 tests/differential.py "/tmp/bhybrid-bin/$v"
+            python3 tests/frontier_adversarial.py "/tmp/bhybrid-bin/$v"
+          done
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/bhybrid-bin/sanitized
+          python3 tests/differential.py /tmp/bhybrid-bin/sanitized
+          python3 tests/frontier_adversarial.py /tmp/bhybrid-bin/sanitized
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/bhybrid-bin/tsan
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bhybrid-bin/tsan
+      - name: Independent full references and sample/tiny
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/bhybrid-data-$seed"
+            if [ "$seed" != 1 ]; then
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/bhybrid-data-$seed" --out "/tmp/bhybrid-ref-$seed"
+            fi
+          done
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/bhybrid-sample
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/bhybrid-tiny
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/bhybrid-tiny --out /tmp/bhybrid-ref-tiny
+      - name: Interleaved restricted Docker comparisons
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then
+              expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else
+              expected=$(sha256sum "/tmp/bhybrid-ref-$seed/results.txt" | cut -d' ' -f1)
+            fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/bhybrid-data-$seed" --expected "$expected" --timer /tmp/bhybrid-bin/sd-timer --seed "$seed" --repeat 3 --results /tmp/bhybrid-evidence/measurements.jsonl bhybrid:legacy bhybrid:candidate
+          done
+          sudo python3 experiments/frontier/compare.py --data /tmp/bhybrid-sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bhybrid-bin/sd-timer --seed 1 --repeat 1 --results /tmp/bhybrid-evidence/sample.jsonl bhybrid:candidate
+          expected=$(sha256sum /tmp/bhybrid-ref-tiny/results.txt | cut -d' ' -f1)
+          sudo python3 experiments/frontier/compare.py --data /tmp/bhybrid-tiny --expected "$expected" --timer /tmp/bhybrid-bin/sd-timer --seed 7 --repeat 1 --results /tmp/bhybrid-evidence/tiny.jsonl bhybrid:candidate
+      - name: Canonical source axis and paired K
+        run: |
+          set -euo pipefail
+          python3 -m pip install clang-format==23.1.3
+          curl -fL https://github.com/boyter/scc/releases/download/v4.1.0/scc_Linux_x86_64.tar.gz -o /tmp/bhybrid-bin/scc.tar.gz
+          echo 'c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b  /tmp/bhybrid-bin/scc.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/bhybrid-bin/scc.tar.gz -C /tmp/bhybrid-bin scc
+          for v in legacy candidate; do
+            mkdir -p "/tmp/bhybrid/count-$v"
+            clang-format --style=LLVM "/tmp/bhybrid/$v.cpp" > "/tmp/bhybrid/count-$v/main.cpp"
+            cp track-b/Dockerfile "/tmp/bhybrid/count-$v/"
+            /tmp/bhybrid-bin/scc --format json "/tmp/bhybrid/count-$v" > "/tmp/bhybrid-evidence/static-$v.json"
+          done
+          python3 - <<'PY'
+          import json, math, statistics, sys
+          from pathlib import Path
+          from collections import defaultdict
+          sys.path.insert(0, '/tmp/organizer/harness')
+          from scoring import k_from_measurements
+          root = Path('/tmp/bhybrid-evidence')
+          cal = json.loads(Path('/tmp/organizer/harness/calibration-seed1.json').read_text())['tracks']['b']
+          ref = dict(T=cal['T_ref_s'], M=cal['M_ref_bytes'], S=91, D=1)
+          rows = defaultdict(list)
+          for line in (root / 'measurements.jsonl').read_text().splitlines():
+              r = json.loads(line)
+              rows[r['seed'], r['image'].split(':')[1]].append(r)
+          scores = {}
+          for (seed, name), group in sorted(rows.items()):
+              static = json.loads((root / f'static-{name}.json').read_text())
+              S = sum(x['Code'] for x in static)
+              axes = dict(T=statistics.median(x['T'] for x in group), M=max(x['M'] for x in group), S=S, D=1)
+              K = k_from_measurements(ref, axes)
+              scores[seed, name] = K
+              print(json.dumps(dict(seed=seed, variant=name, **axes, K_local=K)), flush=True)
+          ranking = sorted((math.exp(sum(math.log(scores[seed, name]) for seed in (1, 2, 3))/3), name) for name in ('legacy','candidate'))
+          print('GEOMEAN_LOCAL_K_RANKING', ranking[::-1], flush=True)
+          (root / 'summary.json').write_text(json.dumps({'ranking': ranking[::-1], 'scores': {f'{seed}/{name}': k for (seed,name),k in scores.items()}}, indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: track-b-touched-rows-15
+          path: /tmp/bhybrid-evidence/
