@@ -1,0 +1,42 @@
+[
+  {
+    "label": "official",
+    "sha": "338c7cf8e1585ae770e2faa12834fa50b8138bd2",
+    "workers": 4,
+    "block_docs": 2048,
+    "family": "official v3 source",
+    "qualify": false
+  },
+  {
+    "label": "old6",
+    "sha": "a5e106a35ba4339b0b9d95f49194521fa05f1581",
+    "workers": 6,
+    "block_docs": 1536,
+    "family": "qualified pooled six",
+    "qualify": false
+  },
+  {
+    "label": "old12",
+    "sha": "b9ab12ad1de87e476b8bf1a76cfb8b242e0813f1",
+    "workers": 12,
+    "block_docs": 768,
+    "family": "qualified pooled twelve",
+    "qualify": false
+  },
+  {
+    "label": "hybrid6",
+    "sha": "5bc63780944240c8a9fb302b0cc5f2d91f98be16",
+    "workers": 6,
+    "block_docs": 2048,
+    "family": "letter keys / lazy singleton / packed summaries",
+    "qualify": true
+  },
+  {
+    "label": "hybrid12",
+    "sha": "ea351a5c9a3eb985faab60326e61387b6366b8b6",
+    "workers": 12,
+    "block_docs": 2048,
+    "family": "letter keys / inline five / packed summaries",
+    "qualify": true
+  }
+]
