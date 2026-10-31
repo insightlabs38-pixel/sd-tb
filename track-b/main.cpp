@@ -733,13 +733,13 @@ class Engine {
                 vector<pair<uint32_t, int32_t>> anchors;
                 anchors.reserve(128);
                 LineTokens line;
-                size_t previous = numeric_limits<size_t>::max();
+                size_t last_block = numeric_limits<size_t>::max();
                 const char *p = begin;
                 for (size_t block; (block = next_block.fetch_add(1)) < blocks;) {
                   const uint32_t first = static_cast<uint32_t>(block * block_docs);
                   const size_t count = min<size_t>(block_docs, total_docs - first);
-                  if (block != previous + 1) p = seek(first);
-                  for (size_t k = 0; k < count; ++k) {
+                  if (block != last_block + 1) p = seek(first);
+                  for (size_t doc_index = 0; doc_index < count; ++doc_index) {
                     const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
                     if (!line_end) line_end = end;
                     const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
@@ -747,7 +747,7 @@ class Engine {
                     uint32_t doc = 0;
                     auto [ptr, ec] = from_chars(p, tab, doc);
                     if (ec != errc() || ptr != tab) throw runtime_error("invalid document id");
-                    if (doc != first + k) throw runtime_error("nonconsecutive document id");
+                    if (doc != first + doc_index) throw runtime_error("nonconsecutive document id");
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     size_t anchor_count = 0;
@@ -804,7 +804,7 @@ class Engine {
                     ++in_block;
                   }
                   flush();
-                  previous = block;
+                  last_block = block;
                 }
             } catch (...) { errors[idx] = current_exception(); }
         };
