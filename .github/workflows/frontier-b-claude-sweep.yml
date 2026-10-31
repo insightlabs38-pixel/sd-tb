@@ -41,12 +41,12 @@ jobs:
           variant sample256 's/sample_bytes = 512u << 10/sample_bytes = 256u << 10/'
           variant workers6 's/? 12 : 1/? 6 : 1/'
           variant workers4 's/? 12 : 1/? 4 : 1/'
-          mkdir -p /tmp/v-colmajor /tmp/count-colmajor; cp track-b/Dockerfile /tmp/v-colmajor/ /tmp/count-colmajor/
+          mkdir -p /tmp/v-colmajor /tmp/count-colmajor; cp track-b/Dockerfile /tmp/v-colmajor/; cp track-b/Dockerfile /tmp/count-colmajor/
           cp experiments/frontier/variants/colmajor.cpp /tmp/v-colmajor/main.cpp
           docker build --network=none -t frontier:colmajor /tmp/v-colmajor
           clang-format --style=LLVM /tmp/v-colmajor/main.cpp > /tmp/count-colmajor/main.cpp; /tmp/bin/scc --format json /tmp/count-colmajor > /tmp/evidence/static-colmajor.json
           git show d7845bc6ac6a77547121daf1fda751e34999b325:track-b/main.cpp > /tmp/champion.cpp
-          mkdir -p /tmp/v-champion /tmp/count-champion; cp track-b/Dockerfile /tmp/v-champion/ /tmp/count-champion/; cp /tmp/champion.cpp /tmp/v-champion/main.cpp
+          mkdir -p /tmp/v-champion /tmp/count-champion; cp track-b/Dockerfile /tmp/v-champion/; cp track-b/Dockerfile /tmp/count-champion/; cp /tmp/champion.cpp /tmp/v-champion/main.cpp
           docker build --network=none -t frontier:champion /tmp/v-champion
           clang-format --style=LLVM /tmp/champion.cpp > /tmp/count-champion/main.cpp; /tmp/bin/scc --format json /tmp/count-champion > /tmp/evidence/static-champion.json
       - name: Corpora

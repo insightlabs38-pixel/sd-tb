@@ -55,7 +55,7 @@ def run_case(rng, docs, queries, trailing_newline=True):
         subprocess.run([binary, "--data", str(root / "data"), "--out", str(root / "out")], check=True, timeout=120)
         return (root / "out/results.txt").read_bytes()
 
-for seed in range(1, 25):
+for seed in range(1, (int(sys.argv[2]) if len(sys.argv) > 2 else 24) + 1):
     rng = random.Random(seed * 7919)
     vocab = [word(rng) for _ in range(rng.choice([5, 30, 200]))]
     count = rng.choice([1, 2, 63, 64, 65, 300, 2047, 2048, 2049, 4097])
