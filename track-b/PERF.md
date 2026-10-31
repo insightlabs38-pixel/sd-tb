@@ -281,10 +281,20 @@ become ~20% of T, so parallelizing query interning (sharded buckets) is the most
 
 ### Handoff for Luna (exact source)
 
-* Source: `track-b/main.cpp` at `c6d232c506ca1dae545f6e2b40d92c3fc6ed5ec8` on `branch/festive-hawking-wn31k1` (PR #9), blob
-  `854acdeda8b5d0f04ce17db0cc4268a5a5f60bd3`; CI on exactly this blob: [run 41251446909](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41251446909), T 0.482 -> 0.314 s, 0.477 -> 0.312 s, 0.478 -> 0.315 s, K ratio **1.206 / 1.204 / 1.198**. Earlier receipts above used the previous blob `3c5bce75...`, which differs only by a plan-reserve and anchor-comparison cleanup (-2 canonical lines). `track-b/Dockerfile` is byte-identical to `sd-sm` (blob `9b064d4031a7...`).
+* Source: the engine described above is already on `main` (PR #10, blob `fb67cede8d56f88faf543b57699b580cd9dab14a`, the scheduled developer's promotion of this branch's lineage plus an empty-`active` guard on the cold-state prefetch). This PR keeps that exact blob. The pre-merge branch blob `854acdeda8b5...` ([run 41251446909](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41251446909), K ratio 1.206 / 1.204 / 1.198) differs only by a two-line plan-reserve/anchor-comparison cleanup that was dropped to keep the already-qualified blob. Earlier receipts above used previous blobs of the same lineage. `track-b/Dockerfile` is byte-identical to `sd-sm` (blob `9b064d4031a7...`).
 * Canonical S (clang-format LLVM + scc): 1,101 + 7 Dockerfile lines = 1,108; D = 1; no new dependencies.
 * Suggested A/B: this blob versus `76946cc`, same host and image, five interleaved runs. Expect the scoring host's T to
   fall by 30-40% (local), or ~25-30% if SMT contention behaves like the 4-vCPU runner; memory should stay near 49-55 MB
   (12 workers), so the M term is slightly negative while the cap does not apply.
 * Rollback: `d7845bc` / blob `76946cc`.
+## Boolean revival and touched-column confirmation (October 31)
+
+[Five-seed, seven-repeat revival qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41242428149) passed full-output hashes, adversarial/differential checks, sanitizers and offline Docker. The legacy candidate scored **18.818317** versus **18.663041** runner-local geometric-mean K for the revival prefilter, which lost on all five seeds (0.825% lower). Rejected; no promotion.
+
+[Three-seed touched-column qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41242480637) passed the same exactness and packaging gates. The legacy candidate scored **17.142180** versus **17.038940** runner-local geometric-mean K for touched-column clearing, which lost on all three seeds (0.602% lower). Rejected; no promotion. These comparisons ran on different CI hosts and should not be compared across runs or treated as official board scores.
+
+## Fast dictionary engine promoted (October 31)
+
+[Strict three-full-seed qualification 41247381171](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41247381171) passed published/independent hashes, sample/tiny outputs, randomized and adversarial differential tests, ASan, TSan, fatal UBSan and pinned offline Docker. Five paired runs per full seed: candidate median T **0.21244 / 0.20727 / 0.20464 s** versus previous main **0.36899 / 0.36407 / 0.35813 s**; candidate peak M **23.41 / 23.15 / 23.14 MB** versus **42.36 / 42.35 / 42.61 MB**; S **1111** versus **925**, D **1** for both. Runner-local K **24.470 / 24.773 / 24.932** versus **19.084 / 19.213 / 19.371**, ratios **1.2822 / 1.2894 / 1.2870**. These are not official board scores.
+
+Promoted the exact qualified source blob `fb67cede8d56f88faf543b57699b580cd9dab14a` via [PR #10](https://github.com/insightlabs38-pixel/sd-tb/pull/10), main commit `286f098eff1059587c4b77601a27b3aec126506b`. [Five-full-seed, seven-repeat confirmation 41251942955](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41251942955) against the six-worker legacy champion is pending; official integrator retains independent board verification and rollback authority.
