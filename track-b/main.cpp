@@ -448,8 +448,7 @@ class Engine {
             size_t docs = 0;
         };
         const char *begin = input.data, *end = begin + input.size;
-        const size_t workers = input.size >= (8u << 20)
-            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
+        const size_t workers = input.size >= (8u << 20) ? 4 : 1;
         vector<const char *> bounds(workers + 1);
         bounds[0] = begin;
         bounds[workers] = end;
