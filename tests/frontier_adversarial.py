@@ -184,3 +184,26 @@ queries = [
 ]
 assert d.run(binary, docs, queries) == d.oracle(docs, queries)
 print("Colliding long tokens preserve phrase order and repetition: PASS")
+
+count = 16417
+edges = {0, count - 1}
+for size in (768, 1024, 1536, 2048):
+    for boundary in range(size, count, size):
+        edges.update(range(boundary - 2, min(count, boundary + 3)))
+for workers in (4, 6, 8, 12):
+    for chunk in range(1, workers):
+        boundary = count * chunk // workers
+        edges.update(range(boundary - 2, boundary + 3))
+docs = [
+    b"common " + b"filler " * 80 + (b"edge edge" if index in edges else b"plain")
+    for index in range(count)
+]
+queries = [
+    b"BOOL common", b"BOOL edge", b"BOOL edge AND common",
+    b"BOOL edge NOT common", b"BOOL unknown OR edge AND common",
+    b"BOOL common NOT edge OR absent", b'PHRASE "edge edge"',
+    b'PHRASE "common edge"', b'PHRASE "edge common"',
+]
+assert sum(map(len, docs)) > 8 << 20
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("4/6/8/12-worker and 768/1024/1536/2048-document boundaries: PASS")
