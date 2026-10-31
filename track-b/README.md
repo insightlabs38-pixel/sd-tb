@@ -8,7 +8,7 @@ Queries select a collision-safe ASCII token dictionary. Up to six workers scan d
 
 ## Validation
 
-[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41199946808) passes three full seeds, published sample/full hashes, an independent tiny reference, ASan/UBSan, TSan, expanded differential/adversarial oracles and restricted offline Docker. The oracle covers 338,000-term dictionary growth, all token lengths/alignment offsets all byte classes at every SIMD alignment, and deliberate short/long CRC32C collisions including repeated and reversed phrase terms. See PERF.md for full T/M/S/D/K comparisons. Runner measurements are not official board scores.
+[Fine-size qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41196378364) passed three full seeds, sample/tiny hashes, differential/adversarial cases, sanitizers and offline Docker. [Five-seed confirmation](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41199946808) passed 105 full-output comparisons with seven repeats per variant. The oracle covers 338,000-term dictionary growth, all token lengths/alignment offsets all byte classes at every SIMD alignment, and deliberate short/long CRC32C collisions including repeated and reversed phrase terms. See PERF.md for full T/M/S/D/K comparisons. Runner measurements are not official board scores.
 
 ## Dependencies
 
