@@ -2,7 +2,7 @@ name: Track B AND-only rarity-order qualification
 on:
   push:
     branches: [track-b/and-only-reorder-11]
-    paths: [track-b/main.cpp, .github/workflows/track-b-andreorder.yml]
+    paths: [track-b/main.cpp, .github/workflows/track-b-and-reorder.yml]
   workflow_dispatch:
 permissions:
   contents: read
