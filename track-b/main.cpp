@@ -589,12 +589,15 @@ class Engine {
                 vector<uint64_t> matrix(words);
                 matrix.reserve(words * (boolean_count + 1));
                 vector<uint32_t> active(boolean_count);
+                vector<uint32_t> touched;
+                touched.reserve(8192);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
                     evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
                     matrix.resize(words);
-                    fill(active.begin(), active.end(), 0);
+                    for (uint32_t column : touched) active[column] = 0;
+                    touched.clear();
                     in_block = 0;
                 };
                 vector<uint32_t> last(phrases.size(), numeric_limits<uint32_t>::max());
@@ -635,6 +638,7 @@ class Engine {
                                 --column;
                                 uint32_t &row = active[column];
                                 if (!row) {
+                                    touched.push_back(column);
                                     row = singleton | static_cast<uint32_t>(in_block);
                                 } else if (row & singleton) {
                                     uint32_t previous = row & ~singleton;
