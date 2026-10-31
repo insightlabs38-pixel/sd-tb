@@ -194,3 +194,12 @@ Promoted exact challenger in [commit 227b4b9e](https://github.com/insightlabs38-
 ## CRC32C token fingerprints (qualified, not promoted, October 31)
 
 [Two-seed comparison 41138170073](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41138170073) passed exact outputs, collision checks and offline Docker. Three-run means: seed 1 baseline **1.437 s**, CRC32C **1.403 s**; seed 2 baseline **1.423 s**, CRC32C **1.413 s**; RSS unchanged. The gains are modest, particularly on seed 2, and are from a different runner environment than the segmented-tape qualification. Retain as an experiment until an independent repeat and a same-runner end-to-end scored comparison show improvement beyond source-size cost.
+
+
+## Qualified 6-worker scoring-box candidate
+
+Source `a5e106a35ba4339b0b9d95f49194521fa05f1581` uses a literal 6 workers on full inputs and 1536-document blocks, with no environment override. Pooled first-ten arrays reduce per-worker summary memory. [Qualification 41159913998](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41159913998) passed pinned offline production-Docker oracles, ASan/UBSan, TSan, three full references, published sample/full hashes and tiny seed 7.
+
+Full seeds 1/2/3: T=0.610445152/0.620926298/0.606104058 s; M=41934848/41828352/41570304 B; S=781; D=1; K_local=15.218973/15.089979/15.273377. These are four-logical-CPU oversubscribed runner measurements, not official scaling evidence. [Complete controls, source SHAs and results](https://github.com/insightlabs38-pixel/sd-tb/blob/frontier/b-sol-worker-qualification/experiments/frontier/WORKERS.md).
+
+This branch is ready for Luna's controlled scoring-box A/B tests, not automatic champion promotion. Preserve PR #3 source `338c7cf` / official `8d5bc54` and PR #2 `4069aa9`.
