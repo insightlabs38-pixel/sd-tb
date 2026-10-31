@@ -265,6 +265,10 @@ Worker scaling on the 4-vCPU SMT runner ([sweep 41247058378](https://github.com/
 peak memory 17 / 21 / 23 / 29 / 35 / 46 / 58 MB; champion (12 workers) 0.526 s / 42.6 MB. Using both SMT siblings is worth ~21% over one thread per core, and
 oversubscription costs ~5-15%, so one worker per logical CPU (at most twelve) is the right default; the 12-logical-CPU scoring host keeps 12.
 
+Parameters at the correct worker count ([sweep 41247879158](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41247879158), 4 workers, 7 paired runs, seeds 1/2 mean T):
+base **0.320 s**; hot threshold 2 / 8 / 16 **0.322 / 0.324 / 0.322 s** (flat, noise); prefetch distance 16 **0.319 s** (flat); block size 1,024 **0.331 s** (+3.5%),
+1,536 **0.351 s** (+10%), 3,072 **0.360 s** (+13%). 2,048 documents per block, threshold 4 and distance 8 stay.
+
 ### Handoff for Luna (exact source)
 
 * Source: `track-b/main.cpp` at `a84e0b5d0ddd844bfe5a8b7eb7318ce09bf277a6` on `branch/festive-hawking-wn31k1`, blob
