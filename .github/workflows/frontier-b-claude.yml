@@ -2,7 +2,7 @@ name: Frontier B candidate vs champion
 on:
   workflow_dispatch:
   push:
-    branches: [branch/festive-hawking-wn31k1, frontier/b-claude-postings-20261031]
+    branches: [branch/festive-hawking-wn31k1, frontier/b-claude-postings-20261031, track-b/fix-empty-boolean-prefetch-16]
     paths: [track-b/main.cpp, tests/**, .github/workflows/frontier-b-claude.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
 permissions:
   contents: read
@@ -10,6 +10,7 @@ concurrency:
   group: frontier-b-claude-${{ github.ref }}
   cancel-in-progress: true
 env:
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
   CHAMPION: d7845bc6ac6a77547121daf1fda751e34999b325
 jobs:
   qualify:
