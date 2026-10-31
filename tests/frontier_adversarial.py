@@ -114,8 +114,16 @@ queries += [b'PHRASE "' + word + b' end"' for word in words]
 assert d.run(binary, docs, queries) == d.oracle(docs, queries)
 print("All token lengths and SIMD boundary offsets: PASS")
 
+def letter_term(index):
+    word = bytearray(b"a" * 12)
+    for position in range(11, 3, -1):
+        word[position] += index % 26
+        index //= 26
+    return bytes(word)
+
 words = [
-    (f"t{index:07x}" if index % 2 else f"longprefix{index:08x}").encode()
+    (letter_term(index) if index % 3 == 2 else
+     (f"t{index:07x}" if index % 3 == 0 else f"longprefix{index:08x}").encode())
     for index in range(338000)
 ]
 queries = []
@@ -184,3 +192,69 @@ queries = [
 ]
 assert d.run(binary, docs, queries) == d.oracle(docs, queries)
 print("Colliding long tokens preserve phrase order and repetition: PASS")
+
+count = 16417
+edges = {0, count - 1}
+for size in (768, 1024, 1536, 2048):
+    for boundary in range(size, count, size):
+        edges.update(range(boundary - 2, min(count, boundary + 3)))
+for workers in (4, 6, 8, 12):
+    for chunk in range(1, workers):
+        boundary = count * chunk // workers
+        edges.update(range(boundary - 2, boundary + 3))
+docs = [
+    b"common " + b"filler " * 80 + (b"edge edge" if index in edges else b"plain")
+    for index in range(count)
+]
+queries = [
+    b"BOOL common", b"BOOL edge", b"BOOL edge AND common",
+    b"BOOL edge NOT common", b"BOOL unknown OR edge AND common",
+    b"BOOL common NOT edge OR absent", b'PHRASE "edge edge"',
+    b'PHRASE "common edge"', b'PHRASE "edge common"',
+]
+assert sum(map(len, docs)) > 8 << 20
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("4/6/8/12-worker and 768/1024/1536/2048-document boundaries: PASS")
+
+vocabulary = set()
+for length in range(9, 14):
+    base = bytearray(b"abcdefghijklmn"[:length])
+    vocabulary.add(bytes(base))
+    for position in range(length):
+        for letter in b"abmqz07":
+            word = base.copy()
+            word[position] = letter
+            vocabulary.add(bytes(word))
+words = sorted(vocabulary)
+docs = [word + b" end" for word in words]
+docs += [word.upper() + b" END" for word in words]
+queries = [b"BOOL " + word for word in words]
+queries += [b'PHRASE "' + word + b' end"' for word in words]
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("Packed 9–12-letter keys, prefixes, digits and case folding: PASS")
+
+positions = [
+    [0, 63, 64, 2047, 2048, 4094, 4095],
+    [1, 65, 127, 2046, 2050, 4000, 4093],
+    [0, 65, 64, 2046, 2048, 4000, 4095],
+]
+docwords = [[b"base"] for _ in range(8195)]
+for block in (0, 4096, 8192):
+    for group, selected in enumerate(positions):
+        for size in range(1, 8):
+            term = f"r{group}n{size}".encode()
+            for position in selected[:size]:
+                if block + position < len(docwords):
+                    docwords[block + position].extend([term] * 3)
+docs = [b" ".join(words) for words in docwords]
+queries = []
+for size in range(1, 8):
+    terms = [f"r{group}n{size}".encode() for group in range(3)]
+    terms += [terms[0], b"absent", b"base"]
+    for ops in itertools.product((b"AND", b"OR", b"NOT"), repeat=5):
+        parts = [terms[0]]
+        for op, term in zip(ops, terms[1:]):
+            parts.extend((op, term))
+        queries.append(b"BOOL " + b" ".join(parts))
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("Inline-row counts 1–7, union overflow, repeated tokens and 4096-document boundaries: PASS")

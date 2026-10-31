@@ -124,7 +124,7 @@ struct FoldEqual {
 
 class FlatDictionary {
 public:
-    // ASCII token bytes leave bit 63 clear; long-token fingerprints set it.
+    // Short ASCII keys, exact letter encodings and CRC fingerprints use disjoint tags.
     struct Slot {
         uint64_t key = 0;
         uint64_t metadata = 0;
@@ -160,6 +160,15 @@ private:
         uint64_t last;
         memcpy(&last, word.data() + word.size() - 8, 8);
         last |= 0x2020202020202020ULL;
+        // Nonzero five-bit letter codes preserve content and length in 60 bits.
+        if (word.size() <= 12 && (first & 0x4040404040404040ULL) == 0x4040404040404040ULL &&
+            (last & 0x4040404040404040ULL) == 0x4040404040404040ULL) {
+            uint64_t tail = last >> ((16 - word.size()) * 8);
+            uint64_t key = 0xc000000000000000ULL | _pext_u64(first, 0x1f1f1f1f1f1f1f1fULL) |
+                (_pext_u64(tail, 0x1f1f1f1f1f1f1f1fULL) << 40);
+            uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+            return {hash ? hash : 1, key};
+        }
         uint64_t hash64 = _mm_crc32_u64(2166136261u, first);
         // The frozen 32-byte maximum makes these chunks cover every token byte.
         if (word.size() > 16) {
@@ -180,7 +189,7 @@ private:
         vector<Slot> fresh(capacity);
         for (const Slot &slot : slots) {
             if (!slot.key) continue;
-            uint32_t hash = slot.key >> 63 ? static_cast<uint32_t>(slot.key)
+            uint32_t hash = (slot.key >> 62) == 2 ? static_cast<uint32_t>(slot.key)
                 : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
             if (!hash) hash = 1;
             size_t i = hash & (capacity - 1);
@@ -210,7 +219,7 @@ public:
                 slot = {key, id};
                 return {id, true};
             }
-            if (slot.key == key && (!(key >> 63) || FoldEqual{}(keys[slot.id()], word)))
+            if (slot.key == key && ((key >> 62) != 2 || FoldEqual{}(keys[slot.id()], word)))
                 return {slot.id(), false};
             i = (i + 1) & (slots.size() - 1);
         }
@@ -232,7 +241,7 @@ public:
         for (;;) {
             const Slot &slot = slots[i];
             if (!slot.key) return nullptr;
-            if (slot.key == key && (!(key >> 63) || FoldEqual{}(keys[slot.id()], word)))
+            if (slot.key == key && ((key >> 62) != 2 || FoldEqual{}(keys[slot.id()], word)))
                 return &slot;
             i = (i + 1) & (slots.size() - 1);
         }
@@ -244,10 +253,10 @@ public:
 
     uint64_t phrase_key(uint32_t term) const {
         uint64_t key = fingerprint(keys[term]).second;
-        return key | ((key >> 63) ? uint64_t(term) << 32 : 0);
+        return key | ((key >> 62) == 2 ? uint64_t(term) << 32 : 0);
     }
     bool phrase_equal(uint64_t expected, const Probe &probe) const {
-        if (!(expected >> 63)) return expected == probe.key;
+        if ((expected >> 62) != 2) return expected == probe.key;
         return probe.key == ((uint64_t(1) << 63) | static_cast<uint32_t>(expected)) &&
             FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
     }
@@ -281,35 +290,123 @@ struct Query {
     span<const uint32_t> words() const { return {terms.data(), term_count}; }
 };
 
-struct Result {
-    uint32_t count = 0;
-    uint64_t sum = 0;
-    array<uint32_t, 10> first{};
-    void add(uint32_t id) {
-        if (count < first.size()) first[count] = id;
-        ++count;
-        sum += id;
-    }
-    template<class Integer> static char *number(char *p, Integer value) {
-        return to_chars(p, p + 24, value).ptr;
-    }
-    char *append(char *p) const {
-        p = number(p, count);
-        *p++ = ' ';
-        p = number(p, sum);
-        for (size_t i = 0; i < min<size_t>(count, first.size()); ++i) {
-            *p++ = ' ';
-            p = number(p, first[i]);
+class Results {
+    static constexpr size_t kept_ids = 10;
+    // Frozen N <= 250,000 keeps every result sum below 2^35.
+    // Counts and sums can be added together; 50,000 queries fit 16-bit offsets.
+    struct __attribute__((packed, aligned(2))) Summary {
+        uint64_t total = 0;
+        uint16_t first_offset = 0;
+        uint32_t count() const { return static_cast<uint32_t>(total >> 35); }
+        uint64_t sum() const { return total & ((uint64_t(1) << 35) - 1); }
+    };
+    vector<Summary> rows;
+    vector<array<uint32_t, kept_ids>> first_ids;
+
+    array<uint32_t, kept_ids> &first_for(Summary &row) {
+        if (!row.count()) {
+            row.first_offset = static_cast<uint32_t>(first_ids.size());
+            first_ids.emplace_back();
         }
-        *p++ = '\n';
-        return p;
+        return first_ids[row.first_offset];
+    }
+public:
+    void reset(size_t count) {
+        rows.assign(count, Summary{});
+        first_ids.clear();
+        // Capacity is reserved, but only matched queries touch first-ID pages.
+        first_ids.reserve(count);
+    }
+    void add(size_t query, uint32_t id) {
+        Summary &row = rows[query];
+        if (row.count() < kept_ids) first_for(row)[row.count()] = id;
+        row.total += (uint64_t(1) << 35) + id;
+    }
+    void add_bits(size_t query, uint64_t bits, uint32_t base) {
+        if (!bits) return;
+        Summary &row = rows[query];
+        if (row.count() < kept_ids) {
+            auto &first = first_for(row);
+            size_t kept = row.count();
+            uint64_t remaining = bits;
+            while (remaining && kept < kept_ids) {
+                first[kept++] = base + countr_zero(remaining);
+                remaining &= remaining - 1;
+            }
+        }
+        unsigned count = popcount(bits);
+        uint64_t delta = (uint64_t(base) + (uint64_t(1) << 35)) * count;
+        delta += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
+        delta += 2u * popcount(bits & 0xccccccccccccccccULL);
+        delta += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
+        delta += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
+        delta += 16u * popcount(bits & 0xffff0000ffff0000ULL);
+        delta += 32u * popcount(bits & 0xffffffff00000000ULL);
+        row.total += delta;
+    }
+    void merge(const Results &source) {
+        if (source.rows.empty()) return;
+        // Worker ranges are merged in document order.
+        for (size_t query = 0; query < rows.size(); ++query) {
+            Summary &dst = rows[query];
+            const Summary &src = source.rows[query];
+            if (!src.count()) continue;
+            if (dst.count() < kept_ids) {
+                auto &first = first_for(dst);
+                size_t kept = dst.count();
+                size_t add = min<size_t>(src.count(), kept_ids - kept);
+                copy_n(source.first_ids[src.first_offset].begin(), add, first.begin() + kept);
+            }
+            dst.total += src.total;
+        }
+    }
+    void write(ostream &out) const {
+        array<char, 256> line;
+        for (const Summary &row : rows) {
+            char *p = line.data();
+            p = to_chars(p, p + 24, row.count()).ptr;
+            *p++ = ' ';
+            p = to_chars(p, p + 24, row.sum()).ptr;
+            for (size_t i = 0; i < min<size_t>(row.count(), kept_ids); ++i) {
+                *p++ = ' ';
+                p = to_chars(p, p + 24, first_ids[row.first_offset][i]).ptr;
+            }
+            *p++ = '\n';
+            out.write(line.data(), p - line.data());
+        }
     }
 
 };
 
 class Engine {
     FlatDictionary dictionary;
-    static constexpr size_t block_docs = 2048, words = block_docs / 64;
+    // Five sorted 12-bit positions fit below the count tag; bit 60 marks a query-local bitmap.
+    static constexpr unsigned small_shift = 61, position_bits = 12, small_limit = 5;
+    static unsigned small_count(uint64_t state) { return static_cast<unsigned>(state >> small_shift); }
+    static uint32_t small_position(uint64_t state, unsigned index) {
+        return static_cast<uint32_t>(state >> (index * position_bits)) & 4095u;
+    }
+    static uint64_t small_union(uint64_t a, uint64_t b) {
+        unsigned i = 0, j = 0, size = 0, na = small_count(a), nb = small_count(b);
+        uint64_t result = 0;
+        while (i < na || j < nb) {
+            uint32_t x = i < na ? small_position(a, i) : numeric_limits<uint32_t>::max();
+            uint32_t y = j < nb ? small_position(b, j) : numeric_limits<uint32_t>::max();
+            uint32_t position = min(x, y);
+            if (size == small_limit) return 0;
+            result |= uint64_t(position) << (size++ * position_bits);
+            if (x == position) ++i;
+            if (y == position) ++j;
+        }
+        return result | (uint64_t(size) << small_shift);
+    }
+    static bool small_contains(uint64_t state, uint32_t position) {
+        // Unused lanes are ones, so zero-lane detection tests only stored positions.
+        constexpr uint64_t lanes = 0x1001001001001ULL;
+        uint64_t valid = (uint64_t(1) << (small_count(state) * position_bits)) - 1;
+        uint64_t difference = (state ^ (uint64_t(position) * lanes)) | ~valid;
+        return ((difference - lanes) & ~difference & (lanes << 11)) != 0;
+    }
     size_t term_count = 0;
     vector<Query> queries;
     struct PhrasePlan {
@@ -328,7 +425,7 @@ class Engine {
         uint32_t output = 0;
     };
     vector<BooleanQuery> boolean_queries;
-    vector<Result> answers;
+    Results answers;
 
     void compile_queries(const MappedFile &input) {
         // Sampling affects anchor choice, never whether a match is accepted.
@@ -378,8 +475,8 @@ class Engine {
     }
 
     void match_document(uint32_t doc, const vector<FlatDictionary::Probe> &probes,
-                        const vector<pair<uint32_t, int32_t>> &anchors,
-                        vector<Result> &results, vector<uint32_t> &last) const {
+                        span<const pair<uint32_t, int32_t>> anchors,
+                        Results &results, vector<uint32_t> &last) const {
         for (const auto &[pos, head] : anchors) {
             for (int32_t pid = head; pid >= 0; pid = phrases[pid].next) {
                 if (last[pid] == doc) continue;
@@ -393,63 +490,111 @@ class Engine {
                 while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
                 if (j == count) {
                     last[pid] = doc;
-                    results[plan.output].add(doc);
+                    results.add(plan.output, doc);
                 }
             }
         }
     }
 
-    void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
-                        size_t in_block, uint32_t block_base, vector<Result> &results) const {
+    template<size_t block_docs>
+    void evaluate_block(const vector<uint64_t> &matrix, const vector<uint64_t> &active,
+                        size_t in_block, uint32_t block_base, Results &results) const {
+        static constexpr size_t words = block_docs / 64;
+        static constexpr uint64_t local_value = uint64_t(1) << 60;
         for (const BooleanQuery &q : boolean_queries) {
-            const size_t qi = q.output;
-            bool possible = active[q.terms[0]] != 0;
-            for (size_t i = 0; i < size_t(q.count - 1); ++i) {
-                if (q.ops[i] == 'A') possible &= active[q.terms[i + 1]] != 0;
-                else if (q.ops[i] == 'O') possible |= active[q.terms[i + 1]] != 0;
-            }
-            if (!possible) continue;
+            uint64_t state = active[q.terms[0]];
             array<uint64_t, words> value;
-            copy_n(matrix.data() + active[q.terms[0]] * words, words, value.data());
-            for (size_t i = 0; i < size_t(q.count - 1); ++i) {
-                const uint64_t *rhs = matrix.data() + active[q.terms[i + 1]] * words;
-                if (q.ops[i] == 'A') for (size_t w = 0; w < words; ++w) value[w] &= rhs[w];
-                else if (q.ops[i] == 'O') for (size_t w = 0; w < words; ++w) value[w] |= rhs[w];
-                else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
-            }
-            for (size_t word = 0; word < (in_block + 63) / 64; ++word) {
-                uint64_t bits = value[word];
-                if (!bits) continue;
-                Result &r = results[qi];
-                uint32_t base = block_base + static_cast<uint32_t>(word * 64);
-                uint64_t first = bits;
-                size_t kept = min<size_t>(r.count, r.first.size());
-                while (first && kept < r.first.size()) {
-                    r.first[kept++] = base + countr_zero(first);
-                    first &= first - 1;
+            auto present = [&](uint64_t source, uint32_t position) -> bool {
+                unsigned size = small_count(source);
+                if (size) return small_contains(source, position);
+                const uint64_t *data = source == local_value ? value.data() : matrix.data() + source * words;
+                return (data[position / 64] >> (position % 64)) & 1;
+            };
+            auto add_small = [&](uint64_t source) {
+                for (unsigned j = 0, size = small_count(source); j < size; ++j) {
+                    uint32_t position = small_position(source, j);
+                    value[position / 64] |= uint64_t(1) << (position % 64);
                 }
-                unsigned count = popcount(bits);
-                r.count += count;
-                r.sum += uint64_t(base) * count;
-                r.sum += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
-                r.sum += 2u * popcount(bits & 0xccccccccccccccccULL);
-                r.sum += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
-                r.sum += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
-                r.sum += 16u * popcount(bits & 0xffff0000ffff0000ULL);
-                r.sum += 32u * popcount(bits & 0xffffffff00000000ULL);
+            };
+            auto materialize = [&] {
+                if (state == local_value) return;
+                if (small_count(state)) { value.fill(0); add_small(state); }
+                else copy_n(matrix.data() + state * words, words, value.data());
+                state = local_value;
+            };
+            auto filter = [&](uint64_t source, uint64_t other, bool keep_matches) {
+                uint64_t result = 0;
+                unsigned kept = 0;
+                for (unsigned j = 0, size = small_count(source); j < size; ++j) {
+                    uint32_t position = small_position(source, j);
+                    if (present(other, position) == keep_matches)
+                        result |= uint64_t(position) << (kept++ * position_bits);
+                }
+                return result | (uint64_t(kept) << small_shift);
+            };
+            for (size_t i = 0; i < size_t(q.count - 1); ++i) {
+                char op = q.ops[i];
+                if (!state && op != 'O') continue;
+                uint64_t other = active[q.terms[i+1]];
+                if (op == 'O') {
+                    if (!other || state == other) continue;
+                    if (!state) { state = other; continue; }
+                    unsigned left_size = small_count(state), right_size = small_count(other);
+                    if (left_size && right_size) {
+                        uint64_t merged = small_union(state, other);
+                        if (merged) state = merged;
+                        else { materialize(); add_small(other); }
+                    } else if (right_size) { materialize(); add_small(other); }
+                    else if (left_size) {
+                        uint64_t previous = state;
+                        copy_n(matrix.data() + other * words, words, value.data());
+                        add_small(previous);
+                        state = local_value;
+                    } else {
+                        materialize();
+                        const uint64_t *rhs = matrix.data() + other * words;
+                        for (size_t w = 0; w < words; ++w) value[w] |= rhs[w];
+                    }
+                } else {
+                    if (!other) { if (op == 'A') state = 0; continue; }
+                    if (small_count(state)) state = filter(state, other, op == 'A');
+                    else if (small_count(other)) {
+                        if (op == 'A') state = filter(other, state, true);
+                        else {
+                            materialize();
+                            for (unsigned j = 0, size = small_count(other); j < size; ++j) {
+                                uint32_t position = small_position(other, j);
+                                value[position / 64] &= ~(uint64_t(1) << (position % 64));
+                            }
+                        }
+                    } else {
+                        materialize();
+                        const uint64_t *rhs = matrix.data() + other * words;
+                        if (op == 'A') for (size_t w = 0; w < words; ++w) value[w] &= rhs[w];
+                        else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
+                    }
+                }
+            }
+            if (unsigned size = small_count(state)) {
+                for (unsigned j = 0; j < size; ++j) results.add(q.output, block_base + small_position(state, j));
+            } else if (state) {
+                const uint64_t *data = state == local_value ? value.data() : matrix.data() + state * words;
+                for (size_t w = 0; w < (in_block + 63) / 64; ++w)
+                    results.add_bits(q.output, data[w], block_base + static_cast<uint32_t>(w * 64));
             }
         }
     }
 
-    void scan_corpus(const MappedFile &input) {
+    template<size_t block_docs>
+    void scan_corpus(const MappedFile &input, size_t workers) {
+        static constexpr size_t words = block_docs / 64;
+        static_assert(block_docs <= (1u << position_bits));
         struct Chunk {
-            vector<Result> results;
+            Results results;
             uint32_t first_doc = 0, last_doc = 0;
             size_t docs = 0;
         };
         const char *begin = input.data, *end = begin + input.size;
-        const size_t workers = input.size >= (8u << 20)
-            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
         vector<const char *> bounds(workers + 1);
         bounds[0] = begin;
         bounds[workers] = end;
@@ -463,14 +608,14 @@ class Engine {
         auto parse_chunk = [&](size_t idx) {
             try {
                 Chunk &c = chunks[idx];
-                c.results.resize(query_count);
+                c.results.reset(query_count);
                 vector<uint64_t> matrix(words);
                 matrix.reserve(words * (boolean_count + 1));
-                vector<uint32_t> active(boolean_count);
+                vector<uint64_t> active(boolean_count);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
-                    evaluate_block(matrix, active, in_block, block_base, c.results);
+                    evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
                     matrix.resize(words);
                     fill(active.begin(), active.end(), 0);
                     in_block = 0;
@@ -494,30 +639,48 @@ class Engine {
                     c.last_doc = doc;
                     ++c.docs;
                     if (!in_block) block_base = doc;
-                    anchors.clear();
+                    size_t anchor_count = 0;
                     probes.clear();
                     TokenScanner scanner(tab + 1, line_end);
                     string_view word;
                     while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    const uint64_t document_bit = uint64_t(1) << (in_block % 64);
+                    const size_t document_word = in_block / 64;
+                    if (anchors.size() < probes.size()) anchors.resize(probes.size());
                     for (size_t index = 0; index < probes.size(); ++index) {
                         const auto &probe = probes[index];
                         const auto *entry = dictionary.resolve(probe);
                         if (entry) {
                             int32_t head = entry->head();
-                            if (head >= 0) anchors.emplace_back(static_cast<uint32_t>(index), head);
+                            if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
                             uint32_t column = entry->column();
                             if (column) {
                                 --column;
-                                uint32_t &row = active[column];
-                                if (!row) {
-                                    row = static_cast<uint32_t>(matrix.size() / words);
-                                    matrix.resize(matrix.size() + words, 0);
-                                }
-                                matrix[row * words + in_block / 64] |= uint64_t(1) << (in_block % 64);
+                                uint64_t &row = active[column];
+                                unsigned size = small_count(row);
+                                if (!row) row = (uint64_t(1) << small_shift) | in_block;
+                                else if (size) {
+                                    if (small_position(row, size - 1) != in_block) {
+                                        if (size < small_limit) {
+                                            row = (row & ((uint64_t(1) << small_shift) - 1)) |
+                                                (uint64_t(in_block) << (size * position_bits)) |
+                                                (uint64_t(size + 1) << small_shift);
+                                        } else {
+                                            uint64_t previous = row;
+                                            row = matrix.size() / words;
+                                            matrix.resize(matrix.size() + words, 0);
+                                            for (unsigned j = 0; j < small_limit; ++j) {
+                                                uint32_t position = small_position(previous, j);
+                                                matrix[row * words + position / 64] |= uint64_t(1) << (position % 64);
+                                            }
+                                            matrix[row * words + document_word] |= document_bit;
+                                        }
+                                    }
+                                } else matrix[row * words + document_word] |= document_bit;
                             }
                         }
                     }
-                    match_document(doc, probes, anchors, c.results, last);
+                    match_document(doc, probes, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
                     if (++in_block == block_docs) flush();
                 }
@@ -529,20 +692,12 @@ class Engine {
         parse_chunk(0);
         for (thread &t : threads) t.join();
         for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-        answers.swap(chunks[0].results);
+        answers = move(chunks[0].results);
         uint32_t expected_doc = 0;
         for (const Chunk &c : chunks) {
             if (c.docs && c.first_doc != expected_doc) throw runtime_error("nonconsecutive document chunks");
             expected_doc += static_cast<uint32_t>(c.docs);
-            for (size_t qi = 0; qi < c.results.size(); ++qi) {
-                Result &dst = answers[qi];
-                const Result &src = c.results[qi];
-                size_t kept = min<size_t>(dst.count, dst.first.size());
-                size_t add = min<size_t>(src.count, dst.first.size() - kept);
-                for (size_t i = 0; i < add; ++i) dst.first[kept + i] = src.first[i];
-                dst.count += src.count;
-                dst.sum += src.sum;
-            }
+            answers.merge(c.results);
         }
 
     }
@@ -597,15 +752,12 @@ public:
         parse_queries(query_file);
         MappedFile docs_file(data_dir + "/docs.txt");
         compile_queries(docs_file);
-        scan_corpus(docs_file);
+        const size_t workers = docs_file.size >= (8u << 20) ? 12 : 1;
+        scan_corpus<2048>(docs_file, workers);
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
         if (!output) throw runtime_error("cannot open output");
-        array<char, 256> line;
-        for (const Result &r : answers) {
-            char *end = r.append(line.data());
-            output.write(line.data(), end - line.data());
-        }
+        answers.write(output);
         if (!output) throw runtime_error("output write failure");
     }
 };
