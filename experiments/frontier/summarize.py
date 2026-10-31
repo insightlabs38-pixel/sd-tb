@@ -19,7 +19,7 @@ rows = [
 summary = []
 for seed in sorted({row["seed"] for row in rows}):
     coefficients = {}
-    for variant in ("official", "development", "previous", "candidate"):
+    for variant in ("official", "development", "previous", "candidate", "experimental"):
         selected = [
             row
             for row in rows
@@ -45,6 +45,7 @@ for seed in sorted({row["seed"] for row in rows}):
         "K ratio to official:",
         coefficients["candidate"] / coefficients["official"],
     )
+print("Experimental forces eight workers on this runner; its throughput is not a higher-core estimate.")
 print(
     "K_local uses board reference axes with runner measurements; it is not an official score."
 )
