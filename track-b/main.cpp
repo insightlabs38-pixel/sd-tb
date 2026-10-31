@@ -47,51 +47,6 @@ struct MappedFile {
     MappedFile &operator=(const MappedFile &) = delete;
 };
 
-class TokenScanner {
-    const char *cursor, *end, *base;
-    uint32_t valid = 0;
-    void refill() {
-        base = cursor;
-        size_t count = min<size_t>(end - cursor, 32);
-        alignas(32) char tail[32]{};
-        const char *load = cursor;
-        if (count < 32) {
-            memcpy(tail, cursor, count);
-            load = tail;
-        }
-        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(load));
-        __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
-        __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
-        __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
-        valid = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
-        cursor += count;
-    }
-public:
-    TokenScanner(const char *begin, const char *last) : cursor(begin), end(last), base(begin) {}
-    bool next(string_view &word) {
-        while (!valid) {
-            if (cursor == end) return false;
-            refill();
-        }
-        unsigned first = countr_zero(valid);
-        const char *start = base + first;
-        unsigned count = countr_one(valid >> first);
-        if (first + count < 32) {
-            valid &= ~((uint32_t(1) << (first + count)) - 1);
-            word = string_view(start, count);
-            return true;
-        }
-        do {
-            refill();
-            count = countr_one(valid);
-        } while (count == 32);
-        const char *stop = base + count;
-        valid &= ~((uint32_t(1) << count) - 1);
-        word = string_view(start, stop - start);
-        return true;
-    }
-};
-
 struct FoldEqual {
     using is_transparent = void;
     bool operator()(string_view a, string_view b) const noexcept {
@@ -124,20 +79,19 @@ struct FoldEqual {
 
 class FlatDictionary {
 public:
-    // Short ASCII keys, exact letter encodings and CRC fingerprints use disjoint tags.
-    struct Slot {
-        uint64_t key = 0;
-        uint64_t metadata = 0;
-        uint32_t id() const { return static_cast<uint32_t>(metadata) & 0xfffffu; }
-        uint32_t column() const { return static_cast<uint32_t>(metadata >> 20) & 0xfffffu; }
-        int32_t head() const { return static_cast<int32_t>(metadata >> 40) - 1; }
+    struct Probe {
+        string_view word;
+        uint32_t hash;
+        uint64_t key;
     };
 private:
-    vector<Slot> slots;
-    vector<string_view> keys;
+    // Metadata word: (term ID + 1) in bits 0-19, Boolean column in 20-39, phrase head + 1 above.
+    // Four-way buckets hold exact keys; a full bucket spills into the next one.
     struct alignas(64) Bucket { uint64_t keys[4]; uint64_t meta[4]; };
     vector<Bucket> buckets;
     size_t bucket_mask = 0;
+    vector<string_view> keys;
+    vector<uint64_t> fingerprints;
 
     static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
         if (word.size() <= 8) {
@@ -188,85 +142,86 @@ private:
         hash = hash ? hash : 1;
         return {hash, (uint64_t(1) << 63) | hash};
     }
-    void rehash(size_t capacity) {
-        vector<Slot> fresh(capacity);
-        for (const Slot &slot : slots) {
-            if (!slot.key) continue;
-            uint32_t hash = (slot.key >> 62) == 2 ? static_cast<uint32_t>(slot.key)
-                : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
-            if (!hash) hash = 1;
-            size_t i = hash & (capacity - 1);
-            while (fresh[i].key) i = (i + 1) & (capacity - 1);
-            fresh[i] = slot;
+    static uint32_t hash_of(uint64_t key) {
+        uint32_t hash = (key >> 62) == 2 ? static_cast<uint32_t>(key) : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+        return hash ? hash : 1;
+    }
+    static unsigned match_mask(const Bucket &bucket, uint64_t key) {
+        __m256i eq = _mm256_cmpeq_epi64(_mm256_load_si256(reinterpret_cast<const __m256i *>(bucket.keys)), _mm256_set1_epi64x(static_cast<long long>(key)));
+        return static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(eq)));
+    }
+    void place(uint64_t key, uint64_t meta) {
+        for (size_t b = hash_of(key) & bucket_mask;; b = (b + 1) & bucket_mask) {
+            Bucket &bucket = buckets[b];
+            for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) { bucket.keys[i] = key; bucket.meta[i] = meta; return; }
         }
-        slots.swap(fresh);
+    }
+    void grow(size_t count) {
+        vector<Bucket> old(count);
+        old.swap(buckets);
+        bucket_mask = count - 1;
+        for (const Bucket &bucket : old) for (unsigned i = 0; i < 4; ++i) if (bucket.keys[i]) place(bucket.keys[i], bucket.meta[i]);
+    }
+    static uint32_t alnum_mask(const char *p) {
+        const __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+        const __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
+        const __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
+        const __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
+        return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
     }
 public:
     void reserve(size_t count) {
         keys.reserve(count);
-        size_t capacity = 16;
-        while (capacity < count * 2) capacity *= 2;
-        rehash(capacity);
+        fingerprints.reserve(count);
+        size_t buckets_needed = 1024;
+        while (buckets_needed * 2 < count) buckets_needed *= 2;
+        grow(buckets_needed);
     }
     pair<uint32_t, bool> intern(string_view word) {
-        if (slots.empty()) rehash(16);
-        if ((keys.size() + 1) * 10 >= slots.size() * 7)
-            rehash(slots.size() * 2);
+        // The frozen query limit keeps IDs and columns within 20 bits.
+        if (keys.size() + 2 >= (1u << 20)) throw runtime_error("query metadata capacity");
+        if (buckets.empty()) grow(1024);
+        else if (keys.size() > buckets.size() * 2) grow(buckets.size() * 2);
         const auto [hash, key] = fingerprint(word);
-        size_t i = hash & (slots.size() - 1);
-        for (;;) {
-            Slot &slot = slots[i];
-            if (!slot.key) {
+        for (size_t b = hash & bucket_mask;; b = (b + 1) & bucket_mask) {
+            Bucket &bucket = buckets[b];
+            for (unsigned hit = match_mask(bucket, key); hit; hit &= hit - 1) {
+                uint32_t id = term_id(bucket.meta[countr_zero(hit)]);
+                if ((key >> 62) != 2 || FoldEqual{}(keys[id], word)) return {id, false};
+            }
+            for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) {
                 uint32_t id = static_cast<uint32_t>(keys.size());
                 keys.push_back(word);
-                slot = {key, id};
+                fingerprints.push_back(key);
+                bucket.keys[i] = key;
+                bucket.meta[i] = id + 1;
                 return {id, true};
             }
-            if (slot.key == key && ((key >> 62) != 2 || FoldEqual{}(keys[slot.id()], word)))
-                return {slot.id(), false};
-            i = (i + 1) & (slots.size() - 1);
         }
     }
-    struct Probe {
-        string_view word;
-        uint32_t hash;
-        uint64_t key;
-    };
+    static uint32_t term_id(uint64_t meta) { return (static_cast<uint32_t>(meta) & 0xfffffu) - 1; }
+    size_t term_length(uint32_t term) const { return keys[term].size(); }
+    void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
+        for (Bucket &bucket : buckets) for (unsigned i = 0; i < 4; ++i) if (bucket.keys[i]) {
+            uint32_t id = term_id(bucket.meta[i]);
+            uint32_t column = columns[id] + 1;
+            uint32_t head = static_cast<uint32_t>(heads[id] + 1);
+            // The frozen query limit keeps columns within 20 bits and heads within 24.
+            if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
+            bucket.meta[i] = (id + 1) | (uint64_t(column) << 20) | (uint64_t(head) << 40);
+        }
+    }
     Probe prepare(string_view word, const char *read_end = nullptr) const {
         const auto [hash, key] = fingerprint(word, read_end);
-        __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
         return {word, hash, key};
     }
-    void prefetch(const Probe &probe) const { __builtin_prefetch(&slots[probe.hash & (slots.size() - 1)], 0, 3); }
-    const Slot *resolve(const Probe &probe) const {
-        if (slots.empty()) return nullptr;
-        const auto &[word, hash, key] = probe;
-        size_t i = hash & (slots.size() - 1);
-        for (;;) {
-            const Slot &slot = slots[i];
-            if (!slot.key) return nullptr;
-            if (slot.key == key && ((key >> 62) != 2 || FoldEqual{}(keys[slot.id()], word)))
-                return &slot;
-            i = (i + 1) & (slots.size() - 1);
-        }
-    }
-
     // Writes every token boundary (start, end, start, end, ...) of [b, b+len) to bounds.
     // b must be readable for len+64 bytes; returns the boundary count (twice the token count).
     static size_t tokenize(const char *b, size_t len, uint32_t *bounds) {
-        const __m256i z = _mm256_set1_epi8('a' - 1), zz = _mm256_set1_epi8('z' + 1);
-        const __m256i d0 = _mm256_set1_epi8('0' - 1), d9 = _mm256_set1_epi8('9' + 1), bit = _mm256_set1_epi8(32);
-        auto classify = [&](const char *p) -> uint32_t {
-            __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
-            __m256i fold = _mm256_or_si256(bytes, bit);
-            __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, z), _mm256_cmpgt_epi8(zz, fold));
-            __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, d0), _mm256_cmpgt_epi8(d9, bytes));
-            return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
-        };
         uint64_t carry = 0;
         size_t n = 0;
         for (size_t off = 0; off <= len; off += 64) {
-            uint64_t m = classify(b + off) | (uint64_t(classify(b + off + 32)) << 32);
+            uint64_t m = alnum_mask(b + off) | (uint64_t(alnum_mask(b + off + 32)) << 32);
             size_t rem = len - off;
             if (rem < 64) m &= rem ? ~uint64_t(0) >> (64 - rem) : 0;
             uint64_t t = m ^ ((m << 1) | carry);
@@ -283,9 +238,8 @@ public:
         }
         return n;
     }
-    // Fingerprints and prefetches every token; 1-8 byte tokens take a branch-free batch path.
-    size_t prepare_line(const char *b, size_t n, const uint32_t *bounds,
-                        Probe *out, uint32_t *longs, const char *read_end) const {
+    // Fingerprints every token; 1-8 byte tokens take a branch-free batch path, the rest a scalar one.
+    void prepare_line(const char *b, size_t n, const uint32_t *bounds, Probe *out, uint32_t *longs, const char *read_end) const {
         size_t nl = 0;
         for (size_t i = 0; i < n; ++i) {
             uint32_t s = bounds[2 * i], len = bounds[2 * i + 1] - s;
@@ -294,24 +248,35 @@ public:
             unsigned used = len < 8 ? len : 8;
             uint64_t key = (word | 0x2020202020202020ULL) & (~uint64_t(0) >> (64 - used * 8));
             uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
-            hash = hash ? hash : 1;
-            out[i] = {string_view(b + s, len), hash, key};
+            out[i] = {string_view(b + s, len), hash ? hash : 1, key};
             longs[nl] = static_cast<uint32_t>(i);
             nl += len > 8;
         }
-        for (size_t k = 0; k < nl; ++k) {
-            Probe &probe = out[longs[k]];
-            probe = prepare(probe.word, read_end);
+        for (size_t k = 0; k < nl; ++k) out[longs[k]] = prepare(out[longs[k]].word, read_end);
+    }
+    void prefetch(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
+    // Returns the metadata word, or zero on a miss; long-token matches are verified byte for byte.
+    uint64_t resolve(const Probe &probe) const {
+        for (size_t b = probe.hash & bucket_mask;; b = (b + 1) & bucket_mask) {
+            const Bucket &bucket = buckets[b];
+            if (unsigned hit = match_mask(bucket, probe.key); __builtin_expect(hit != 0, 1)) {
+                if (__builtin_expect((probe.key >> 62) != 2, 1)) return bucket.meta[countr_zero(hit)];
+                return resolve_long(probe, b);
+            }
+            if (bucket.keys[3] == 0) return 0;
         }
-        return n;
     }
-    uint32_t lookup(string_view word, const char *read_end = nullptr) const {
-        const Slot *slot = resolve(prepare(word, read_end));
-        return slot ? slot->id() : numeric_limits<uint32_t>::max();
+    // Equal 32-bit fingerprints may name different words, so every candidate is compared.
+    uint64_t resolve_long(const Probe &probe, size_t b) const {
+        for (;; b = (b + 1) & bucket_mask) {
+            const Bucket &bucket = buckets[b];
+            for (unsigned i = 0; i < 4; ++i)
+                if (bucket.keys[i] == probe.key && FoldEqual{}(keys[term_id(bucket.meta[i])], probe.word)) return bucket.meta[i];
+            if (bucket.keys[3] == 0) return 0;
+        }
     }
-
     uint64_t phrase_key(uint32_t term) const {
-        uint64_t key = fingerprint(keys[term]).second;
+        uint64_t key = fingerprints[term];
         return key | ((key >> 62) == 2 ? uint64_t(term) << 32 : 0);
     }
     bool phrase_equal(uint64_t expected, const Probe &probe) const {
@@ -319,67 +284,29 @@ public:
         return probe.key == ((uint64_t(1) << 63) | static_cast<uint32_t>(expected)) &&
             FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
     }
-    void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
-        // The frozen query limit keeps IDs/columns within 20 bits and heads within 24.
-        if (keys.size() > (1u << 20)) throw runtime_error("query metadata capacity");
-        for (Slot &slot : slots) if (slot.key) {
-            uint32_t id = slot.id();
-            uint32_t column = columns[id] + 1;
-            uint32_t head = static_cast<uint32_t>(heads[id] + 1);
-            if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
-            slot.metadata = id | (uint64_t(column) << 20) | (uint64_t(head) << 40);
-        }
-        build_buckets();
-    }
-    // Four-way buckets: overflow spills linearly into following buckets.
-    void build_buckets() {
-        size_t count = 1024;
-        while (count * 2 < keys.size()) count *= 2;
-        buckets.assign(count, Bucket{});
-        bucket_mask = count - 1;
-        for (const Slot &slot : slots) if (slot.key) {
-            uint32_t hash = (slot.key >> 62) == 2 ? static_cast<uint32_t>(slot.key)
-                : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
-            if (!hash) hash = 1;
-            for (size_t b = hash & bucket_mask;; b = (b + 1) & bucket_mask) {
-                unsigned used = 0;
-                while (used < 4 && buckets[b].keys[used]) ++used;
-                if (used < 4) { buckets[b].keys[used] = slot.key; buckets[b].meta[used] = slot.metadata; break; }
-            }
-        }
-    }
-    void prefetch_bucket(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
-    // Returns slot metadata, or zero on a miss; long-token matches are verified byte for byte.
-    uint64_t resolve_meta(const Probe &probe) const {
-        const size_t mask = bucket_mask;
-        size_t b = probe.hash & mask;
-        for (;;) {
-            const Bucket &bucket = buckets[b];
-            __m256i eq = _mm256_cmpeq_epi64(_mm256_load_si256(reinterpret_cast<const __m256i *>(bucket.keys)), _mm256_set1_epi64x(static_cast<long long>(probe.key)));
-            unsigned hit = static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(eq)));
-            if (__builtin_expect(hit != 0, 1)) {
-                uint64_t meta = bucket.meta[countr_zero(hit)];
-                if (__builtin_expect((probe.key >> 62) == 2, 0) && !FoldEqual{}(keys[static_cast<uint32_t>(meta) & 0xfffffu], probe.word)) {
-                    // Equal 32-bit fingerprint but different bytes: keep scanning later slots.
-                    if (hit & (hit - 1)) { /* unreachable: keys unique per fingerprint+bytes handled below */ }
-                    return resolve_long_slow(probe, b);
-                }
-                return meta;
-            }
-            if (bucket.keys[3] == 0) return 0;
-            b = (b + 1) & mask;
-        }
-    }
-    uint64_t resolve_long_slow(const Probe &probe, size_t b) const {
-        for (;; b = (b + 1) & bucket_mask) {
-            const Bucket &bucket = buckets[b];
-            for (unsigned i = 0; i < 4; ++i) {
-                if (bucket.keys[i] == probe.key && FoldEqual{}(keys[static_cast<uint32_t>(bucket.meta[i]) & 0xfffffu], probe.word)) return bucket.meta[i];
-            }
-            if (bucket.keys[3] == 0) return 0;
-        }
-    }
+};
 
+// Reusable per-worker buffers that turn one document line into fingerprinted probes.
+struct LineTokens {
+    vector<uint32_t> bounds, longs;
+    vector<FlatDictionary::Probe> probes;
+    vector<char> tail;
+    size_t count = 0;
+    void load(const FlatDictionary &dictionary, const char *text, const char *line_end, const char *file_end) {
+        size_t length = line_end - text;
+        const char *read_end = file_end;
+        if (file_end - line_end < 128) {
+            // Only the file's last lines need a padded copy so SIMD loads stay in bounds.
+            tail.assign(length + 128, 0);
+            memcpy(tail.data(), text, length);
+            text = tail.data();
+            read_end = nullptr;
+        }
+        size_t capacity = length / 2 + 40;
+        if (longs.size() < capacity) { bounds.resize(2 * capacity + 8); longs.resize(capacity); probes.resize(capacity); }
+        count = FlatDictionary::tokenize(text, length, bounds.data()) / 2;
+        dictionary.prepare_line(text, count, bounds.data(), probes.data(), longs.data(), read_end);
+    }
 };
 
 struct Query {
@@ -496,38 +423,33 @@ public:
         const auto [count, sum] = dense_stats<words>(data);
         row.total += (uint64_t(base) + (uint64_t(1) << 35)) * count + sum;
     }
-    void merge(const Results &source) {
-        if (source.rows.empty()) return;
-        // Worker ranges are merged in document order.
-        for (size_t query = 0; query < rows.size(); ++query) {
-            Summary &dst = rows[query];
-            const Summary &src = source.rows[query];
-            if (!src.count()) continue;
-            if (dst.count() < kept_ids) {
-                auto &first = first_for(dst);
-                size_t kept = dst.count();
-                size_t add = min<size_t>(src.count(), kept_ids - kept);
-                copy_n(source.first_ids[src.first_offset].begin(), add, first.begin() + kept);
-            }
-            dst.total += src.total;
-        }
-    }
-    void write(ostream &out) const {
+    // Merges worker summaries (given in document order) and formats the lines for queries [first, last).
+    static void write_range(const vector<const Results *> &parts, size_t first, size_t last, string &out) {
         array<char, 256> line;
-        for (const Summary &row : rows) {
+        for (size_t query = first; query < last; ++query) {
+            Summary merged;
+            array<uint32_t, kept_ids> ids;
+            size_t kept = 0;
+            for (const Results *part : parts) {
+                const Summary &row = part->rows[query];
+                if (!row.count()) continue;
+                size_t add = min<size_t>(row.count(), kept_ids - kept);
+                copy_n(part->first_ids[row.first_offset].begin(), add, ids.begin() + kept);
+                kept += add;
+                merged.total += row.total;
+            }
             char *p = line.data();
-            p = to_chars(p, p + 24, row.count()).ptr;
+            p = to_chars(p, p + 24, merged.count()).ptr;
             *p++ = ' ';
-            p = to_chars(p, p + 24, row.sum()).ptr;
-            for (size_t i = 0; i < min<size_t>(row.count(), kept_ids); ++i) {
+            p = to_chars(p, p + 24, merged.sum()).ptr;
+            for (size_t i = 0; i < kept; ++i) {
                 *p++ = ' ';
-                p = to_chars(p, p + 24, first_ids[row.first_offset][i]).ptr;
+                p = to_chars(p, p + 24, ids[i]).ptr;
             }
             *p++ = '\n';
-            out.write(line.data(), p - line.data());
+            out.append(line.data(), p - line.data());
         }
     }
-
 };
 
 class Engine {
@@ -577,17 +499,25 @@ class Engine {
         uint32_t output = 0;
     };
     vector<BooleanQuery> boolean_queries;
-    Results answers;
+    vector<Results> partial;
 
+    // A short corpus prefix ranks phrase terms by rarity; ties prefer longer words. Only speed depends on it.
+    static constexpr size_t sample_bytes = 512u << 10;
     void compile_queries(const MappedFile &input) {
         // Sampling affects anchor choice, never whether a match is accepted.
         vector<uint32_t> frequency(term_count);
-        const char *stop = input.data + min<size_t>(input.size, 2u << 20);
-        TokenScanner scanner(input.data, stop);
-        string_view word;
-        while (scanner.next(word)) {
-            uint32_t term = dictionary.lookup(word, input.data + input.size);
-            if (term != numeric_limits<uint32_t>::max()) ++frequency[term];
+        const char *file_end = input.data + input.size, *stop = input.data + min<size_t>(input.size, sample_bytes);
+        LineTokens line;
+        for (const char *p = input.data; p < stop;) {
+            const char *line_end = static_cast<const char *>(memchr(p, '\n', file_end - p));
+            if (!line_end) line_end = file_end;
+            const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
+            if (tab) {
+                line.load(dictionary, tab + 1, line_end, file_end);
+                for (size_t i = 0; i < line.count; ++i)
+                    if (uint64_t meta = dictionary.resolve(line.probes[i])) ++frequency[FlatDictionary::term_id(meta)];
+            }
+            p = line_end < file_end ? line_end + 1 : file_end;
         }
         vector<int32_t> anchor_head(term_count, -1);
         query_count = queries.size();
@@ -610,7 +540,8 @@ class Engine {
             }
             size_t best = 0;
             for (size_t i = 1; i < q.term_count; ++i)
-                if (frequency[q.terms[i]] < frequency[q.terms[best]]) best = i;
+                if (frequency[q.terms[i]] < frequency[q.terms[best]] ||
+                    (frequency[q.terms[i]] == frequency[q.terms[best]] && dictionary.term_length(q.terms[i]) > dictionary.term_length(q.terms[best]))) best = i;
             uint32_t term = q.terms[best];
             PhrasePlan plan;
             for (size_t i = 0; i < q.term_count; ++i) plan.keys[i] = dictionary.phrase_key(q.terms[i]);
@@ -621,9 +552,6 @@ class Engine {
             anchor_head[term] = static_cast<int32_t>(phrases.size());
             phrases.push_back(plan);
         }
-        sort(boolean_queries.begin(), boolean_queries.end(), [](const BooleanQuery &a, const BooleanQuery &b) {
-            return a.terms < b.terms;
-        });
         dictionary.configure_metadata(boolean_column, anchor_head);
         vector<Query>().swap(queries);
 
@@ -777,9 +705,7 @@ class Engine {
                 vector<uint32_t> last(phrases.size(), numeric_limits<uint32_t>::max());
                 vector<pair<uint32_t, int32_t>> anchors;
                 anchors.reserve(128);
-                vector<FlatDictionary::Probe> probes;
-                vector<uint32_t> edges, longs;
-                vector<char> tail;
+                LineTokens line;
                 const char *p = bounds[idx], *stop = bounds[idx + 1];
                 while (p < stop) {
                     const char *line_end = static_cast<const char *>(memchr(p, '\n', stop - p));
@@ -795,29 +721,18 @@ class Engine {
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     size_t anchor_count = 0;
-                    const char *text = tab + 1;
-                    size_t text_len = line_end - text;
-                    const char *read_end = end;
-                    if (end - line_end < 128) {
-                        // Only the file's last lines need a padded copy so SIMD loads stay in bounds.
-                        tail.assign(text_len + 128, 0);
-                        memcpy(tail.data(), text, text_len);
-                        text = tail.data();
-                        read_end = nullptr;
-                    }
-                    size_t capacity = text_len / 2 + 40;
-                    if (longs.size() < capacity) { edges.resize(2 * capacity + 8); longs.resize(capacity); probes.resize(capacity); }
+                    line.load(dictionary, tab + 1, line_end, end);
+                    const size_t token_count = line.count;
+                    const auto *probes = line.probes.data();
                     constexpr size_t kAhead = 8;
-                    size_t token_count = FlatDictionary::tokenize(text, text_len, edges.data()) / 2;
-                    dictionary.prepare_line(text, token_count, edges.data(), probes.data(), longs.data(), read_end);
-                    for (size_t i = 0; i < kAhead && i < token_count; ++i) dictionary.prefetch_bucket(probes[i]);
+                    for (size_t i = 0; i < kAhead && i < token_count; ++i) dictionary.prefetch(probes[i]);
                     const uint64_t document_bit = uint64_t(1) << (in_block % 64);
                     const size_t document_word = in_block / 64;
                     if (anchors.size() < token_count) anchors.resize(token_count);
                     for (size_t index = 0; index < token_count; ++index) {
-                        if (index + kAhead < token_count) dictionary.prefetch_bucket(probes[index + kAhead]);
+                        if (index + kAhead < token_count) dictionary.prefetch(probes[index + kAhead]);
                         const auto &probe = probes[index];
-                        const uint64_t entry = dictionary.resolve_meta(probe);
+                        const uint64_t entry = dictionary.resolve(probe);
                         {
                             int32_t head = static_cast<int32_t>(entry >> 40) - 1;
                             if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
@@ -848,7 +763,7 @@ class Engine {
                             }
                         }
                     }
-                    match_document(doc, {probes.data(), token_count}, {anchors.data(), anchor_count}, c.results, last);
+                    match_document(doc, {probes, token_count}, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
                     if (++in_block == block_docs) flush();
                 }
@@ -860,14 +775,29 @@ class Engine {
         parse_chunk(0);
         for (thread &t : threads) t.join();
         for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-        answers = move(chunks[0].results);
         uint32_t expected_doc = 0;
-        for (const Chunk &c : chunks) {
+        for (Chunk &c : chunks) {
             if (c.docs && c.first_doc != expected_doc) throw runtime_error("nonconsecutive document chunks");
             expected_doc += static_cast<uint32_t>(c.docs);
-            answers.merge(c.results);
+            partial.push_back(move(c.results));
         }
+    }
 
+    // Each thread merges and formats one contiguous range of queries.
+    void write_answers(ostream &out, size_t threads) {
+        vector<const Results *> parts;
+        for (const Results &part : partial) parts.push_back(&part);
+        vector<string> text(threads);
+        auto format = [&](size_t i) {
+            size_t first = query_count * i / threads, last = query_count * (i + 1) / threads;
+            text[i].reserve((last - first) * 32);
+            Results::write_range(parts, first, last, text[i]);
+        };
+        vector<thread> pool;
+        for (size_t i = 1; i < threads; ++i) pool.emplace_back(format, i);
+        format(0);
+        for (thread &t : pool) t.join();
+        for (const string &chunk : text) out.write(chunk.data(), chunk.size());
     }
 
     uint32_t intern(string_view word) {
@@ -878,8 +808,8 @@ class Engine {
 
     void parse_queries(const MappedFile &input) {
         const char *p = input.data, *end = p + input.size;
-        dictionary.reserve(40000);
-        queries.reserve(static_cast<size_t>(count(input.data, input.data + input.size, '\n')));
+        dictionary.reserve(input.size / 24);
+        queries.reserve(input.size / 20);
         while (p < end) {
             const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
             if (!line_end) line_end = end;
@@ -925,7 +855,7 @@ public:
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
         if (!output) throw runtime_error("cannot open output");
-        answers.write(output);
+        write_answers(output, workers);
         if (!output) throw runtime_error("output write failure");
     }
 };
