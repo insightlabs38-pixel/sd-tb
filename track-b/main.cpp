@@ -281,35 +281,95 @@ struct Query {
     span<const uint32_t> words() const { return {terms.data(), term_count}; }
 };
 
-struct Result {
-    uint32_t count = 0;
-    uint64_t sum = 0;
-    array<uint32_t, 10> first{};
-    void add(uint32_t id) {
-        if (count < first.size()) first[count] = id;
-        ++count;
-        sum += id;
-    }
-    template<class Integer> static char *number(char *p, Integer value) {
-        return to_chars(p, p + 24, value).ptr;
-    }
-    char *append(char *p) const {
-        p = number(p, count);
-        *p++ = ' ';
-        p = number(p, sum);
-        for (size_t i = 0; i < min<size_t>(count, first.size()); ++i) {
-            *p++ = ' ';
-            p = number(p, first[i]);
+class Results {
+    static constexpr size_t kept_ids = 10;
+    struct Summary {
+        uint64_t sum = 0;
+        uint32_t count = 0;
+        uint32_t first_offset = numeric_limits<uint32_t>::max();
+    };
+    vector<Summary> rows;
+    vector<array<uint32_t, kept_ids>> first_ids;
+
+    array<uint32_t, kept_ids> &first_for(Summary &row) {
+        if (!row.count) {
+            row.first_offset = static_cast<uint32_t>(first_ids.size());
+            first_ids.emplace_back();
         }
-        *p++ = '\n';
-        return p;
+        return first_ids[row.first_offset];
+    }
+public:
+    void reset(size_t count) {
+        rows.assign(count, Summary{});
+        first_ids.clear();
+        // Capacity is reserved, but only matched queries touch first-ID pages.
+        first_ids.reserve(count);
+    }
+    void add(size_t query, uint32_t id) {
+        Summary &row = rows[query];
+        if (row.count < kept_ids) first_for(row)[row.count] = id;
+        ++row.count;
+        row.sum += id;
+    }
+    void add_bits(size_t query, uint64_t bits, uint32_t base) {
+        if (!bits) return;
+        Summary &row = rows[query];
+        if (row.count < kept_ids) {
+            auto &first = first_for(row);
+            size_t kept = row.count;
+            uint64_t remaining = bits;
+            while (remaining && kept < kept_ids) {
+                first[kept++] = base + countr_zero(remaining);
+                remaining &= remaining - 1;
+            }
+        }
+        unsigned count = popcount(bits);
+        row.count += count;
+        row.sum += uint64_t(base) * count;
+        row.sum += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
+        row.sum += 2u * popcount(bits & 0xccccccccccccccccULL);
+        row.sum += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
+        row.sum += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
+        row.sum += 16u * popcount(bits & 0xffff0000ffff0000ULL);
+        row.sum += 32u * popcount(bits & 0xffffffff00000000ULL);
+    }
+    void merge(const Results &source) {
+        if (source.rows.empty()) return;
+        // Worker ranges are merged in document order.
+        for (size_t query = 0; query < rows.size(); ++query) {
+            Summary &dst = rows[query];
+            const Summary &src = source.rows[query];
+            if (!src.count) continue;
+            if (dst.count < kept_ids) {
+                auto &first = first_for(dst);
+                size_t kept = dst.count;
+                size_t add = min<size_t>(src.count, kept_ids - kept);
+                copy_n(source.first_ids[src.first_offset].begin(), add, first.begin() + kept);
+            }
+            dst.count += src.count;
+            dst.sum += src.sum;
+        }
+    }
+    void write(ostream &out) const {
+        array<char, 256> line;
+        for (const Summary &row : rows) {
+            char *p = line.data();
+            p = to_chars(p, p + 24, row.count).ptr;
+            *p++ = ' ';
+            p = to_chars(p, p + 24, row.sum).ptr;
+            for (size_t i = 0; i < min<size_t>(row.count, kept_ids); ++i) {
+                *p++ = ' ';
+                p = to_chars(p, p + 24, first_ids[row.first_offset][i]).ptr;
+            }
+            *p++ = '\n';
+            out.write(line.data(), p - line.data());
+        }
     }
 
 };
 
 class Engine {
     FlatDictionary dictionary;
-    static constexpr size_t block_docs = 2048, words = block_docs / 64;
     size_t term_count = 0;
     vector<Query> queries;
     struct PhrasePlan {
@@ -328,7 +388,7 @@ class Engine {
         uint32_t output = 0;
     };
     vector<BooleanQuery> boolean_queries;
-    vector<Result> answers;
+    Results answers;
 
     void compile_queries(const MappedFile &input) {
         // Sampling affects anchor choice, never whether a match is accepted.
@@ -378,8 +438,8 @@ class Engine {
     }
 
     void match_document(uint32_t doc, const vector<FlatDictionary::Probe> &probes,
-                        const vector<pair<uint32_t, int32_t>> &anchors,
-                        vector<Result> &results, vector<uint32_t> &last) const {
+                        span<const pair<uint32_t, int32_t>> anchors,
+                        Results &results, vector<uint32_t> &last) const {
         for (const auto &[pos, head] : anchors) {
             for (int32_t pid = head; pid >= 0; pid = phrases[pid].next) {
                 if (last[pid] == doc) continue;
@@ -393,14 +453,16 @@ class Engine {
                 while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
                 if (j == count) {
                     last[pid] = doc;
-                    results[plan.output].add(doc);
+                    results.add(plan.output, doc);
                 }
             }
         }
     }
 
+    template<size_t block_docs>
     void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
-                        size_t in_block, uint32_t block_base, vector<Result> &results) const {
+                        size_t in_block, uint32_t block_base, Results &results) const {
+        static constexpr size_t words = block_docs / 64;
         for (const BooleanQuery &q : boolean_queries) {
             const size_t qi = q.output;
             bool possible = active[q.terms[0]] != 0;
@@ -420,36 +482,20 @@ class Engine {
             for (size_t word = 0; word < (in_block + 63) / 64; ++word) {
                 uint64_t bits = value[word];
                 if (!bits) continue;
-                Result &r = results[qi];
-                uint32_t base = block_base + static_cast<uint32_t>(word * 64);
-                uint64_t first = bits;
-                size_t kept = min<size_t>(r.count, r.first.size());
-                while (first && kept < r.first.size()) {
-                    r.first[kept++] = base + countr_zero(first);
-                    first &= first - 1;
-                }
-                unsigned count = popcount(bits);
-                r.count += count;
-                r.sum += uint64_t(base) * count;
-                r.sum += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
-                r.sum += 2u * popcount(bits & 0xccccccccccccccccULL);
-                r.sum += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
-                r.sum += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
-                r.sum += 16u * popcount(bits & 0xffff0000ffff0000ULL);
-                r.sum += 32u * popcount(bits & 0xffffffff00000000ULL);
+                results.add_bits(qi, bits, block_base + static_cast<uint32_t>(word * 64));
             }
         }
     }
 
-    void scan_corpus(const MappedFile &input) {
+    template<size_t block_docs>
+    void scan_corpus(const MappedFile &input, size_t workers) {
+        static constexpr size_t words = block_docs / 64;
         struct Chunk {
-            vector<Result> results;
+            Results results;
             uint32_t first_doc = 0, last_doc = 0;
             size_t docs = 0;
         };
         const char *begin = input.data, *end = begin + input.size;
-        const size_t workers = input.size >= (8u << 20)
-            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
         vector<const char *> bounds(workers + 1);
         bounds[0] = begin;
         bounds[workers] = end;
@@ -463,14 +509,14 @@ class Engine {
         auto parse_chunk = [&](size_t idx) {
             try {
                 Chunk &c = chunks[idx];
-                c.results.resize(query_count);
+                c.results.reset(query_count);
                 vector<uint64_t> matrix(words);
                 matrix.reserve(words * (boolean_count + 1));
                 vector<uint32_t> active(boolean_count);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
-                    evaluate_block(matrix, active, in_block, block_base, c.results);
+                    evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
                     matrix.resize(words);
                     fill(active.begin(), active.end(), 0);
                     in_block = 0;
@@ -494,17 +540,20 @@ class Engine {
                     c.last_doc = doc;
                     ++c.docs;
                     if (!in_block) block_base = doc;
-                    anchors.clear();
+                    size_t anchor_count = 0;
                     probes.clear();
                     TokenScanner scanner(tab + 1, line_end);
                     string_view word;
                     while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    const uint64_t document_bit = uint64_t(1) << (in_block % 64);
+                    const size_t document_word = in_block / 64;
+                    if (anchors.size() < probes.size()) anchors.resize(probes.size());
                     for (size_t index = 0; index < probes.size(); ++index) {
                         const auto &probe = probes[index];
                         const auto *entry = dictionary.resolve(probe);
                         if (entry) {
                             int32_t head = entry->head();
-                            if (head >= 0) anchors.emplace_back(static_cast<uint32_t>(index), head);
+                            if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
                             uint32_t column = entry->column();
                             if (column) {
                                 --column;
@@ -513,11 +562,11 @@ class Engine {
                                     row = static_cast<uint32_t>(matrix.size() / words);
                                     matrix.resize(matrix.size() + words, 0);
                                 }
-                                matrix[row * words + in_block / 64] |= uint64_t(1) << (in_block % 64);
+                                matrix[row * words + document_word] |= document_bit;
                             }
                         }
                     }
-                    match_document(doc, probes, anchors, c.results, last);
+                    match_document(doc, probes, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
                     if (++in_block == block_docs) flush();
                 }
@@ -529,20 +578,12 @@ class Engine {
         parse_chunk(0);
         for (thread &t : threads) t.join();
         for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-        answers.swap(chunks[0].results);
+        answers = move(chunks[0].results);
         uint32_t expected_doc = 0;
         for (const Chunk &c : chunks) {
             if (c.docs && c.first_doc != expected_doc) throw runtime_error("nonconsecutive document chunks");
             expected_doc += static_cast<uint32_t>(c.docs);
-            for (size_t qi = 0; qi < c.results.size(); ++qi) {
-                Result &dst = answers[qi];
-                const Result &src = c.results[qi];
-                size_t kept = min<size_t>(dst.count, dst.first.size());
-                size_t add = min<size_t>(src.count, dst.first.size() - kept);
-                for (size_t i = 0; i < add; ++i) dst.first[kept + i] = src.first[i];
-                dst.count += src.count;
-                dst.sum += src.sum;
-            }
+            answers.merge(c.results);
         }
 
     }
@@ -597,15 +638,12 @@ public:
         parse_queries(query_file);
         MappedFile docs_file(data_dir + "/docs.txt");
         compile_queries(docs_file);
-        scan_corpus(docs_file);
+        const size_t workers = docs_file.size >= (8u << 20) ? 12 : 1;
+        scan_corpus<768>(docs_file, workers);
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
         if (!output) throw runtime_error("cannot open output");
-        array<char, 256> line;
-        for (const Result &r : answers) {
-            char *end = r.append(line.data());
-            output.write(line.data(), end - line.data());
-        }
+        answers.write(output);
         if (!output) throw runtime_error("output write failure");
     }
 };
