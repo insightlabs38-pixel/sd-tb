@@ -76,10 +76,13 @@ Development host (4 cores, GCC 13, `-O3 -flto -march=x86-64-v3`), seed 1, pinned
 | dynamic blocks, fused tokenizer, cold prefetch, shape grouping | ~740 |
 
 Four real cores (`W=4`): champion 392-397 ms, candidate 215-231 ms. Twelve threads on four cores: 425 -> 229 ms.
-Peak anonymous memory 38.8 -> 41.4 MB. Canonical S 918 -> ~1,092 (plus 7 Dockerfile lines), D 1.
+Peak anonymous memory 38.5 -> 42.1 MB (12 workers). Canonical S 918 -> 1,103 (plus 7 Dockerfile lines), D 1.
 
 CI (pinned `gcc:15` Docker, offline, organizer timer, 4-vCPU SMT runner; five paired runs per seed):
-see `PERF.md` for the receipts and run links.
+K ratio 1.156 / 1.152 / 1.157 with both sides at 12 workers (T 0.476 -> 0.335 s), and 1.220 / 1.231 / 1.228 with the
+final worker-count change (candidate uses the runner's 4 CPUs: T 0.267 s, M 23 MB). Receipts and links: `PERF.md`.
+The runner's T gain (0.70x) is smaller than the development host's (0.55-0.6x): SMT siblings share the same
+caches, so expect the scoring host to land between the two.
 
 ## 4. Rejected or neutral (with reasons)
 
@@ -92,7 +95,10 @@ see `PERF.md` for the receipts and run links.
 | Query-ordered prefetch of active states, sort by first term | <= 2% |
 | Transparent huge pages for the dictionary, `-static`, PGO (GCC 13 sample profile), `-march=native`, `-O2` | no gain |
 | Extracting the mark loop into a separate function (restrict/templated) | 9-12% slower from changed inlining |
-| Block sizes 1,024-4,096 | 1,024 saves 8 MB (-1.7% from M) but costs ~8% time; 4,096 the reverse |
+| Block sizes 1,024-4,096 | 1,024 saves 8 MB but costs ~8% time; 1,536 is within noise on CI; 4,096 the reverse |
+| Hot cap 1,500/2,000, hot threshold 8, 256 KB sample (CI sweep) | all within +-2% of base |
+| Parallel query-file tokenization, prefaulting dictionary/plans, extra intern prefetch | no change in the 10 ms serial parse (instruction and first-touch bound) |
+| 24-byte `Probe` | -1%, within noise; not adopted |
 
 ## 5. Next actions
 

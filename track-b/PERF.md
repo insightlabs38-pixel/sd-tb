@@ -226,3 +226,46 @@ Promoted exact challenger in [commit 227b4b9e](https://github.com/insightlabs38-
 Source `ea351a5c9a3eb985faab60326e61387b6366b8b6` combines exact 9–12-letter keys, packed count/sum headers and lazy Boolean evaluation. Full inputs use 12 literal workers with 2,048-document blocks; there is no worker environment override. [Pinned qualification 41165413401](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41165413401) passes production-Docker oracles, ASan/UBSan, TSan, all three full references, published sample/full hashes and tiny seed 7.
 
 Full seeds 1/2/3: organizer five-run trimmed T=0.324628/0.325807/0.326278 s; peak M=42610688/41828352/42856448 B; S=925; D=1; K_local=20.346611/20.309763/20.295099. These are paired four-logical-CPU runner measurements, not official scores or a rejection of higher-core scaling. [Complete evidence and controlled handoff](https://github.com/insightlabs38-pixel/sd-tb/blob/frontier/b-sol-hybrid-qualification/experiments/frontier/HYBRIDS.md). Rollbacks: `b9ab12a`, official `8d5bc54` / PR #3 `338c7cf`, and PR #2 `4069aa9`.
+
+## Claude frontier: window tokenizer, bucket dictionary, hot rows (October 31)
+
+Rollback `d7845bc` (production blob `76946cc`, official `run-dcebadac870d`, K 23.250490). Mechanism, the complete
+postings measurement and every rejected experiment: `experiments/frontier/B-CLAUDE-FRONTIER.md`.
+
+One 64-byte AVX2 window tokenizer fingerprints while it splits (the query file uses it too); one four-way bucket
+dictionary answers term ID, Boolean column and phrase head with a single SIMD compare; frequent Boolean terms own
+permanent dense rows marked branch-free, the rest keep five inline positions; AVX2 exact dense count/sum; workers
+claim document-aligned blocks; plans are grouped by operator shape; 18-bit first-ten lists merged by value; output is
+merged and formatted on all threads; one worker per allowed CPU, at most twelve.
+
+Pinned qualification, run [41246193365](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41246193365) on source
+`a84e0b5` (blob `3c5bce7504eae1a0da6deb4a898a597d03214963`): pinned `gcc:15` offline Docker, uid 65534, read-only root,
+organizer timer, warmed inputs, five paired runs per seed on a 4-vCPU GitHub runner, differential, adversarial,
+randomized-shape fuzz, ASan/UBSan and TSan gates, published seed-1 hash and independent seed-2/3 references. The
+champion keeps its fixed 12 workers; on this runner the candidate therefore uses 4.
+
+| Seed | Champion T / M | Candidate T / M | S (both, incl. Dockerfile) | K_local | K ratio |
+|---|---|---|---|---|---|
+| 1 | 0.420 s / 42.8 MB | 0.267 s / 23.4 MB | 925 / 1110 | 17.88 -> 21.82 | 1.220 |
+| 2 | 0.406 s / 42.9 MB | 0.254 s / 23.5 MB | 925 / 1110 | 18.19 -> 22.40 | 1.231 |
+| 3 | 0.409 s / 42.6 MB | 0.257 s / 23.2 MB | 925 / 1110 | 18.13 -> 22.26 | 1.228 |
+
+Same-worker-count evidence (both at 12 oversubscribed workers, earlier source `893af0d`, [run 41243209029](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41243209029)):
+T 0.476 -> 0.335 s, M 42.8 -> 45.2 MB, K ratio **1.156 / 1.152 / 1.157**. [Parameter sweep 41245241013](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41245241013)
+(7 paired runs, seeds 1-2): hot-row cap 1500/2000, hot threshold 8, 256 KB sample, 1,536-document blocks and word-major hot
+rows are all within +-2% of the base (noise); 4 and 6 workers beat 12 by ~12% on this 4-vCPU runner (3x oversubscribed) at half the memory,
+which is why the worker count now follows the CPU affinity mask. On the 12-logical-CPU scoring host this is still 12.
+
+Development host (4 cores, GCC 13), seed 1, full corpus, interleaved min of 9-11: pinned single core 1,376 -> 786 ms;
+4 workers 391 -> 242 ms; 12 workers 408 -> 246 ms; anonymous memory 38.5 -> 42.1 MB (12 workers). Seed 2 matches the
+independent Python reference byte for byte. These are runner and development-host measurements, not board scores.
+
+### Handoff for Luna (exact source)
+
+* Source: `track-b/main.cpp` at `a84e0b5d0ddd844bfe5a8b7eb7318ce09bf277a6` on `branch/festive-hawking-wn31k1`, blob
+  `3c5bce7504eae1a0da6deb4a898a597d03214963`. `track-b/Dockerfile` is byte-identical to `sd-sm` (blob `9b064d4031a7...`).
+* Canonical S (clang-format LLVM + scc): 1,103 + 7 Dockerfile lines = 1,110; D = 1; no new dependencies.
+* Suggested A/B: this blob versus `76946cc`, same host and image, five interleaved runs. Expect the scoring host's T to
+  fall by 30-40% (local), or ~25-30% if SMT contention behaves like the 4-vCPU runner; memory should stay near 49-55 MB
+  (12 workers), so the M term is slightly negative while the cap does not apply.
+* Rollback: `d7845bc` / blob `76946cc`.
