@@ -4,7 +4,7 @@ A C++20, standard-library-only solution to [Track B](https://github.com/hackatho
 
 ## Approach
 
-Queries select a collision-safe ASCII token dictionary. Up to four workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints with exact packed short keys and full-byte long-token verification. Document-local batches prefetch dictionary probes, whose slots pack term IDs, Boolean columns and phrase heads. Boolean terms populate reusable 2,048-document bitmaps with bounded capacity and rows touched only for terms present in the block; compact plans apply every operator strictly left to right. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency against the same exact lookup probes. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
+Queries select a collision-safe ASCII token dictionary. Up to six workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints with exact packed short keys and full-byte long-token verification. Document-local batches prefetch dictionary probes, whose slots pack term IDs, Boolean columns and phrase heads. Boolean terms populate 2,048-document bitmaps using lazy singleton rows and packed summaries; compact plans apply every operator strictly left to right. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency against the same exact lookup probes. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
 
 ## Validation
 
@@ -14,6 +14,6 @@ Queries select a collision-safe ASCII token dictionary. Up to four workers scan 
 
 None beyond the C++ standard library and system C runtime. Build image is the pinned, organizer-allowlisted `gcc:15`; runtime image is the pinned `debian:13-slim`.
 
-## With another 24 hours
+## Next optimization targets
 
-Profile the streaming scan, compare block sizes by the full coefficient, and test faster dictionary probes and phrase-anchor layouts. The official integrator owns promotion and board measurements.
+Compare worker counts and block sizes by the full T/M/S/D coefficient, then profile dictionary probes and phrase-anchor layouts. The official integrator owns promotion and board measurements.
