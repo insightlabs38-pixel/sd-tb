@@ -148,3 +148,16 @@ On the same two-CPU cloud host after environment recovery, three rotated full se
 The final local source passes full seeds 1/2, seven differential seeds, ASan/UBSan and TSan, including >8 MiB parallel fixtures, all token lengths/alignment offsets, 338,000-term dictionary growth, same-endpoint long tokens and deliberately colliding long/short CRC32C keys. Independent three-full-seed pinned GCC 15 qualification compares this source against the official source, development baseline, and the preceding verified frontier source.
 
 The word-occupancy hybrid was refined across scalar cutoffs 2/4/8 and a SIMD prepass that removed hot-loop occupancy writes; its roughly 1.07–1.11 s timings did not justify extra source versus the simpler design near 1.08 s. Dynamic 8/16 MiB range scheduling remained approximately flat against static ranges because extra partial blocks offset load balancing. Short packed keys and document-local prefetches were additive (about 1.31 to 1.17 s); sparse rows allowed larger blocks without the full dense-row allocation. Prefix-only fingerprints were not promoted; long shared-prefix inputs motivate the all-byte fingerprint and collision gates.
+
+
+## Prefetched sparse-row qualification (three full seeds)
+
+[Production qualification 41149282228](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41149282228) passed pinned offline GCC 15 builds, ASan/UBSan, TSan, expanded differential/adversarial gates, published sample/full hashes and independent full seed-2/3 references. The same restricted timer/cgroup method compares four immutable sources in three rotated pairs per seed. Source commit: `a402285`.
+
+| Full seed | Official T / M | Prior frontier T / M | New frontier T / M | New S/D | New K_local | K ratio vs prior / official |
+|---|---|---|---|---|---|---|
+| 1 | 1.539492 s / 525,185,024 B | 0.850198 s / 55,320,576 B | 0.678716 s / 56,356,864 B | 672 / 1 | 14.049360 | 1.098189 / 2.378497 |
+| 2 | 1.568309 s / 525,172,736 B | 0.809549 s / 55,054,336 B | 0.648939 s / 59,478,016 B | 672 / 1 | 14.214015 | 1.083125 / 2.428779 |
+| 3 | 1.516786 s / 526,163,968 B | 0.824705 s / 55,058,432 B | 0.651839 s / 59,068,416 B | 672 / 1 | 14.201972 | 1.092310 / 2.387426 |
+
+T is the three-run median; M is the largest cgroup peak. Runtime improved about 20%, but the four-worker cgroup peaks increased, so the full-K gain over the prior frontier is 8.3–9.8%, below the local two-CPU estimate. These are runner results, not official board scores. Next memory work targets transient bitmap-row reallocation copies and query/result representation, while preserving this verified rollback point.

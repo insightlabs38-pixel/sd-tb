@@ -8,7 +8,7 @@ Queries select a collision-safe ASCII token dictionary. Up to four workers scan 
 
 ## Validation
 
-The preceding architecture is qualified in [run 41147462315](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41147462315). This version adds sparse bitmap rows and a prefetched dictionary; its independent pinned qualification is pending. Local full seeds 1/2, expanded differential/adversarial suites and ASan/UBSan pass. The expanded oracle covers dictionary growth beyond 338,000 terms and both short- and long-token CRC32C collisions. Runner measurements are not official board scores.
+[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41149282228) passes three full seeds, published sample/full hashes, an independent tiny reference, ASan/UBSan, TSan, expanded differential/adversarial oracles and restricted offline Docker. The oracle covers 338,000-term dictionary growth, all token lengths/alignment offsets and deliberate short/long CRC32C collisions. See PERF.md for full T/M/S/D/K comparisons. Runner measurements are not official board scores.
 
 ## Dependencies
 
