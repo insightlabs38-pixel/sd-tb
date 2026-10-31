@@ -1,1 +1,1 @@
-sweep 6 micro
+sweep 7 laps
