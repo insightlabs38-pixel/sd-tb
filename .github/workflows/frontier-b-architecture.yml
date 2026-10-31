@@ -1,13 +1,13 @@
-name: Frontier B architecture qualification
+name: Track B hybrid 64-byte scanner qualification
 on:
   push:
-    branches: [frontier/b-sol-architecture, frontier/b-sol-streaming-v2, frontier/b-sol-streaming-v3]
-    paths: [track-b/main.cpp, tests/frontier_adversarial.py, experiments/frontier/**, .github/workflows/frontier-b-architecture.yml]
+    branches: [track-b/scanner64-hybrid-11]
+    paths: [track-b/main.cpp]
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: frontier-b-architecture
+  group: track-b-scanner64-hybrid
   cancel-in-progress: false
 jobs:
   qualify:
@@ -28,7 +28,7 @@ jobs:
           cp track-b/Dockerfile /tmp/official/
           cp track-b/Dockerfile /tmp/development/
           cp track-b/Dockerfile /tmp/previous/
-          git show 8902fb9:track-b/main.cpp > /tmp/official/main.cpp
+          git show 5bc63780944240c8a9fb302b0cc5f2d91f98be16:track-b/main.cpp > /tmp/official/main.cpp
           git show 763a5f5:track-b/main.cpp > /tmp/development/main.cpp
           git show 4069aa9:track-b/main.cpp > /tmp/previous/main.cpp
           docker build --network=none -t frontier:official /tmp/official
