@@ -198,3 +198,10 @@ Promoted exact challenger in [commit 227b4b9e](https://github.com/insightlabs38-
 ## Frontier streaming architecture promoted (October 31)
 
 [Three-full-seed qualification 41157659217](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41157659217) passed the published seed-1 full SHA-256, independent seed-2/3 full Python references, randomized and adversarial differential tests, CRC32C collision cases, sample/tiny hashes and pinned offline Docker. Three interleaved Docker measurements per seed gave median candidate wall times **0.579 / 0.573 / 0.575 s** (seeds 1/2/3) versus prior streaming challenger **0.677 / 0.671 / 0.668 s**; candidate peak memory was approximately **43 MiB**. Canonical source S=742, D=1; median-based local K estimates **15.75 / 15.82 / 15.80** are runner-local, not official board results. Promoted the exact tested source blob `4b386e5587b690f2b12a9f2cd6d9d59cb178594d` in commit `f55c2715406a4dbfb2960b3feac15db0968bf4c4`. The prior segmented-tape champion remains in Git history for rollback.
+
+
+## Qualified compact 6-worker hybrid
+
+Source `5bc63780944240c8a9fb302b0cc5f2d91f98be16` combines exact 9–12-letter keys, packed count/sum headers and lazy Boolean evaluation. Full inputs use 6 literal workers with 2,048-document blocks; there is no worker environment override. [Pinned qualification 41165413401](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41165413401) passes production-Docker oracles, ASan/UBSan, TSan, all three full references, published sample/full hashes and tiny seed 7.
+
+Full seeds 1/2/3: organizer five-run trimmed T=0.334020/0.331050/0.335371 s; peak M=37122048/37105664/37085184 B; S=857; D=1; K_local=20.289576/20.380386/20.248668. These are paired four-logical-CPU runner measurements, not official scores or a rejection of higher-core scaling. [Complete evidence and controlled handoff](https://github.com/insightlabs38-pixel/sd-tb/blob/frontier/b-sol-hybrid-qualification/experiments/frontier/HYBRIDS.md). Rollbacks: `a5e106a`, official `8d5bc54` / PR #3 `338c7cf`, and PR #2 `4069aa9`.
