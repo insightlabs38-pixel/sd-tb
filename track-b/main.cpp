@@ -124,18 +124,20 @@ struct FoldEqual {
 
 class FlatDictionary {
 public:
-    // Short ASCII keys, exact letter encodings and CRC fingerprints use disjoint tags.
-    struct Slot {
-        uint64_t key = 0;
-        uint64_t metadata = 0;
-        uint32_t id() const { return static_cast<uint32_t>(metadata) & 0xfffffu; }
-        uint32_t column() const { return static_cast<uint32_t>(metadata >> 20) & 0xfffffu; }
-        int32_t head() const { return static_cast<int32_t>(metadata >> 40) - 1; }
-    };
+    struct Probe { string_view word; uint32_t hash; uint64_t key; };
 private:
-    vector<Slot> slots;
+    struct alignas(64) Bucket {
+        array<uint64_t, 4> keys{};
+        array<uint64_t, 4> metadata{};
+    };
+    struct Location { size_t bucket; unsigned lane; bool found; };
+    vector<Bucket> buckets;
     vector<string_view> keys;
-
+    static uint32_t term_id(uint64_t metadata) { return (static_cast<uint32_t>(metadata) & 0xfffffu) - 1; }
+    static unsigned mask(__m256i stored, uint64_t key) {
+        __m256i compared = _mm256_cmpeq_epi64(stored, _mm256_set1_epi64x(static_cast<int64_t>(key)));
+        return static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(compared)));
+    }
     static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
         if (word.size() <= 8) {
             uint64_t key = 0;
@@ -185,72 +187,82 @@ private:
         hash = hash ? hash : 1;
         return {hash, (uint64_t(1) << 63) | hash};
     }
-    void rehash(size_t capacity) {
-        vector<Slot> fresh(capacity);
-        for (const Slot &slot : slots) {
-            if (!slot.key) continue;
-            uint32_t hash = (slot.key >> 62) == 2 ? static_cast<uint32_t>(slot.key)
-                : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
-            if (!hash) hash = 1;
-            size_t i = hash & (capacity - 1);
-            while (fresh[i].key) i = (i + 1) & (capacity - 1);
-            fresh[i] = slot;
+    static uint32_t key_hash(uint64_t key) {
+        uint32_t hash = (key >> 62) == 2 ? static_cast<uint32_t>(key)
+            : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+        return hash ? hash : 1;
+    }
+    Location locate(const Probe &probe) const {
+        size_t index = probe.hash & (buckets.size() - 1);
+        for (;;) {
+            const Bucket &bucket = buckets[index];
+            __m256i stored = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(bucket.keys.data()));
+            unsigned matched = mask(stored, probe.key);
+            while (matched) {
+                unsigned lane = countr_zero(matched);
+                if ((probe.key >> 62) != 2 || FoldEqual{}(keys[term_id(bucket.metadata[lane])], probe.word))
+                    return {index, lane, true};
+                matched &= matched - 1;
+            }
+            unsigned empty = mask(stored, 0);
+            if (empty) return {index, static_cast<unsigned>(countr_zero(empty)), false};
+            index = (index + 1) & (buckets.size() - 1);
         }
-        slots.swap(fresh);
+    }
+    void rehash(size_t capacity) {
+        vector<Bucket> fresh(capacity);
+        for (const Bucket &old : buckets) for (unsigned lane = 0; lane < 4; ++lane) {
+            if (!old.keys[lane]) continue;
+            size_t index = key_hash(old.keys[lane]) & (capacity - 1);
+            for (;;) {
+                Bucket &bucket = fresh[index];
+                unsigned empty = mask(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(bucket.keys.data())), 0);
+                if (empty) {
+                    unsigned target = countr_zero(empty);
+                    bucket.keys[target] = old.keys[lane];
+                    bucket.metadata[target] = old.metadata[lane];
+                    break;
+                }
+                index = (index + 1) & (capacity - 1);
+            }
+        }
+        buckets.swap(fresh);
     }
 public:
     void reserve(size_t count) {
         keys.reserve(count);
-        size_t capacity = 16;
-        while (capacity < count * 2) capacity *= 2;
+        size_t capacity = 4;
+        while (capacity * 4 < count * 2) capacity *= 2;
         rehash(capacity);
     }
     pair<uint32_t, bool> intern(string_view word) {
-        if (slots.empty()) rehash(16);
-        if ((keys.size() + 1) * 10 >= slots.size() * 7)
-            rehash(slots.size() * 2);
-        const auto [hash, key] = fingerprint(word);
-        size_t i = hash & (slots.size() - 1);
-        for (;;) {
-            Slot &slot = slots[i];
-            if (!slot.key) {
-                uint32_t id = static_cast<uint32_t>(keys.size());
-                keys.push_back(word);
-                slot = {key, id};
-                return {id, true};
-            }
-            if (slot.key == key && ((key >> 62) != 2 || FoldEqual{}(keys[slot.id()], word)))
-                return {slot.id(), false};
-            i = (i + 1) & (slots.size() - 1);
-        }
+        if (buckets.empty()) rehash(4);
+        if ((keys.size() + 1) * 10 >= buckets.size() * 4 * 7) rehash(buckets.size() * 2);
+        Probe probe = prepare(word);
+        Location location = locate(probe);
+        uint64_t &metadata = buckets[location.bucket].metadata[location.lane];
+        if (location.found) return {term_id(metadata), false};
+        uint32_t id = static_cast<uint32_t>(keys.size());
+        if (id >= 0xfffffu) throw runtime_error("query metadata capacity");
+        keys.push_back(word);
+        buckets[location.bucket].keys[location.lane] = probe.key;
+        metadata = id + 1;
+        return {id, true};
     }
-    struct Probe {
-        string_view word;
-        uint32_t hash;
-        uint64_t key;
-    };
     Probe prepare(string_view word, const char *read_end = nullptr) const {
         const auto [hash, key] = fingerprint(word, read_end);
-        __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
+        __builtin_prefetch(&buckets[hash & (buckets.size() - 1)], 0, 3);
         return {word, hash, key};
     }
-    const Slot *resolve(const Probe &probe) const {
-        if (slots.empty()) return nullptr;
-        const auto &[word, hash, key] = probe;
-        size_t i = hash & (slots.size() - 1);
-        for (;;) {
-            const Slot &slot = slots[i];
-            if (!slot.key) return nullptr;
-            if (slot.key == key && ((key >> 62) != 2 || FoldEqual{}(keys[slot.id()], word)))
-                return &slot;
-            i = (i + 1) & (slots.size() - 1);
-        }
+    uint64_t resolve(const Probe &probe) const {
+        if (buckets.empty()) return 0;
+        Location location = locate(probe);
+        return location.found ? buckets[location.bucket].metadata[location.lane] : 0;
     }
     uint32_t lookup(string_view word, const char *read_end = nullptr) const {
-        const Slot *slot = resolve(prepare(word, read_end));
-        return slot ? slot->id() : numeric_limits<uint32_t>::max();
+        uint64_t metadata = resolve(prepare(word, read_end));
+        return metadata ? term_id(metadata) : numeric_limits<uint32_t>::max();
     }
-
     uint64_t phrase_key(uint32_t term) const {
         uint64_t key = fingerprint(keys[term]).second;
         return key | ((key >> 62) == 2 ? uint64_t(term) << 32 : 0);
@@ -261,17 +273,14 @@ public:
             FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
     }
     void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
-        // The frozen query limit keeps IDs/columns within 20 bits and heads within 24.
-        if (keys.size() > (1u << 20)) throw runtime_error("query metadata capacity");
-        for (Slot &slot : slots) if (slot.key) {
-            uint32_t id = slot.id();
+        for (Bucket &bucket : buckets) for (unsigned lane = 0; lane < 4; ++lane) if (bucket.keys[lane]) {
+            uint32_t id = term_id(bucket.metadata[lane]);
             uint32_t column = columns[id] + 1;
             uint32_t head = static_cast<uint32_t>(heads[id] + 1);
             if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
-            slot.metadata = id | (uint64_t(column) << 20) | (uint64_t(head) << 40);
+            bucket.metadata[lane] = (id + 1) | (uint64_t(column) << 20) | (uint64_t(head) << 40);
         }
     }
-
 };
 
 struct Query {
@@ -607,11 +616,11 @@ class Engine {
                     if (anchors.size() < probes.size()) anchors.resize(probes.size());
                     for (size_t index = 0; index < probes.size(); ++index) {
                         const auto &probe = probes[index];
-                        const auto *entry = dictionary.resolve(probe);
-                        if (entry) {
-                            int32_t head = entry->head();
+                        uint64_t metadata = dictionary.resolve(probe);
+                        if (metadata) {
+                            int32_t head = static_cast<int32_t>(metadata >> 40) - 1;
                             if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
-                            uint32_t column = entry->column();
+                            uint32_t column = static_cast<uint32_t>(metadata >> 20) & 0xfffffu;
                             if (column) {
                                 --column;
                                 uint32_t &row = active[column];
