@@ -2,7 +2,7 @@ name: Frontier B worker scaling qualification
 on:
   push:
     branches: [frontier/b-sol-worker-qualification]
-    paths: [experiments/frontier/**, tests/frontier_adversarial.py, .github/workflows/frontier-b-workers.yml]
+    paths: [experiments/frontier/qualify-workers.py, experiments/frontier/worker-sources.json, experiments/frontier/docker-exact.py, experiments/frontier/compare.py, tests/frontier_adversarial.py, .github/workflows/frontier-b-workers.yml]
   workflow_dispatch:
 permissions:
   contents: read
