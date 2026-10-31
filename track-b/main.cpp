@@ -343,12 +343,20 @@ public:
         }
         unsigned count = popcount(bits);
         uint64_t delta = (uint64_t(base) + (uint64_t(1) << 35)) * count;
-        delta += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
-        delta += 2u * popcount(bits & 0xccccccccccccccccULL);
-        delta += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
-        delta += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
-        delta += 16u * popcount(bits & 0xffff0000ffff0000ULL);
-        delta += 32u * popcount(bits & 0xffffffff00000000ULL);
+        if (count <= 3) {
+            uint64_t remaining = bits;
+            while (remaining) {
+                delta += countr_zero(remaining);
+                remaining &= remaining - 1;
+            }
+        } else {
+            delta += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
+            delta += 2u * popcount(bits & 0xccccccccccccccccULL);
+            delta += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
+            delta += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
+            delta += 16u * popcount(bits & 0xffff0000ffff0000ULL);
+            delta += 32u * popcount(bits & 0xffffffff00000000ULL);
+        }
         row.total += delta;
     }
     void merge(const Results &source) {
