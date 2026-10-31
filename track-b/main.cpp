@@ -701,7 +701,7 @@ public:
         parse_queries(query_file);
         MappedFile docs_file(data_dir + "/docs.txt");
         compile_queries(docs_file);
-        const size_t workers = docs_file.size >= (8u << 20) ? 6 : 1;
+        const size_t workers = docs_file.size >= (8u << 20) ? 8 : 1;
         scan_corpus<2048>(docs_file, workers);
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
