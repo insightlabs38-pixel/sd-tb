@@ -2,6 +2,7 @@
 #include <bit>
 #include <immintrin.h>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -410,17 +411,26 @@ public:
     // Merges worker summaries (given in document order) and formats the lines for queries [first, last).
     static void write_range(const vector<const Results *> &parts, size_t first, size_t last, string &out) {
         array<char, 256> line;
+        vector<size_t> next;
         for (size_t query = first; query < last; ++query) {
             Summary merged;
             array<uint32_t, kept_ids> ids;
-            size_t kept = 0;
-            for (const Results *part : parts) {
-                const Summary &row = part->rows[query];
-                if (!row.count()) continue;
-                size_t add = min<size_t>(row.count(), kept_ids - kept);
-                copy_n(part->first_ids[row.first_offset].begin(), add, ids.begin() + kept);
-                kept += add;
-                merged.total += row.total;
+            for (const Results *part : parts) merged.total += part->rows[query].total;
+            // Each worker holds its smallest IDs in order, so a k-way merge yields the global smallest.
+            const size_t kept = min<size_t>(merged.count(), kept_ids);
+            next.assign(parts.size(), 0);
+            for (size_t i = 0; i < kept; ++i) {
+                size_t best = parts.size();
+                uint32_t smallest = numeric_limits<uint32_t>::max();
+                for (size_t k = 0; k < parts.size(); ++k) {
+                    const Summary &row = parts[k]->rows[query];
+                    if (next[k] < min<size_t>(row.count(), kept_ids) && parts[k]->first_ids[row.first_offset][next[k]] < smallest) {
+                        smallest = parts[k]->first_ids[row.first_offset][next[k]];
+                        best = k;
+                    }
+                }
+                ids[i] = smallest;
+                ++next[best];
             }
             char *p = line.data();
             p = to_chars(p, p + 24, merged.count()).ptr;
@@ -670,20 +680,43 @@ class Engine {
     void scan_corpus(const MappedFile &input, size_t workers) {
         static constexpr size_t words = block_docs / 64;
         static_assert(block_docs <= (1u << position_bits));
+        const char *begin = input.data, *end = begin + input.size;
+        auto line_start = [&](const char *pos) {
+            const char *newline = static_cast<const char *>(memrchr(begin, '\n', pos - begin));
+            return newline ? newline + 1 : begin;
+        };
+        auto line_id = [&](const char *line) {
+            const char *tab = static_cast<const char *>(memchr(line, '\t', end - line));
+            uint32_t id = 0;
+            if (!tab) throw runtime_error("missing document tab");
+            auto [ptr, ec] = from_chars(line, tab, id);
+            if (ec != errc() || ptr != tab) throw runtime_error("invalid document id");
+            return id;
+        };
+        // Document IDs are dense, so the last line gives the count and interpolation finds block starts.
+        const uint64_t total_docs = input.size ? uint64_t(line_id(line_start(end[-1] == '\n' ? end - 1 : end))) + 1 : 0;
+        auto seek = [&](uint32_t target) {
+            const char *low = begin, *high = end;
+            uint64_t low_id = 0, high_id = total_docs;
+            while (low_id != target && high - low > 8192) {
+                const char *middle = line_start(low + static_cast<uint64_t>(high - low) * (target - low_id) / (high_id - low_id));
+                if (middle <= low) middle = static_cast<const char *>(memchr(low, '\n', end - low)) + 1;
+                if (middle >= high) break;
+                const uint32_t id = line_id(middle);
+                if (id <= target) { low = middle; low_id = id; } else { high = middle; high_id = id; }
+            }
+            while (low_id != target) {
+                low = static_cast<const char *>(memchr(low, '\n', end - low)) + 1;
+                low_id = line_id(low);
+            }
+            return low;
+        };
         struct Chunk {
             Results results;
-            uint32_t first_doc = 0, last_doc = 0;
             size_t docs = 0;
         };
-        const char *begin = input.data, *end = begin + input.size;
-        vector<const char *> bounds(workers + 1);
-        bounds[0] = begin;
-        bounds[workers] = end;
-        for (size_t i = 1; i < workers; ++i) {
-            const char *split = begin + (input.size / workers) * i;
-            const char *newline = static_cast<const char *>(memchr(split, '\n', end - split));
-            bounds[i] = newline ? newline + 1 : end;
-        }
+        const size_t blocks = (total_docs + block_docs - 1) / block_docs;
+        atomic<size_t> next_block{0};
         vector<Chunk> chunks(workers);
         vector<exception_ptr> errors(workers);
         auto parse_chunk = [&](size_t idx) {
@@ -710,18 +743,21 @@ class Engine {
                 vector<pair<uint32_t, int32_t>> anchors;
                 anchors.reserve(128);
                 LineTokens line;
-                const char *p = bounds[idx], *stop = bounds[idx + 1];
-                while (p < stop) {
-                    const char *line_end = static_cast<const char *>(memchr(p, '\n', stop - p));
-                    if (!line_end) line_end = stop;
+                size_t previous = numeric_limits<size_t>::max();
+                const char *p = begin;
+                for (size_t block; (block = next_block.fetch_add(1)) < blocks;) {
+                  const uint32_t first = static_cast<uint32_t>(block * block_docs);
+                  const size_t count = min<size_t>(block_docs, total_docs - first);
+                  if (block != previous + 1) p = seek(first);
+                  for (size_t k = 0; k < count; ++k) {
+                    const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
+                    if (!line_end) line_end = end;
                     const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
                     if (!tab) throw runtime_error("missing document tab");
                     uint32_t doc = 0;
                     auto [ptr, ec] = from_chars(p, tab, doc);
                     if (ec != errc() || ptr != tab) throw runtime_error("invalid document id");
-                    if (!c.docs) c.first_doc = doc;
-                    else if (doc != c.last_doc + 1) throw runtime_error("nonconsecutive document id");
-                    c.last_doc = doc;
+                    if (doc != first + k) throw runtime_error("nonconsecutive document id");
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     size_t anchor_count = 0;
@@ -773,10 +809,12 @@ class Engine {
                         } else matrix[row * words + document_word] |= document_bit;
                     }
                     match_document(doc, {probes, token_count}, {anchors.data(), anchor_count}, c.results, last);
-                    p = line_end < stop ? line_end + 1 : stop;
-                    if (++in_block == block_docs) flush();
+                    p = line_end < end ? line_end + 1 : end;
+                    ++in_block;
+                  }
+                  flush();
+                  previous = block;
                 }
-                if (in_block) flush();
             } catch (...) { errors[idx] = current_exception(); }
         };
         vector<thread> threads;
@@ -784,12 +822,12 @@ class Engine {
         parse_chunk(0);
         for (thread &t : threads) t.join();
         for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-        uint32_t expected_doc = 0;
+        size_t docs = 0;
         for (Chunk &c : chunks) {
-            if (c.docs && c.first_doc != expected_doc) throw runtime_error("nonconsecutive document chunks");
-            expected_doc += static_cast<uint32_t>(c.docs);
+            docs += c.docs;
             partial.push_back(move(c.results));
         }
+        if (docs != total_docs) throw runtime_error("nonconsecutive document ids");
     }
 
     // Each thread merges and formats one contiguous range of queries.
