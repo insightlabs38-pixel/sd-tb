@@ -23,6 +23,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -886,7 +887,10 @@ public:
         parse_queries(query_file);
         MappedFile docs_file(data_dir + "/docs.txt");
         compile_queries(docs_file);
-        const size_t workers = docs_file.size >= (8u << 20) ? 12 : 1;
+        // Twelve workers fit the scoring host; fewer allowed CPUs get one worker each.
+        cpu_set_t allowed;
+        const size_t cpus = sched_getaffinity(0, sizeof allowed, &allowed) == 0 ? max(1, CPU_COUNT(&allowed)) : 12;
+        const size_t workers = docs_file.size >= (8u << 20) ? min<size_t>(12, cpus) : 1;
         scan_corpus<2048>(docs_file, workers);
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
