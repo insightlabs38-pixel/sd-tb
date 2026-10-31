@@ -1,7 +1,7 @@
 name: Track B fine block-size qualification
 on:
   push:
-    branches: [track-b/block-size-11]
+    branches: [track-b/block-size-fine-11]
     paths: [.github/workflows/track-b-block-size-fine.yml]
   workflow_dispatch:
 permissions:
@@ -117,5 +117,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: track-b-block-size-evidence
+          name: track-b-block-size-fine-evidence
           path: /tmp/evidence/
