@@ -49,21 +49,28 @@ struct MappedFile {
 
 class TokenScanner {
     const char *cursor, *end, *base;
-    uint32_t valid = 0;
+    uint64_t valid = 0;
+    static uint32_t classify(const char *load) {
+        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(load));
+        __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
+        __m256i letters = _mm256_and_si256(
+            _mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
+        __m256i digits = _mm256_and_si256(
+            _mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
+        return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
+    }
     void refill() {
         base = cursor;
-        size_t count = min<size_t>(end - cursor, 32);
-        alignas(32) char tail[32]{};
+        size_t count = min<size_t>(end - cursor, 64);
+        alignas(32) char tail[64]{};
         const char *load = cursor;
-        if (count < 32) {
+        if (count < 64) {
             memcpy(tail, cursor, count);
             load = tail;
         }
-        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(load));
-        __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
-        __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
-        __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
-        valid = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
+        valid = uint64_t(classify(load)) | (uint64_t(classify(load + 32)) << 32);
         cursor += count;
     }
 public:
@@ -76,17 +83,17 @@ public:
         unsigned first = countr_zero(valid);
         const char *start = base + first;
         unsigned count = countr_one(valid >> first);
-        if (first + count < 32) {
-            valid &= ~((uint32_t(1) << (first + count)) - 1);
+        if (first + count < 64) {
+            valid &= ~((uint64_t(1) << (first + count)) - 1);
             word = string_view(start, count);
             return true;
         }
         do {
             refill();
             count = countr_one(valid);
-        } while (count == 32);
+        } while (count == 64);
         const char *stop = base + count;
-        valid &= ~((uint32_t(1) << count) - 1);
+        valid &= ~((uint64_t(1) << count) - 1);
         word = string_view(start, stop - start);
         return true;
     }
@@ -423,6 +430,7 @@ class Engine {
         array<char, 5> ops{};
         uint8_t count = 0;
         uint32_t output = 0;
+        uint32_t required = numeric_limits<uint32_t>::max();
     };
     vector<BooleanQuery> boolean_queries;
     Results answers;
@@ -453,6 +461,16 @@ class Engine {
                 plan.count = static_cast<uint8_t>(q.term_count);
                 for (size_t i = 0; i < q.term_count; ++i) plan.terms[i] = boolean_column[q.terms[i]];
                 plan.ops = q.ops;
+                uint32_t mandatory = q.terms[0];
+                for (size_t i = 0; i + 1 < q.term_count; ++i) {
+                    if (q.ops[i] == 'O') mandatory = numeric_limits<uint32_t>::max();
+                    else if (q.ops[i] == 'A' &&
+                             (mandatory == numeric_limits<uint32_t>::max() ||
+                              frequency[q.terms[i + 1]] < frequency[mandatory]))
+                        mandatory = q.terms[i + 1];
+                }
+                if (mandatory != numeric_limits<uint32_t>::max())
+                    plan.required = boolean_column[mandatory];
                 boolean_queries.push_back(plan);
                 continue;
             }
@@ -502,6 +520,7 @@ class Engine {
         static constexpr size_t words = block_docs / 64;
         static constexpr uint64_t local_value = uint64_t(1) << 60;
         for (const BooleanQuery &q : boolean_queries) {
+            if (q.required != numeric_limits<uint32_t>::max() && !active[q.required]) continue;
             uint64_t state = active[q.terms[0]];
             array<uint64_t, words> value;
             auto present = [&](uint64_t source, uint32_t position) -> bool {
