@@ -2,6 +2,7 @@
 #include <bit>
 #include <immintrin.h>
 #include <array>
+#include <numeric>
 #include <atomic>
 #include <charconv>
 #include <cstdint>
@@ -543,6 +544,19 @@ class Engine {
             plan.next = anchor_head[term];
             anchor_head[term] = static_cast<int32_t>(phrases.size());
             phrases.push_back(plan);
+        }
+        {   // Grouping queries by operator shape makes the evaluator's branches repeat.
+            auto shape = [](const BooleanQuery &q) {
+                unsigned key = q.count;
+                for (size_t i = 0; i + 1 < q.count; ++i) key = key * 3 + (q.ops[i] == 'A' ? 0 : q.ops[i] == 'O' ? 1 : 2);
+                return key;
+            };
+            vector<uint32_t> start(1800);
+            for (const BooleanQuery &q : boolean_queries) ++start[shape(q) + 1];
+            partial_sum(start.begin(), start.end(), start.begin());
+            vector<BooleanQuery> grouped(boolean_queries.size());
+            for (const BooleanQuery &q : boolean_queries) grouped[start[shape(q)]++] = q;
+            boolean_queries.swap(grouped);
         }
         dictionary.configure_metadata(boolean_column, anchor_head);
         vector<Query>().swap(queries);
