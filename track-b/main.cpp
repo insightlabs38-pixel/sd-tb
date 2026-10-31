@@ -308,9 +308,24 @@ class Results {
         uint64_t sum() const { return total & ((uint64_t(1) << 35) - 1); }
     };
     vector<Summary> rows;
-    vector<array<uint32_t, kept_ids>> first_ids;
+    // Ten 18-bit document IDs (N < 2^18) pack into 24 bytes.
+    struct IdList {
+        array<uint64_t, 3> bits{};
+        void set(size_t i, uint32_t id) {
+            const size_t at = i * 18, word = at / 64, shift = at % 64;
+            bits[word] |= uint64_t(id) << shift;
+            if (shift > 46) bits[word + 1] |= uint64_t(id) >> (64 - shift);
+        }
+        uint32_t get(size_t i) const {
+            const size_t at = i * 18, word = at / 64, shift = at % 64;
+            uint64_t value = bits[word] >> shift;
+            if (shift > 46) value |= bits[word + 1] << (64 - shift);
+            return static_cast<uint32_t>(value & 0x3ffff);
+        }
+    };
+    vector<IdList> first_ids;
 
-    array<uint32_t, kept_ids> &first_for(Summary &row) {
+    IdList &first_for(Summary &row) {
         if (!row.count()) {
             row.first_offset = static_cast<uint32_t>(first_ids.size());
             first_ids.emplace_back();
@@ -326,7 +341,7 @@ public:
     }
     void add(size_t query, uint32_t id) {
         Summary &row = rows[query];
-        if (row.count() < kept_ids) first_for(row)[row.count()] = id;
+        if (row.count() < kept_ids) first_for(row).set(row.count(), id);
         row.total += (uint64_t(1) << 35) + id;
     }
     // Exact count and position sum of a dense bitmap: bytes weigh their index, bits their offset.
@@ -372,7 +387,7 @@ public:
             auto &first = first_for(row);
             for (size_t w = 0; w < words && kept < kept_ids; ++w)
                 for (uint64_t bits = data[w]; bits && kept < kept_ids; bits &= bits - 1)
-                    first[kept++] = base + static_cast<uint32_t>(w * 64) + countr_zero(bits);
+                    first.set(kept++, base + static_cast<uint32_t>(w * 64) + countr_zero(bits));
         }
         row.total += (uint64_t(base) + (uint64_t(1) << 35)) * count + sum;
     }
@@ -392,8 +407,8 @@ public:
                 uint32_t smallest = numeric_limits<uint32_t>::max();
                 for (size_t k = 0; k < parts.size(); ++k) {
                     const Summary &row = parts[k]->rows[query];
-                    if (next[k] < min<size_t>(row.count(), kept_ids) && parts[k]->first_ids[row.first_offset][next[k]] < smallest) {
-                        smallest = parts[k]->first_ids[row.first_offset][next[k]];
+                    if (next[k] < min<size_t>(row.count(), kept_ids) && parts[k]->first_ids[row.first_offset].get(next[k]) < smallest) {
+                        smallest = parts[k]->first_ids[row.first_offset].get(next[k]);
                         best = k;
                     }
                 }
@@ -494,7 +509,7 @@ class Engine {
             vector<uint32_t> hot;
             vector<uint8_t> seen(term_count);
             for (const Query &q : queries) if (!q.phrase) for (uint32_t term : q.words())
-                if (!seen[term]++ && frequency[term] >= hot_min) hot.push_back(term);
+                if (!exchange(seen[term], 1) && frequency[term] >= hot_min) hot.push_back(term);
             if (hot.size() > hot_cap) {
                 nth_element(hot.begin(), hot.begin() + hot_cap, hot.end(), [&](uint32_t a, uint32_t b) { return frequency[a] > frequency[b]; });
                 hot.resize(hot_cap);
@@ -663,18 +678,25 @@ class Engine {
         };
         // Document IDs are dense, so the last line gives the count and interpolation finds block starts.
         const uint64_t total_docs = input.size ? uint64_t(line_id(line_start(end[-1] == '\n' ? end - 1 : end))) + 1 : 0;
+        // IDs below 2^18 keep sums within 35 bits and first-ten lists within 18-bit fields.
+        if (total_docs > (1u << 18)) throw runtime_error("document count capacity");
+        auto next_line = [&](const char *line) {
+            const char *newline = static_cast<const char *>(memchr(line, '\n', end - line));
+            if (!newline || newline + 1 == end) throw runtime_error("nonconsecutive document id");
+            return newline + 1;
+        };
         auto seek = [&](uint32_t target) {
             const char *low = begin, *high = end;
             uint64_t low_id = 0, high_id = total_docs;
             while (low_id != target && high - low > 8192) {
                 const char *middle = line_start(low + static_cast<uint64_t>(high - low) * (target - low_id) / (high_id - low_id));
-                if (middle <= low) middle = static_cast<const char *>(memchr(low, '\n', end - low)) + 1;
+                if (middle <= low) middle = next_line(low);
                 if (middle >= high) break;
                 const uint32_t id = line_id(middle);
                 if (id <= target) { low = middle; low_id = id; } else { high = middle; high_id = id; }
             }
             while (low_id != target) {
-                low = static_cast<const char *>(memchr(low, '\n', end - low)) + 1;
+                low = next_line(low);
                 low_id = line_id(low);
             }
             return low;
@@ -749,6 +771,7 @@ class Engine {
                         const uint32_t column = static_cast<uint32_t>(entry >> 20) & 0xfffffu;
                         const bool hot = column - 1 < hot_columns;
                         hot_rows[(hot ? column : hot_columns + 1) * words + document_word] |= document_bit;
+                        __builtin_prefetch(&active[column > hot_columns ? column - 1 : 0]);
                         cold[cold_count] = column;
                         cold_count += column > hot_columns;
                     }

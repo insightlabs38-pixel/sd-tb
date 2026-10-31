@@ -40,6 +40,8 @@ jobs:
           set -euo pipefail
           python3 tests/differential.py /tmp/bin/candidate
           python3 tests/frontier_adversarial.py /tmp/bin/candidate
+          python3 tests/claude_fuzz.py /tmp/bin/candidate
+          python3 tests/claude_fuzz.py /tmp/bin/asan
           python3 tests/differential.py /tmp/bin/asan
           python3 tests/frontier_adversarial.py /tmp/bin/asan
           TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/tsan
