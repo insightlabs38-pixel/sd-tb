@@ -667,7 +667,7 @@ class Engine {
                                 uint32_t &row = active[column];
                                 if (!row) {
                                     row = singleton | static_cast<uint32_t>(in_block);
-                                } else if (row & singleton) {
+                                } else if ((row & doubleton) == singleton) {
                                     uint32_t previous = row & ~singleton;
                                     if (previous != in_block)
                                         row = doubleton | (previous << 10) | static_cast<uint32_t>(in_block);
