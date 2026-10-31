@@ -407,6 +407,8 @@ class Engine {
         uint32_t required = numeric_limits<uint32_t>::max();
     };
     vector<BooleanQuery> boolean_queries;
+    vector<int32_t> required_head, required_next;
+    vector<uint32_t> unanchored_boolean;
     Results answers;
 
     void compile_queries(const MappedFile &input) {
@@ -461,6 +463,16 @@ class Engine {
             anchor_head[term] = static_cast<int32_t>(phrases.size());
             phrases.push_back(plan);
         }
+        required_head.assign(boolean_count, -1);
+        required_next.assign(boolean_queries.size(), -1);
+        for (size_t i = 0; i < boolean_queries.size(); ++i) {
+            uint32_t term = boolean_queries[i].required;
+            if (term == numeric_limits<uint32_t>::max()) unanchored_boolean.push_back(static_cast<uint32_t>(i));
+            else {
+                required_next[i] = required_head[term];
+                required_head[term] = static_cast<int32_t>(i);
+            }
+        }
         dictionary.configure_metadata(boolean_column, anchor_head);
         vector<Query>().swap(queries);
 
@@ -490,11 +502,11 @@ class Engine {
 
     template<size_t block_docs>
     void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
-                        size_t in_block, uint32_t block_base, Results &results) const {
+                        const vector<uint32_t> &active_columns, size_t in_block,
+                        uint32_t block_base, Results &results) const {
         static constexpr size_t words = block_docs / 64;
         static constexpr uint32_t local_value = 0x40000000u;
-        for (const BooleanQuery &q : boolean_queries) {
-            if (q.required != numeric_limits<uint32_t>::max() && !active[q.required]) continue;
+        auto evaluate = [&](const BooleanQuery &q) {
             uint32_t state = active[q.terms[0]];
             array<uint64_t, words> value;
             auto materialize = [&] {
@@ -560,7 +572,11 @@ class Engine {
                 for (size_t w = 0; w < (in_block + 63) / 64; ++w)
                     results.add_bits(q.output, data[w], block_base + static_cast<uint32_t>(w * 64));
             }
-        }
+        };
+        for (uint32_t i : unanchored_boolean) evaluate(boolean_queries[i]);
+        for (uint32_t column : active_columns)
+            for (int32_t i = required_head[column]; i >= 0; i = required_next[i])
+                evaluate(boolean_queries[i]);
     }
 
     template<size_t block_docs>
@@ -589,12 +605,15 @@ class Engine {
                 vector<uint64_t> matrix(words);
                 matrix.reserve(words * (boolean_count + 1));
                 vector<uint32_t> active(boolean_count);
+                vector<uint32_t> active_columns;
+                active_columns.reserve(boolean_count);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
-                    evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
+                    evaluate_block<block_docs>(matrix, active, active_columns, in_block, block_base, c.results);
                     matrix.resize(words);
                     fill(active.begin(), active.end(), 0);
+                    active_columns.clear();
                     in_block = 0;
                 };
                 vector<uint32_t> last(phrases.size(), numeric_limits<uint32_t>::max());
@@ -636,6 +655,7 @@ class Engine {
                                 uint32_t &row = active[column];
                                 if (!row) {
                                     row = singleton | static_cast<uint32_t>(in_block);
+                                    active_columns.push_back(column);
                                 } else if (row & singleton) {
                                     uint32_t previous = row & ~singleton;
                                     if (previous != in_block) {
