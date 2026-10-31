@@ -5,7 +5,7 @@ import random
 import sys
 
 spec = importlib.util.spec_from_file_location(
-    "diff", str(Path(__file__).with_name("differential.py"))
+    "diff", Path(__file__).with_name("differential.py")
 )
 d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
@@ -156,3 +156,31 @@ queries = [b"BOOL " + x, b"BOOL " + y, b"BOOL " + x + b" NOT " + y]
 queries += [b'PHRASE "' + x + b" " + y + b'"']
 assert d.run(binary, docs, queries) == d.oracle(docs, queries)
 print("Long-token CRC32C collision with full-byte identity checks: PASS")
+
+docs = [
+    b"." * pad + b"a" + bytes([byte]) + b"b"
+    for byte in range(256)
+    if byte not in (9, 10, 13)
+    for pad in range(32)
+]
+queries = [b"BOOL a", b"BOOL b", b'PHRASE "a b"']
+queries += [
+    b"BOOL a" + bytes([byte]).lower() + b"b"
+    for byte in range(128)
+    if 48 <= byte <= 57 or 65 <= byte <= 90 or 97 <= byte <= 122
+]
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("Exhaustive byte classification at every SIMD alignment: PASS")
+
+docs = [
+    x + b" " + x,
+    y + b" " + y,
+    y + b" " + x,
+    x + b" " + y,
+    x.upper() + b" " + y.upper(),
+]
+queries = [
+    b'PHRASE "' + a + b" " + b + b'"' for a, b in ((x, y), (y, x), (x, x), (y, y))
+]
+assert d.run(binary, docs, queries) == d.oracle(docs, queries)
+print("Colliding long tokens preserve phrase order and repetition: PASS")

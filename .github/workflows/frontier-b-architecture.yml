@@ -1,7 +1,7 @@
 name: Frontier B architecture qualification
 on:
   push:
-    branches: [frontier/b-sol-architecture, frontier/b-sol-streaming-v2]
+    branches: [frontier/b-sol-architecture, frontier/b-sol-streaming-v2, frontier/b-sol-streaming-v3]
     paths: [track-b/main.cpp, tests/frontier_adversarial.py, experiments/frontier/**, .github/workflows/frontier-b-architecture.yml]
   workflow_dispatch:
 permissions:
@@ -30,7 +30,7 @@ jobs:
           cp track-b/Dockerfile /tmp/previous/
           git show 8902fb9:track-b/main.cpp > /tmp/official/main.cpp
           git show 763a5f5:track-b/main.cpp > /tmp/development/main.cpp
-          git show b7d7c90:track-b/main.cpp > /tmp/previous/main.cpp
+          git show 4069aa9:track-b/main.cpp > /tmp/previous/main.cpp
           docker build --network=none -t frontier:official /tmp/official
           docker build --network=none -t frontier:development /tmp/development
           docker build --network=none -t frontier:previous /tmp/previous
