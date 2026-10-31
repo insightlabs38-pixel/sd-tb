@@ -1,44 +1,103 @@
-# Track B frontier: adaptive containers, window tokenizer, bucket dictionary (Claude, Oct 31)
+# Track B frontier: adaptive block containers, window tokenizer, bucket dictionary (Claude, Oct 31)
 
-Base: `d7845bc` (production blob `76946cc`, official run `run-dcebadac870d`, K 23.250490).
-Branch: `branch/festive-hawking-wn31k1`. Rollback: `d7845bc`. Nothing here touches `sd-sm`.
+Base `d7845bc` (production blob `76946cc`, official `run-dcebadac870d`, K 23.250490). Branch
+`branch/festive-hawking-wn31k1`. Rollback: `d7845bc`. `sd-sm` is untouched. All timings below are
+development-host or GitHub-runner measurements, never official scores.
 
-## Verdict on the postings family
+## 1. Verdict on the query-aware postings family
 
-A complete exact pipeline was built and measured (`postings_probe.cpp`: same tokenizer, dictionary and
-phrase matcher; deduplicated event log, CSR postings, 24 MB of dense bitmaps for 754 terms, sparse
-sorted lists elsewhere, exact left-to-right evaluation of all 31,000 Boolean queries). Seed-1 output
-hash matches the published SHA-256. Single thread, full corpus, pinned core:
+I built a **complete exact postings pipeline** (`postings_probe.cpp`, single thread): the candidate's
+tokenizer, dictionary and phrase matcher, then a deduplicated (column, document) event log, a counting-sort
+CSR index, 754 dense bitmaps (24 MB) for terms with df >= N/64 and sorted lists elsewhere, and exact
+left-to-right evaluation of all 31,000 Boolean queries (list/list merge, list/bitmap filter, bitmap ops,
+popcount sums, first ten). Seed-1 output matches the published SHA-256 `f86973c2...`.
 
-| Stage | ms |
+| Stage (full corpus, one pinned core) | ms |
 |---|---|
 | scan + tokenize + resolve + event log + phrase | 941 |
-| counting-sort CSR (21.09 M pairs) | 239 |
+| CSR build (21.09 M deduplicated pairs) | 239 |
 | dense bitmap build | 187 |
-| exact query evaluation (all Boolean) | 176 |
+| exact evaluation of every Boolean query | 176 |
 | **total** | **~1,545** |
 
-For comparison the champion takes ~1,420 ms and the candidate below ~795 ms on the same pinned core.
-Resident cost is ~170 MB event log + 84 MB postings + 24 MB bitmaps. Evaluation is fast (5.7 us/query,
-embarrassingly parallel) but it is not where time goes: a dedupe-and-append log alone costs +120-200 ms
-over resolve-only (branchless; +300 ms with a branch), and the counting sort adds 70-240 ms, against 330 ms
-for the champion's whole branchy bitmap fill. Even zero-cost evaluation could not pay for >=+60 MB:
-memory has exponent 0.2, so +60 MB costs ~11% K while the entire eval stage is ~20-26% of CPU (+10-14% K).
-Posting construction is the hard floor, and the block-streaming design already pays less than that floor.
+For reference the champion needs ~1,420 ms and the final candidate ~740 ms on the same core.
+The postings index holds 21.09 M pairs (84 MB as u32) plus 170 MB of transient event arrays in the probe.
 
-## What the candidate is
+Why it cannot win, from measured components (seed 1, 53,444 Boolean terms; 714 terms with df > 4,096 carry
+57% of pairs):
 
-The selective hybrid that did win is block-granular rather than corpus-granular:
+* Evaluation is genuinely cheap and trivially parallel (5.7 us/query, 176 ms single thread), and my own
+  block evaluator spends 0.17-0.24 s on the same work. That is the whole prize: at most ~20-25% of CPU.
+* Construction is the floor, not evaluation. A *branchless* dedupe-and-append log costs +120-200 ms over
+  resolve alone (+300 ms with the data-dependent branch), a counting sort adds 70-240 ms, bitmap building
+  another ~190 ms. The champion's entire branchy bitmap fill is 330 ms, and the final hot/cold fill ~230 ms.
+* Memory has weight 0.2: +60 MB on a ~50 MB process costs ~10% K, while perfect, free evaluation is worth
+  <= +12% K (T^-0.5). Net: no win even at zero evaluation cost.
+* Query overlap is nil for factored DAGs: 29,483 distinct two-term prefixes among 29,709 queries with two
+  or more terms; 22,836 distinct first terms among 31,000; the 100 most-used terms are 4.1% of term uses.
 
-- Hot Boolean terms (>=4 sample hits, <=3000) own permanent per-worker dense bitmap rows and are marked
-  with one branch-free read-modify-write per token. Cold terms keep five inline 12-bit positions and spill
-  to dynamic rows. Eval uses the same sparse/dense operators as before.
-- 64-byte window tokenizer fused with 8-byte-key fingerprinting; one SIMD compare against a four-way
-  bucket dictionary that returns term ID, Boolean column and phrase head in one 64-bit word.
-- Branch-free dictionary resolve; the rare cases (long-token candidates, full-bucket misses) are the only loop.
-- AVX2 exact count and weighted position sum for dense result rows (nibble LUTs, SAD, maddubs).
-- Dynamic claiming of document-aligned blocks (interpolated seek on dense IDs); first-ten IDs merged by value.
-- Query file tokenized with the same SIMD tokenizer; output merged and formatted on all threads.
-- 18-bit packed first-ten lists; 512 KB frequency sample (ties prefer longer words).
+The *selective hybrid* that does win is block-granular instead of corpus-granular (section 2): permanent dense
+rows for the terms that would be bitmap postings anyway, tiny inline sorted containers for the rest, no
+persisted index.
 
-TBD: CI numbers, pinned-compiler results, S/M/D, K_local.
+## 2. What the candidate is
+
+* **Query file and corpus share one tokenizer.** A 64-byte window classifier yields start/end transitions;
+  tokens are fingerprinted as they are found (1-8 byte tokens: exact key plus CRC32C; 9-12 letters: packed
+  5-bit key; longer: CRC chain with full-byte verification on candidates).
+* **One four-way bucket dictionary** (64-byte buckets, 8-byte keys, 64-bit metadata: term ID, Boolean column,
+  phrase head). Lookup is one SIMD compare, branch-free except long-token candidates and full-bucket misses.
+  Built directly by interning; nothing is rebuilt or copied afterwards.
+* **Hot rows.** Boolean terms with >= 4 hits in a 512 KB corpus sample (at most 3,000) occupy the first
+  columns and permanent per-worker 2,048-document bitmap rows, marked with one unconditional OR per token
+  (non-hot tokens write a sink row). Remaining terms keep the five-position inline state and spill into dynamic
+  rows, exactly as before. Sampling only chooses work; it never decides whether anything matches.
+* **Block scheduling.** Workers claim document-aligned blocks from an atomic counter; block starts come from
+  an interpolation seek on the dense document IDs (malformed IDs still fail with the champion's message).
+  Per-query first-ten IDs are kept by every worker and merged by value.
+* **Dense result rows** use an AVX2 nibble-table kernel for exact count and weighted position sum.
+* Plans are grouped by operator shape with a counting sort so evaluator branches repeat; output merge and
+  formatting run on all threads; first-ten lists use 18-bit packing.
+
+## 3. Measurements
+
+Development host (4 cores, GCC 13, `-O3 -flto -march=x86-64-v3`), seed 1, pinned core, min of 9-11 runs:
+
+| Step | ms |
+|---|---|
+| champion `d7845bc` | 1,422-1,507 |
+| batched tokenizer + pipelined probes | 1,431 |
+| bucket dictionary | 1,376 |
+| 64-byte window tokenizer | 1,290 |
+| dense count/sum kernel | 1,169 |
+| single dictionary, shorter sample, parallel output | 1,037 |
+| **hot rows** | **802** |
+| branch-free resolve | 775 |
+| dynamic blocks, fused tokenizer, cold prefetch, shape grouping | ~740 |
+
+Four real cores (`W=4`): champion 392-397 ms, candidate 215-231 ms. Twelve threads on four cores: 425 -> 229 ms.
+Peak anonymous memory 38.8 -> 41.4 MB. Canonical S 918 -> ~1,092 (plus 7 Dockerfile lines), D 1.
+
+CI (pinned `gcc:15` Docker, offline, organizer timer, 4-vCPU SMT runner; five paired runs per seed):
+see `PERF.md` for the receipts and run links.
+
+## 4. Rejected or neutral (with reasons)
+
+| Experiment | Result |
+|---|---|
+| Dense-everywhere branch-free evaluator | exact, +22% slower (970 vs 796 ms): scratch expansion costs more than the mispredicts it removes |
+| Dense path for OR queries only | +6% slower |
+| Word-major hot rows (L1-resident marking) | exact; marking not L1-bound locally (+2.7% from transposes); kept as a CI sweep variant for small-L2 SMT hosts |
+| Eight-group table flatten, branchless long fingerprint, prefix prefetch of active entries for hot columns | no gain or slower (the last: +25%) |
+| Query-ordered prefetch of active states, sort by first term | <= 2% |
+| Transparent huge pages for the dictionary, `-static`, PGO (GCC 13 sample profile), `-march=native`, `-O2` | no gain |
+| Extracting the mark loop into a separate function (restrict/templated) | 9-12% slower from changed inlining |
+| Block sizes 1,024-4,096 | 1,024 saves 8 MB (-1.7% from M) but costs ~8% time; 4,096 the reverse |
+
+## 5. Next actions
+
+1. Luna: official A/B of exact source (see handoff in `PERF.md`).
+2. Parallel query parse (tokenize slices on helper threads, intern serially): ~3 ms of ~120 ms projected.
+3. Smaller `Probe` (16 bytes) to cut store traffic in the tokenizer: est. 2-3%.
+4. Re-tune `hot_cap`, block size and worker count on the actual 6-core/12-thread host.
+5. Shrink dynamic rows with u16 sorted containers (memory only).

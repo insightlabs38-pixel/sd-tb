@@ -68,4 +68,19 @@ for seed in range(1, (int(sys.argv[2]) if len(sys.argv) > 2 else 24) + 1):
     want = d.oracle(docs, queries)
     assert got == want, f"seed {seed}: mismatch (docs={count}, trailing newline={newline})"
     print(f"seed {seed}: docs={count} PASS")
+# More frequent Boolean terms than the hot-row cap, so the cap and cold spill paths both run.
+rng = random.Random(4242)
+wide = [("w%04d" % i).encode() for i in range(5200)] + [("longerword%05d" % i).encode() for i in range(300)]
+docs = [b" ".join(rng.choice(wide) for _ in range(rng.randint(40, 120))) for _ in range(3500)]
+# every term is repeated in the first documents, which feed the frequency sample
+docs[:40] = [b" ".join(wide[(i * 140 + j) % len(wide)] for j in range(140)) for i in range(40)]
+queries = []
+for _ in range(500):
+    parts = [rng.choice(wide)]
+    for _ in range(rng.randint(0, 5)):
+        parts += [rng.choice([b"AND", b"OR", b"NOT"]), rng.choice(wide)]
+    queries.append(b"BOOL " + b" ".join(parts))
+queries += [b'PHRASE "' + b" ".join(rng.choice(wide) for _ in range(3)) + b'"' for _ in range(60)]
+assert run_case(rng, docs, queries) == d.oracle(docs, queries), "hot-cap mismatch"
+print("More frequent Boolean terms than hot rows: PASS")
 print("Randomized window/tail/block fuzz: PASS")
