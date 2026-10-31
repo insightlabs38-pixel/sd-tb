@@ -1,1 +1,1 @@
-sweep 3
+sweep 4 workers
