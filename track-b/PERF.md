@@ -116,6 +116,69 @@ Promoted source commit [bb940fd216110ceda816fd7bc00a8b7ff9b0088d](https://github
 
 [Three-pair two-full-seed comparison 41130495388](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41130495388) passed seven differential seeds, both full-seed exact outputs and offline Docker for both PMR variants. On the pre-16-bit champion, seed 1 means: baseline **1.537 s**, unsynchronized pool **1.457 s**, monotonic **1.423 s**; seed 2: **1.553 s**, pool **1.457 s**, monotonic **1.440 s**. Pool adds ~16 MiB peak RSS; monotonic adds ~116 MiB. The allocator results must be retested atop the promoted 16-bit tape before considering an additive promotion, since memory and source size affect K.
 
+## Frontier blockwise corpus evaluation (qualification pending)
+
+Frontier rollback baseline is `763a5f5` (production source `dc2ceedad12a72007d225c6d85566122b534ef36`); official-source comparison is `8902fb9` (blob `505fa18787f55c72c0c14dcdd403be585b855d48`, identical to the current scored submission). The new architecture retains neither postings nor corpus token tape: workers evaluate Boolean queries on reusable 1,024-document bitmaps and verify phrases around sampled anchors in document-local buffers. AVX2 finds ASCII token boundaries; CRC32C and full byte comparison preserve exact dictionary identity. Compact Boolean plans preserve strict left association. Bit population counts compute counts and sums without answer lists.
+
+On the cloud development host (two CPU quota, three visible CPUs), three rotated restricted-container full seed-1 runs measured official-source **2.921/2.347/2.309 s**, current development **2.288/2.216/2.340 s**, frontier **1.421/1.396/1.410 s**. Cgroup peaks: official **521,580,544 B**, development **376,471,552 B**, frontier **45,604,864 B**. Inputs were warmed outside each run container. The organizer timer measured exec-to-exit as uid 65534, network disabled, read-only root, 8 GiB memory limit and 512-process limit. These use host GCC 12, not the pinned production compiler; the pinned GCC 15 Docker qualification is pending. Canonical clang-format 23.1.3 plus scc 4.1.0 counts frontier **S=607**, including seven Dockerfile lines; **D=1**. Applying the frozen formula with the published board reference axes gives **K_local=10.323808**; this combines runner measurements with board reference constants and is not an official score.
+
+Every full seed-1 run matched published SHA-256 `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`. Full seed 2 matched the independent organizer Python reference: frontier **1.441/1.448 s**, cgroup peak **45,395,968 B**, versus development **2.271/2.284 s**, **376,270,848 B**. Seven differential seeds, the organizer worked example, repeated/suffix phrases, exhaustive Boolean truth assignments, >8 MiB parallel/block boundary cases, 32-byte tokens, UTF-8 separators and deliberate CRC32C collisions passed. ASan/UBSan passed both differential and adversarial suites. No official board score is claimed.
+
+Rejected or superseded local variants: document-local phrase matching plus retained Boolean postings used ~210 MiB beyond mapped input; fully fused per-document Boolean callbacks reduced that to ~24 MiB but took ~3 s; full hybrid bitmap/list indexes still retained ~150 MiB and took ~1.8 s. Blockwise evaluation wins this comparison. Linked-list anchor scheduling regressed the compact contiguous query scan (1.66 versus ~1.50 s); frequent trigger traversal and scattered plan access outweigh the avoided scans. A first per-token SIMD probe and variable-tail CRC helper regressed; scanning 32-byte boundary masks once and hashing constant-sized CRC chunks recovered a consistent gain. Block sizes 256–4096 remain score tradeoffs; 1,024 is the current balanced choice, not a final optimum.
+
+
+## Frontier pinned qualification (three full seeds)
+
+[Production qualification 41147462315](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41147462315) passed pinned GCC 15 offline Docker builds, all differential/adversarial oracles, ASan/UBSan, the published seed-1 full/sample hashes, independent full seed-2/3 Python references, and tiny seed 7. Restricted runs use the organizer timer, uid 65534, read-only root, disabled network, 8 GiB memory, 512-process limit, dropped capabilities except SETUID/SETGID, and warmed inputs. Source commit `5641b8f` preserves the source introduced by `d59b80e`; previous source remains at `763a5f5` for rollback.
+
+| Full seed | Official-source median T / peak M | Development median T / peak M | Frontier median T / peak M | Frontier S/D | K_local | K ratio vs official source |
+|---|---|---|---|---|---|---|
+| 1 | 1.304001 s / 525,086,720 B | 1.202580 s / 379,973,632 B | 0.751904 s / 55,582,720 B | 607 / 1 | 13.590891 | 2.117523 |
+| 2 | 1.365172 s / 525,348,864 B | 1.203598 s / 379,990,016 B | 0.739860 s / 55,066,624 B | 607 / 1 | 13.726650 | 2.188481 |
+| 3 | 1.343440 s / 526,172,160 B | 1.234500 s / 380,649,472 B | 0.708414 s / 55,238,656 B | 607 / 1 | 14.019256 | 2.217965 |
+
+Each median uses three rotated paired runs; M is the largest cgroup peak. Canonical formatter/counter versions are 23.1.3/4.1.0; official S=721, development S=765, D=1 throughout. K_local applies the frozen board reference axes to runner measurements, not a new official score. Native TSan additionally passed the parallel adversarial fixture locally. The initial qualification attempt `41146390617` passed build/sanitizer gates but failed the benchmark helper's mount ownership before timing; `5641b8f` fixes the helper without changing production code.
+
+## Prefetched dictionary and sparse block rows (frontier v2, subsequently qualified)
+
+Rollback is the pinned-qualified `b7d7c90` source from PR #1. This challenger allocates bitmap rows only for Boolean terms present in the current 2,048-document block. Dictionary probes are prepared and prefetched in document-local batches. Exact 1–8-byte keys occupy the dictionary slot directly; long-token fingerprints enter a tagged key space and retain full-byte verification. Every byte of a valid token participates in its fingerprint. Slots also carry the Boolean column, avoiding another dependent lookup. The first worker transfers result ownership instead of allocating a second global result buffer.
+
+On the same two-CPU cloud host after environment recovery, three rotated full seed-1 restricted-container pairs measured prior **1.450/1.431/1.423 s**, new **1.058/1.049/1.057 s**. Cgroup peaks were **45,654,016 B** and **42,901,504 B**. Canonical source increases from **607 to 672**, D stays **1**; the full formula gives **K_local 10.248357 to 11.831993**, a **15.45% gain**. Seed 2 new **1.054/1.057 s**, peak **45,203,456 B**, matched the independent reference. These are host GCC 12 measurements, not pinned compiler or board results.
+
+The final local source passes full seeds 1/2, seven differential seeds, ASan/UBSan and TSan, including >8 MiB parallel fixtures, all token lengths/alignment offsets, 338,000-term dictionary growth, same-endpoint long tokens and deliberately colliding long/short CRC32C keys. Independent three-full-seed pinned GCC 15 qualification compares this source against the official source, development baseline, and the preceding verified frontier source.
+
+The word-occupancy hybrid was refined across scalar cutoffs 2/4/8 and a SIMD prepass that removed hot-loop occupancy writes; its roughly 1.07–1.11 s timings did not justify extra source versus the simpler design near 1.08 s. Dynamic 8/16 MiB range scheduling remained approximately flat against static ranges because extra partial blocks offset load balancing. Short packed keys and document-local prefetches were additive (about 1.31 to 1.17 s); sparse rows allowed larger blocks without the full dense-row allocation. Prefix-only fingerprints were not promoted; long shared-prefix inputs motivate the all-byte fingerprint and collision gates.
+
+
+## Prefetched sparse-row qualification (three full seeds)
+
+[Production qualification 41149282228](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41149282228) passed pinned offline GCC 15 builds, ASan/UBSan, TSan, expanded differential/adversarial gates, published sample/full hashes and independent full seed-2/3 references. The same restricted timer/cgroup method compares four immutable sources in three rotated pairs per seed. Source commit: `a402285`.
+
+| Full seed | Official T / M | Prior frontier T / M | New frontier T / M | New S/D | New K_local | K ratio vs prior / official |
+|---|---|---|---|---|---|---|
+| 1 | 1.539492 s / 525,185,024 B | 0.850198 s / 55,320,576 B | 0.678716 s / 56,356,864 B | 672 / 1 | 14.049360 | 1.098189 / 2.378497 |
+| 2 | 1.568309 s / 525,172,736 B | 0.809549 s / 55,054,336 B | 0.648939 s / 59,478,016 B | 672 / 1 | 14.214015 | 1.083127 / 2.428779 |
+| 3 | 1.516786 s / 526,163,968 B | 0.824705 s / 55,058,432 B | 0.651839 s / 59,068,416 B | 672 / 1 | 14.201972 | 1.092310 / 2.387426 |
+
+T is the three-run median; M is the largest cgroup peak. Runtime improved about 20%, but the four-worker cgroup peaks increased, so the full-K gain over the prior frontier is 8.3–9.8%, below the local two-CPU estimate. These are runner results, not official board scores. Next memory work targets transient bitmap-row reallocation copies and query/result representation, while preserving this verified rollback point.
+
+
+## Compact plans and exact phrase probes (frontier v3)
+
+[Production qualification 41157659217](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41157659217) passes pinned GCC 15 offline Docker, ASan/UBSan, TSan, seven randomized differential seeds, exhaustive Boolean assignments, all byte classes at every SIMD alignment, long CRC collisions with reversed/repeated phrases, 338,000-term dictionary growth, published sample/full hashes, tiny seed 7, and independent full seed-2/3 references. Immutable production source: `338c7cf8e1585ae770e2faa12834fa50b8138bd2`; rollback: `4069aa9` (v2).
+
+Fixed query records compile into separate inline Boolean/phrase plans, then release the parse array. Dictionary metadata packs term ID, Boolean column and phrase head into one word. Phrase candidates are collected during resolution; exact short keys and collision-checked long fingerprints reuse the document's lookup probes, eliminating the token-ID buffer and repeated anchor lookups. Bitmap capacity reserves its exact upper bound before scanning, avoiding transient growth copies. SIMD sampling and bounded `to_chars` output reduce startup/serialization costs.
+
+| Full seed | v2 median T / peak M | v3 median T / peak M | v3 S/D | v3 K_local | K ratio vs v2 |
+|---|---|---|---|---|---|
+| 1 | 0.676918456 s / 59,858,944 B | 0.578750112 s / 43,130,880 B | 742 / 1 | 15.750712 | 1.133194 |
+| 2 | 0.671495305 s / 58,978,304 B | 0.573402319 s / 42,942,464 B | 742 / 1 | 15.823991 | 1.130540 |
+| 3 | 0.668224612 s / 56,344,576 B | 0.575259689 s / 42,889,216 B | 742 / 1 | 15.798424 | 1.115721 |
+
+Each T is the median of three rotated restricted-container runs; M is the maximum cgroup peak. Canonical clang-format 23.1.3/scc 4.1.0 gives S=742, D=1. All three peaks are below the frozen 43,999,232-byte memory cap, so further memory savings alone earn no K. These are runner-equivalent K values, not official scores. The live board independently scored Luna's v2 integration (`6bf7383`, run `run-071238af51d9`) at T=0.558953 s, M=56,795,136 B, S=672, D=1, K=15.457529; v3 has no official receipt yet.
+
+Rejected local refinements: frequency-selected direct lookup caches (64–4,096 slots, including selective-prefetch controls) cost about 0.98–1.13 s versus 0.92–0.94 s on two full seeds. A positive-witness Boolean candidate bitmap initially regressed; moving marking to block flush recovered the regression but did not offset its source cost. Start/end-mask tokenization was inconsistent across seeds. Pooled first-ten summaries reduce eight-worker/1,024-document-block peak memory from about 50.3 MB to 38.8 MB; higher-core throughput remains unmeasured on matching hardware and is experimental.
+
 ## Segmented zero-copy phrase tape (promoted, October 31)
 
 [Three-pair two-full-seed qualification 41149380822](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41149380822) passed seven deterministic differential seeds, ASan+UBSan on organizer tiny, published full seed-1 SHA-256, independent full seed-2 Python reference, and pinned offline Docker as uid 65534 on a read-only root filesystem. Instead of copying per-worker phrase-token vectors into one global tape, the engine retains four worker-owned chunks, with per-document chunk IDs and global offsets. Exact 16-bit phrase-token IDs and the 32-bit high-vocabulary fallback remain supported.

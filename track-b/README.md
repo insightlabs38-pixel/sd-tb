@@ -4,11 +4,11 @@ A C++20, standard-library-only solution to [Track B](https://github.com/hackatho
 
 ## Approach
 
-Queries are parsed before the corpus. A case-insensitive ASCII token dictionary selects only query-visible terms, with byte-exact comparison and no Unicode normalization. A four-worker corpus scan builds ascending per-term document postings and a compact, per-worker segmented phrase-token tape with 16-bit IDs and an exact 32-bit high-vocabulary fallback. Retaining worker-owned segments avoids the global tape copy. Four query workers preserve output order. Boolean expressions use sorted-set intersection, union and difference in strict left-to-right order, with rare-term candidate probes and adaptive intersections for unbalanced lists. Phrase queries choose their least-frequent term as a candidate filter and verify exact adjacency around that anchor. High-frequency phrases are deduplicated and evaluated by a shared token-level Aho-Corasick automaton with parallel document-range scans. Output is deterministic and includes the exact 64-bit sum and first ten IDs.
+Queries select a collision-safe ASCII token dictionary. Up to four workers scan disjoint document ranges with AVX2 byte classification and CRC32C fingerprints with exact packed short keys and full-byte long-token verification. Document-local batches prefetch dictionary probes, whose slots pack term IDs, Boolean columns and phrase heads. Boolean terms populate reusable 2,048-document bitmaps with bounded capacity and rows touched only for terms present in the block; compact plans apply every operator strictly left to right. Population counts compute exact counts and ID sums without materializing answer lists. Phrase queries use sampled rare anchors and verify adjacency against the same exact lookup probes. Sampling changes work selection only. Workers merge count, sum and first-ten summaries in document order. No corpus-wide postings, positions, token tape or phrase automaton is retained.
 
 ## Validation
 
-The [segmented-tape qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41149380822) passed seven-seed differential tests, ASan/UBSan, exact full seed-1 hash, independent full seed-2 reference, and pinned offline Docker under uid 65534 on a read-only root. It reduced full-run peak RSS by about 69–71 MiB without a consistent wall-time regression. The [independent ownership comparison](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41137002236) also passed the 80,000-phrase-term fallback. A direct post-promotion exactness run is tracked in [CI 41154133283](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41154133283). Runner timings are not official board measurements.
+[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41157659217) passes three full seeds, published sample/full hashes, an independent tiny reference, ASan/UBSan, TSan, expanded differential/adversarial oracles and restricted offline Docker. The oracle covers 338,000-term dictionary growth, all token lengths/alignment offsets all byte classes at every SIMD alignment, and deliberate short/long CRC32C collisions including repeated and reversed phrase terms. See PERF.md for full T/M/S/D/K comparisons. Runner measurements are not official board scores.
 
 ## Dependencies
 
@@ -16,4 +16,4 @@ None beyond the C++ standard library and system C runtime. Build image is the pi
 
 ## With another 24 hours
 
-Profile the organizer full corpus, compare selective positional indexing and query-batch evaluation against the measured hybrid baseline, and explore SIMD tokenization. The phrase automaton is already implemented. Replace the placeholder `team` value before official submission.
+Profile the streaming scan, compare block sizes by the full coefficient, and test faster dictionary probes and phrase-anchor layouts. The official integrator owns promotion and board measurements.
