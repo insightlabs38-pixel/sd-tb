@@ -332,23 +332,34 @@ public:
     void add_bits(size_t query, uint64_t bits, uint32_t base) {
         if (!bits) return;
         Summary &row = rows[query];
-        if (row.count() < kept_ids) {
-            auto &first = first_for(row);
-            size_t kept = row.count();
+        const unsigned count = popcount(bits);
+        size_t kept = row.count();
+        array<uint32_t, kept_ids> *first = kept < kept_ids ? &first_for(row) : nullptr;
+        uint64_t delta = (uint64_t(base) + (uint64_t(1) << 35)) * count;
+        if (count <= 4) {
+            // Sparse words: accumulate IDs and their offsets in one bit walk.
             uint64_t remaining = bits;
-            while (remaining && kept < kept_ids) {
-                first[kept++] = base + countr_zero(remaining);
+            while (remaining) {
+                unsigned offset = countr_zero(remaining);
+                delta += offset;
+                if (first && kept < kept_ids) (*first)[kept++] = base + offset;
                 remaining &= remaining - 1;
             }
+        } else {
+            if (first) {
+                uint64_t remaining = bits;
+                while (remaining && kept < kept_ids) {
+                    (*first)[kept++] = base + countr_zero(remaining);
+                    remaining &= remaining - 1;
+                }
+            }
+            delta += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
+            delta += 2u * popcount(bits & 0xccccccccccccccccULL);
+            delta += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
+            delta += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
+            delta += 16u * popcount(bits & 0xffff0000ffff0000ULL);
+            delta += 32u * popcount(bits & 0xffffffff00000000ULL);
         }
-        unsigned count = popcount(bits);
-        uint64_t delta = (uint64_t(base) + (uint64_t(1) << 35)) * count;
-        delta += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
-        delta += 2u * popcount(bits & 0xccccccccccccccccULL);
-        delta += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
-        delta += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
-        delta += 16u * popcount(bits & 0xffff0000ffff0000ULL);
-        delta += 32u * popcount(bits & 0xffffffff00000000ULL);
         row.total += delta;
     }
     void merge(const Results &source) {
