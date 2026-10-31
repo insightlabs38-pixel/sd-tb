@@ -462,6 +462,10 @@ class Engine {
             phrases.push_back(plan);
         }
         dictionary.configure_metadata(boolean_column, anchor_head);
+        // Query output order is independent of evaluation order.
+        sort(boolean_queries.begin(), boolean_queries.end(), [](const BooleanQuery &a, const BooleanQuery &b) {
+            return a.terms[0] < b.terms[0];
+        });
         vector<Query>().swap(queries);
 
     }
