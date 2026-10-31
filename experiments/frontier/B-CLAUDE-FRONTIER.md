@@ -97,13 +97,13 @@ caches, so expect the scoring host to land between the two.
 | Extracting the mark loop into a separate function (restrict/templated) | 9-12% slower from changed inlining |
 | Block sizes 1,024-4,096 | 1,024 saves 8 MB but costs ~8% time; 1,536 is within noise on CI; 4,096 the reverse |
 | Hot cap 1,500/2,000, hot threshold 8, 256 KB sample (CI sweep) | all within +-2% of base |
-| Parallel query-file tokenization, prefaulting dictionary/plans, extra intern prefetch | no change in the 10 ms serial parse (instruction and first-touch bound) |
+| Parallel query-file tokenization (8 helper threads), prefaulting dictionary/plans, extra intern prefetch | no gain: CI laps parse 12.1-13.0 ms serial vs 13.2-14.1 ms parallel; the cost is serial interning (~170k probes) plus Query construction |
 | 24-byte `Probe` | -1%, within noise; not adopted |
 
 ## 5. Next actions
 
 1. Luna: official A/B of exact source (see handoff in `PERF.md`).
-2. Parallel query parse (tokenize slices on helper threads, intern serially): ~3 ms of ~120 ms projected.
+2. Sharded interning of the query dictionary (bucket ranges per thread, IDs renumbered by prefix sums): the serial parse+compile+output is ~26 ms on the CI runner and ~20% of T on a 12-thread host; tokenizing in parallel alone does not help (see ledger).
 3. Smaller `Probe` (16 bytes) to cut store traffic in the tokenizer: est. 2-3%.
 4. Re-tune `hot_cap`, block size and worker count on the actual 6-core/12-thread host.
 5. Shrink dynamic rows with u16 sorted containers (memory only).
