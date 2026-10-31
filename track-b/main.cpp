@@ -448,7 +448,7 @@ class Engine {
             size_t docs = 0;
         };
         const char *begin = input.data, *end = begin + input.size;
-        const size_t workers = input.size >= (8u << 20) ? 6 : 1;
+        const size_t workers = input.size >= (8u << 20) ? 8 : 1;
         vector<const char *> bounds(workers + 1);
         bounds[0] = begin;
         bounds[workers] = end;
