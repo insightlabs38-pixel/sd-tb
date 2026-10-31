@@ -388,6 +388,7 @@ public:
 class Engine {
     FlatDictionary dictionary;
     static constexpr uint32_t singleton = 0x80000000u;
+    static constexpr uint32_t doubleton = 0xc0000000u;
     size_t term_count = 0;
     vector<Query> queries;
     struct PhrasePlan {
@@ -491,44 +492,69 @@ class Engine {
     template<size_t block_docs>
     void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
                         size_t in_block, uint32_t block_base, Results &results) const {
+        static_assert(block_docs == 1024);
         static constexpr size_t words = block_docs / 64;
         static constexpr uint32_t local_value = 0x40000000u;
+        static constexpr uint32_t position_mask = 1023u;
+        auto is_inline = [&](uint32_t x) { return (x & singleton) != 0; };
+        auto visit_inline = [&](uint32_t x, auto &&fn) {
+            if ((x & doubleton) == doubleton) {
+                fn((x >> 10) & position_mask);
+                fn(x & position_mask);
+            } else fn(x & position_mask);
+        };
+        auto pack = [&](uint32_t a, uint32_t b, unsigned n) {
+            if (!n) return uint32_t(0);
+            if (n == 1) return singleton | a;
+            if (b < a) swap(a, b);
+            return doubleton | (a << 10) | b;
+        };
         for (const BooleanQuery &q : boolean_queries) {
             if (q.required != numeric_limits<uint32_t>::max() && !active[q.required]) continue;
             uint32_t state = active[q.terms[0]];
             array<uint64_t, words> value;
             auto materialize = [&] {
-                if (state != local_value) {
-                    copy_n(matrix.data() + state * words, words, value.data());
-                    state = local_value;
-                }
+                if (state == local_value) return;
+                if (is_inline(state)) {
+                    value.fill(0);
+                    visit_inline(state, [&](uint32_t pos) {
+                        value[pos / 64] |= uint64_t(1) << (pos % 64);
+                    });
+                } else copy_n(matrix.data() + state * words, words, value.data());
+                state = local_value;
             };
             auto present = [&](uint32_t source, uint32_t position) {
-                const uint64_t *data = source == local_value ? value.data() : matrix.data() + source * words;
-                return (data[position / 64] >> (position % 64)) & 1;
+                if (source == local_value) return bool((value[position / 64] >> (position % 64)) & 1);
+                if (is_inline(source)) {
+                    bool hit = false;
+                    visit_inline(source, [&](uint32_t pos) { hit |= pos == position; });
+                    return hit;
+                }
+                return bool((matrix[source * words + position / 64] >> (position % 64)) & 1);
             };
-            for (size_t i = 0; i < size_t(q.count - 1); ++i) {
-                uint32_t other = active[q.terms[i+1]];
+            for (size_t i = 0; i + 1 < q.count; ++i) {
+                uint32_t other = active[q.terms[i + 1]];
                 char op = q.ops[i];
                 if (op == 'O') {
                     if (!other || state == other) continue;
                     if (!state) { state = other; continue; }
-                    if (other & singleton) {
-                        uint32_t position = other & ~singleton;
-                        if (state & singleton) {
-                            uint32_t previous = state & ~singleton;
-                            value.fill(0);
-                            value[previous / 64] = uint64_t(1) << (previous % 64);
-                            state = local_value;
-                        } else materialize();
-                        value[position / 64] |= uint64_t(1) << (position % 64);
-                    } else if (state & singleton) {
-                        uint32_t position = state & ~singleton;
-                        copy_n(matrix.data() + other * words, words, value.data());
-                        value[position / 64] |= uint64_t(1) << (position % 64);
-                        state = local_value;
+                    if (is_inline(state) && is_inline(other)) {
+                        uint32_t vals[4]{};
+                        unsigned n = 0;
+                        visit_inline(state, [&](uint32_t pos) { vals[n++] = pos; });
+                        visit_inline(other, [&](uint32_t pos) {
+                            bool seen = false;
+                            for (unsigned j = 0; j < n; ++j) seen |= vals[j] == pos;
+                            if (!seen) vals[n++] = pos;
+                        });
+                        if (n <= 2) { state = pack(vals[0], vals[1], n); continue; }
+                    }
+                    materialize();
+                    if (is_inline(other)) {
+                        visit_inline(other, [&](uint32_t pos) {
+                            value[pos / 64] |= uint64_t(1) << (pos % 64);
+                        });
                     } else {
-                        materialize();
                         const uint64_t *rhs = matrix.data() + other * words;
                         for (size_t w = 0; w < words; ++w) value[w] |= rhs[w];
                     }
@@ -536,17 +562,21 @@ class Engine {
                 }
                 if (!state) continue;
                 if (!other) { if (op == 'A') state = 0; continue; }
-                if (state & singleton) {
-                    uint32_t position = state & ~singleton;
-                    bool hit = other & singleton ? state == other : present(other, position);
-                    if (op == 'A' ? !hit : hit) state = 0;
-                } else if (other & singleton) {
-                    uint32_t position = other & ~singleton;
-                    if (op == 'A') state = present(state, position) ? other : 0;
-                    else {
-                        materialize();
-                        value[position / 64] &= ~(uint64_t(1) << (position % 64));
-                    }
+                if (is_inline(state) || (op == 'A' && is_inline(other))) {
+                    uint32_t source = is_inline(state) ? state : other;
+                    uint32_t target = is_inline(state) ? other : state;
+                    uint32_t vals[2]{};
+                    unsigned n = 0;
+                    visit_inline(source, [&](uint32_t pos) {
+                        bool hit = present(target, pos);
+                        if ((op == 'A' && hit) || (op == 'N' && !hit)) vals[n++] = pos;
+                    });
+                    state = pack(vals[0], vals[1], n);
+                } else if (is_inline(other)) {
+                    materialize();
+                    visit_inline(other, [&](uint32_t pos) {
+                        value[pos / 64] &= ~(uint64_t(1) << (pos % 64));
+                    });
                 } else {
                     materialize();
                     const uint64_t *rhs = matrix.data() + other * words;
@@ -554,8 +584,9 @@ class Engine {
                     else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
                 }
             }
-            if (state & singleton) results.add(q.output, block_base + (state & ~singleton));
-            else if (state) {
+            if (is_inline(state)) {
+                visit_inline(state, [&](uint32_t pos) { results.add(q.output, block_base + pos); });
+            } else if (state) {
                 const uint64_t *data = state == local_value ? value.data() : matrix.data() + state * words;
                 for (size_t w = 0; w < (in_block + 63) / 64; ++w)
                     results.add_bits(q.output, data[w], block_base + static_cast<uint32_t>(w * 64));
@@ -638,10 +669,16 @@ class Engine {
                                     row = singleton | static_cast<uint32_t>(in_block);
                                 } else if (row & singleton) {
                                     uint32_t previous = row & ~singleton;
-                                    if (previous != in_block) {
+                                    if (previous != in_block)
+                                        row = doubleton | (previous << 10) | static_cast<uint32_t>(in_block);
+                                } else if ((row & doubleton) == doubleton) {
+                                    uint32_t first = (row >> 10) & 1023u;
+                                    uint32_t second = row & 1023u;
+                                    if (first != in_block && second != in_block) {
                                         row = static_cast<uint32_t>(matrix.size() / words);
                                         matrix.resize(matrix.size() + words, 0);
-                                        matrix[row * words + previous / 64] = uint64_t(1) << (previous % 64);
+                                        matrix[row * words + first / 64] |= uint64_t(1) << (first % 64);
+                                        matrix[row * words + second / 64] |= uint64_t(1) << (second % 64);
                                         matrix[row * words + document_word] |= document_bit;
                                     }
                                 } else matrix[row * words + document_word] |= document_bit;
