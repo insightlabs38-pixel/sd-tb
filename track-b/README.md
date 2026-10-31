@@ -8,7 +8,7 @@ Queries select a collision-safe ASCII token dictionary. Up to four workers scan 
 
 ## Validation
 
-The frontier architecture is undergoing pinned production Docker qualification on three independent full seeds, published tiny/sample/full hash gates, differential and adversarial oracles, and ASan/UBSan. Local full seeds 1 and 2 are exact; see PERF.md for measured evidence and qualification status. Local measurements are not official board scores.
+[Pinned production qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41147462315) passed three independent full seeds, published sample/full hashes, an independent tiny reference, differential and adversarial oracles, restricted offline Docker, and ASan/UBSan. Native TSan passed the parallel adversarial fixture locally. See PERF.md for paired T/M/S/D/K evidence. Runner measurements are not official board scores.
 
 ## Dependencies
 

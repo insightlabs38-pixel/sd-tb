@@ -125,3 +125,16 @@ On the cloud development host (two CPU quota, three visible CPUs), three rotated
 Every full seed-1 run matched published SHA-256 `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`. Full seed 2 matched the independent organizer Python reference: frontier **1.441/1.448 s**, cgroup peak **45,395,968 B**, versus development **2.271/2.284 s**, **376,270,848 B**. Seven differential seeds, the organizer worked example, repeated/suffix phrases, exhaustive Boolean truth assignments, >8 MiB parallel/block boundary cases, 32-byte tokens, UTF-8 separators and deliberate CRC32C collisions passed. ASan/UBSan passed both differential and adversarial suites. No official board score is claimed.
 
 Rejected or superseded local variants: document-local phrase matching plus retained Boolean postings used ~210 MiB beyond mapped input; fully fused per-document Boolean callbacks reduced that to ~24 MiB but took ~3 s; full hybrid bitmap/list indexes still retained ~150 MiB and took ~1.8 s. Blockwise evaluation wins this comparison. Linked-list anchor scheduling regressed the compact contiguous query scan (1.66 versus ~1.50 s); frequent trigger traversal and scattered plan access outweigh the avoided scans. A first per-token SIMD probe and variable-tail CRC helper regressed; scanning 32-byte boundary masks once and hashing constant-sized CRC chunks recovered a consistent gain. Block sizes 256–4096 remain score tradeoffs; 1,024 is the current balanced choice, not a final optimum.
+
+
+## Frontier pinned qualification (three full seeds)
+
+[Production qualification 41147462315](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41147462315) passed pinned GCC 15 offline Docker builds, all differential/adversarial oracles, ASan/UBSan, the published seed-1 full/sample hashes, independent full seed-2/3 Python references, and tiny seed 7. Restricted runs use the organizer timer, uid 65534, read-only root, disabled network, 8 GiB memory, 512-process limit, dropped capabilities except SETUID/SETGID, and warmed inputs. Source commit `5641b8f` preserves the source introduced by `d59b80e`; previous source remains at `763a5f5` for rollback.
+
+| Full seed | Official-source median T / peak M | Development median T / peak M | Frontier median T / peak M | Frontier S/D | K_local | K ratio vs official source |
+|---|---|---|---|---|---|---|
+| 1 | 1.304001 s / 525,086,720 B | 1.202580 s / 379,973,632 B | 0.751904 s / 55,582,720 B | 607 / 1 | 13.590891 | 2.117523 |
+| 2 | 1.365172 s / 525,348,864 B | 1.203598 s / 379,990,016 B | 0.739860 s / 55,066,624 B | 607 / 1 | 13.726650 | 2.188481 |
+| 3 | 1.343440 s / 526,172,160 B | 1.234500 s / 380,649,472 B | 0.708414 s / 55,238,656 B | 607 / 1 | 14.019256 | 2.217965 |
+
+Each median uses three rotated paired runs; M is the largest cgroup peak. Canonical formatter/counter versions are 23.1.3/4.1.0; official S=721, development S=765, D=1 throughout. K_local applies the frozen board reference axes to runner measurements, not a new official score. Native TSan additionally passed the parallel adversarial fixture locally. The initial qualification attempt `41146390617` passed build/sanitizer gates but failed the benchmark helper's mount ownership before timing; `5641b8f` fixes the helper without changing production code.
