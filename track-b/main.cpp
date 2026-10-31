@@ -49,32 +49,18 @@ struct MappedFile {
 };
 
 struct FoldEqual {
-    using is_transparent = void;
+    // Only tokens longer than eight bytes reach here; overlapping eight-byte words ignore ASCII case.
     bool operator()(string_view a, string_view b) const noexcept {
         if (a.size() != b.size()) return false;
-        const char *x = a.data(), *y = b.data();
-        size_t count = a.size();
-        while (count >= 8) {
-            uint64_t left, right;
-            memcpy(&left, x, 8);
-            memcpy(&right, y, 8);
-            if ((left | 0x2020202020202020ULL) != (right | 0x2020202020202020ULL)) return false;
-            x += 8; y += 8; count -= 8;
-        }
-        if (count & 4) {
-            uint32_t left, right;
-            memcpy(&left, x, 4); memcpy(&right, y, 4);
-            if ((left | 0x20202020u) != (right | 0x20202020u)) return false;
-            x += 4; y += 4;
-        }
-        if (count & 2) {
-            uint16_t left, right;
-            memcpy(&left, x, 2); memcpy(&right, y, 2);
-            if ((left | 0x2020u) != (right | 0x2020u)) return false;
-            x += 2; y += 2;
-        }
-        if ((count & 1) && ((*x | 32) != (*y | 32))) return false;
-        return true;
+        const size_t size = a.size();
+        auto load = [](string_view v, size_t at) {
+            uint64_t word;
+            memcpy(&word, v.data() + at, 8);
+            return word | 0x2020202020202020ULL;
+        };
+        for (size_t i = 0; i + 8 < size; i += 8)
+            if (load(a, i) != load(b, i)) return false;
+        return load(a, size - 8) == load(b, size - 8);
     }
 };
 
@@ -196,47 +182,49 @@ public:
             bucket.meta[i] = (id + 1) | (uint64_t(column) << 20) | (uint64_t(head) << 40);
         }
     }
-    // Writes every token boundary (start, end, start, end, ...) of [b, b+len) to bounds.
-    // b must be readable for len+64 bytes; returns the boundary count (twice the token count).
-    static size_t tokenize(const char *b, size_t len, uint32_t *bounds) {
+    // Splits [b, b+len) into tokens and fingerprints them; b must be readable for len+64 bytes.
+    // Tokens up to eight bytes are keyed inline, longer ones are listed in longs and keyed afterwards.
+    static size_t tokenize(const char *b, size_t len, Probe *out, uint32_t *longs) {
+        size_t count = 0, long_count = 0;
         uint64_t carry = 0;
-        size_t n = 0;
+        uint32_t start = 0;
+        bool open = false;
+        auto emit = [&](uint32_t from, uint32_t to) {
+            const uint32_t size = to - from;
+            uint64_t word;
+            memcpy(&word, b + from, 8);
+            const unsigned used = size < 8 ? size : 8;
+            const uint64_t key = (word | 0x2020202020202020ULL) & (~uint64_t(0) >> (64 - used * 8));
+            const uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+            out[count] = {string_view(b + from, size), hash ? hash : 1, key};
+            longs[long_count] = static_cast<uint32_t>(count++);
+            long_count += size > 8;
+        };
         for (size_t off = 0; off <= len; off += 64) {
             uint64_t m = alnum_mask(b + off) | (uint64_t(alnum_mask(b + off + 32)) << 32);
-            size_t rem = len - off;
+            const size_t rem = len - off;
             if (rem < 64) m &= rem ? ~uint64_t(0) >> (64 - rem) : 0;
+            // Transitions alternate token start, token end; a token may cross windows.
             uint64_t t = m ^ ((m << 1) | carry);
             carry = m >> 63;
-            const unsigned count = popcount(t);
-            uint32_t *out = bounds + n;
-            for (unsigned k = 0; k < count; k += 4) {
-                out[k] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
-                out[k + 1] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
-                out[k + 2] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
-                out[k + 3] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
+            if (open && t) {
+                emit(start, static_cast<uint32_t>(off) + countr_zero(t));
+                t &= t - 1;
+                open = false;
             }
-            n += count;
+            while (t) {
+                const uint32_t from = static_cast<uint32_t>(off) + countr_zero(t);
+                t &= t - 1;
+                if (!t) { start = from; open = true; break; }
+                emit(from, static_cast<uint32_t>(off) + countr_zero(t));
+                t &= t - 1;
+            }
         }
-        return n;
-    }
-    // Fingerprints every token; 1-8 byte tokens take a branch-free batch path, the rest a scalar one.
-    void prepare_line(const char *b, size_t n, const uint32_t *bounds, Probe *out, uint32_t *longs) const {
-        size_t nl = 0;
-        for (size_t i = 0; i < n; ++i) {
-            uint32_t s = bounds[2 * i], len = bounds[2 * i + 1] - s;
-            uint64_t word;
-            memcpy(&word, b + s, 8);
-            unsigned used = len < 8 ? len : 8;
-            uint64_t key = (word | 0x2020202020202020ULL) & (~uint64_t(0) >> (64 - used * 8));
-            uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
-            out[i] = {string_view(b + s, len), hash ? hash : 1, key};
-            longs[nl] = static_cast<uint32_t>(i);
-            nl += len > 8;
-        }
-        for (size_t k = 0; k < nl; ++k) {
+        for (size_t k = 0; k < long_count; ++k) {
             Probe &probe = out[longs[k]];
             tie(probe.hash, probe.key) = fingerprint(probe.word);
         }
+        return count;
     }
     void prefetch(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
     // Returns the metadata word, or zero on a miss; long-token matches are verified byte for byte.
@@ -271,11 +259,11 @@ public:
 
 // Reusable per-worker buffers that turn one document line into fingerprinted probes.
 struct LineTokens {
-    vector<uint32_t> bounds, longs;
+    vector<uint32_t> longs;
     vector<FlatDictionary::Probe> probes;
     vector<char> tail;
     size_t count = 0;
-    void load(const FlatDictionary &dictionary, const char *text, const char *line_end, const char *file_end) {
+    void load(const char *text, const char *line_end, const char *file_end) {
         const char *original = text;
         size_t length = line_end - text;
         const bool padded = file_end - line_end < 128;
@@ -286,9 +274,8 @@ struct LineTokens {
             text = tail.data();
         }
         size_t capacity = length / 2 + 40;
-        if (longs.size() < capacity) { bounds.resize(2 * capacity + 8); longs.resize(capacity); probes.resize(capacity); }
-        count = FlatDictionary::tokenize(text, length, bounds.data()) / 2;
-        dictionary.prepare_line(text, count, bounds.data(), probes.data(), longs.data());
+        if (longs.size() < capacity) { longs.resize(capacity); probes.resize(capacity); }
+        count = FlatDictionary::tokenize(text, length, probes.data(), longs.data());
         // Words always refer to the original bytes, never to the temporary copy.
         if (padded) for (size_t i = 0; i < count; ++i) probes[i].word = string_view(original + (probes[i].word.data() - text), probes[i].word.size());
     }
@@ -342,28 +329,6 @@ public:
         if (row.count() < kept_ids) first_for(row)[row.count()] = id;
         row.total += (uint64_t(1) << 35) + id;
     }
-    void add_bits(size_t query, uint64_t bits, uint32_t base) {
-        if (!bits) return;
-        Summary &row = rows[query];
-        if (row.count() < kept_ids) {
-            auto &first = first_for(row);
-            size_t kept = row.count();
-            uint64_t remaining = bits;
-            while (remaining && kept < kept_ids) {
-                first[kept++] = base + countr_zero(remaining);
-                remaining &= remaining - 1;
-            }
-        }
-        unsigned count = popcount(bits);
-        uint64_t delta = (uint64_t(base) + (uint64_t(1) << 35)) * count;
-        delta += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
-        delta += 2u * popcount(bits & 0xccccccccccccccccULL);
-        delta += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
-        delta += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
-        delta += 16u * popcount(bits & 0xffff0000ffff0000ULL);
-        delta += 32u * popcount(bits & 0xffffffff00000000ULL);
-        row.total += delta;
-    }
     // Exact count and position sum of a dense bitmap: bytes weigh their index, bits their offset.
     template<size_t words>
     static pair<uint32_t, uint64_t> dense_stats(const uint64_t *data) {
@@ -395,17 +360,20 @@ public:
         alignas(32) uint32_t part[8];
         _mm256_store_si256(reinterpret_cast<__m256i *>(part), weighted);
         uint64_t index_sum = sum64(scaled) + part[0] + part[1] + part[2] + part[3] + part[4] + part[5] + part[6] + part[7];
-        return {static_cast<uint32_t>(sum64(count)), bits_total(sum64(bits)) + 8 * index_sum};
+        return {static_cast<uint32_t>(sum64(count)), sum64(bits) + 8 * index_sum};
     }
-    static uint64_t bits_total(uint64_t value) { return value; }
     template<size_t words>
-    void add_dense(size_t query, const uint64_t *data, size_t in_block, uint32_t base) {
-        Summary &row = rows[query];
-        if (row.count() < kept_ids) {
-            for (size_t w = 0; w < (in_block + 63) / 64; ++w) add_bits(query, data[w], base + static_cast<uint32_t>(w * 64));
-            return;
-        }
+    void add_dense(size_t query, const uint64_t *data, uint32_t base) {
         const auto [count, sum] = dense_stats<words>(data);
+        if (!count) return;
+        Summary &row = rows[query];
+        size_t kept = row.count();
+        if (kept < kept_ids) {
+            auto &first = first_for(row);
+            for (size_t w = 0; w < words && kept < kept_ids; ++w)
+                for (uint64_t bits = data[w]; bits && kept < kept_ids; bits &= bits - 1)
+                    first[kept++] = base + static_cast<uint32_t>(w * 64) + countr_zero(bits);
+        }
         row.total += (uint64_t(base) + (uint64_t(1) << 35)) * count + sum;
     }
     // Merges worker summaries (given in document order) and formats the lines for queries [first, last).
@@ -510,7 +478,7 @@ class Engine {
             if (!line_end) line_end = file_end;
             const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
             if (tab) {
-                line.load(dictionary, tab + 1, line_end, file_end);
+                line.load(tab + 1, line_end, file_end);
                 for (size_t i = 0; i < line.count; ++i)
                     if (uint64_t meta = dictionary.resolve(line.probes[i])) ++frequency[FlatDictionary::term_id(meta)];
             }
@@ -590,7 +558,7 @@ class Engine {
 
     template<size_t block_docs>
     void evaluate_block(const vector<uint64_t> &matrix, const vector<uint64_t> &active,
-                        size_t in_block, uint32_t block_base, Results &results) const {
+                        uint32_t block_base, Results &results) const {
         static constexpr size_t words = block_docs / 64;
         static constexpr uint64_t local_value = uint64_t(1) << 60;
         for (const BooleanQuery &q : boolean_queries) {
@@ -671,7 +639,7 @@ class Engine {
                 for (unsigned j = 0; j < size; ++j) results.add(q.output, block_base + small_position(state, j));
             } else if (state) {
                 const uint64_t *data = state == local_value ? value.data() : matrix.data() + state * words;
-                results.template add_dense<words>(q.output, data, in_block, block_base);
+                results.template add_dense<words>(q.output, data, block_base);
             }
         }
     }
@@ -733,7 +701,7 @@ class Engine {
                 size_t in_block = 0;
                 auto flush = [&] {
                     for (size_t column = 0; column < hot_columns; ++column) active[column] = column + 1;
-                    evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
+                    evaluate_block<block_docs>(matrix, active, block_base, c.results);
                     matrix.resize(base_rows * words);
                     fill(matrix.begin() + words, matrix.end(), 0);
                     fill(active.begin(), active.end(), 0);
@@ -761,7 +729,7 @@ class Engine {
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     size_t anchor_count = 0;
-                    line.load(dictionary, tab + 1, line_end, end);
+                    line.load(tab + 1, line_end, end);
                     const size_t token_count = line.count;
                     const auto *probes = line.probes.data();
                     constexpr size_t kAhead = 8;
@@ -855,7 +823,7 @@ class Engine {
         while (p < end) {
             const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
             if (!line_end) line_end = end;
-            line.load(dictionary, p, line_end, end);
+            line.load(p, line_end, end);
             Query q;
             auto is = [&](size_t i, string_view text) { return line.probes[i].word == text; };
             if (line.count && is(0, "BOOL")) {
