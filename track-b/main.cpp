@@ -450,6 +450,10 @@ class Engine {
             anchor_head[term] = static_cast<int32_t>(phrases.size());
             phrases.push_back(plan);
         }
+        // Cluster Boolean evaluations by first posting to improve block-cache locality.
+        sort(boolean_queries.begin(), boolean_queries.end(), [](const BooleanQuery &a, const BooleanQuery &b) {
+            return a.terms[0] < b.terms[0];
+        });
         dictionary.configure_metadata(boolean_column, anchor_head);
         vector<Query>().swap(queries);
 
