@@ -397,6 +397,7 @@ class Engine {
         array<char, 5> ops{};
         uint8_t count = 0;
         uint32_t output = 0;
+        uint32_t mandatory_gate = numeric_limits<uint32_t>::max();
     };
     vector<BooleanQuery> boolean_queries;
     Results answers;
@@ -427,6 +428,19 @@ class Engine {
                 plan.count = static_cast<uint8_t>(q.term_count);
                 for (size_t i = 0; i < q.term_count; ++i) plan.terms[i] = boolean_column[q.terms[i]];
                 plan.ops = q.ops;
+                size_t last_or_term = 0;
+                for (size_t i = 1; i < q.term_count; ++i)
+                    if (q.ops[i - 1] == 'O') last_or_term = i;
+                uint32_t least_frequency = numeric_limits<uint32_t>::max();
+                for (size_t i = 0; i < q.term_count; ++i) {
+                    bool mandatory = (!last_or_term && !i) ||
+                        (i > last_or_term && q.ops[i - 1] == 'A');
+                    if (mandatory && (plan.mandatory_gate == numeric_limits<uint32_t>::max() ||
+                                      frequency[q.terms[i]] < least_frequency)) {
+                        plan.mandatory_gate = plan.terms[i];
+                        least_frequency = frequency[q.terms[i]];
+                    }
+                }
                 boolean_queries.push_back(plan);
                 continue;
             }
@@ -476,6 +490,7 @@ class Engine {
         static constexpr size_t words = block_docs / 64;
         static constexpr uint32_t local_value = 0x40000000u;
         for (const BooleanQuery &q : boolean_queries) {
+            if (q.mandatory_gate != numeric_limits<uint32_t>::max() && !active[q.mandatory_gate]) continue;
             uint32_t state = active[q.terms[0]];
             array<uint64_t, words> value;
             auto materialize = [&] {
