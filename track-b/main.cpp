@@ -135,6 +135,7 @@ public:
 private:
     vector<Slot> slots;
     vector<string_view> keys;
+    vector<uint64_t> bloom;
 
     static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
         if (word.size() <= 8) {
@@ -231,11 +232,15 @@ public:
     };
     Probe prepare(string_view word, const char *read_end = nullptr) const {
         const auto [hash, key] = fingerprint(word, read_end);
+        if (!bloom.empty()) {
+            uint32_t bit = hash & ((1u << 20) - 1);
+            if (!(bloom[bit >> 6] & (uint64_t(1) << (bit & 63)))) return {word, 0, key};
+        }
         __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
         return {word, hash, key};
     }
     const Slot *resolve(const Probe &probe) const {
-        if (slots.empty()) return nullptr;
+        if (!probe.hash || slots.empty()) return nullptr;
         const auto &[word, hash, key] = probe;
         size_t i = hash & (slots.size() - 1);
         for (;;) {
@@ -269,6 +274,11 @@ public:
             uint32_t head = static_cast<uint32_t>(heads[id] + 1);
             if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
             slot.metadata = id | (uint64_t(column) << 20) | (uint64_t(head) << 40);
+        }
+        bloom.assign(1u << 14, 0);
+        for (string_view word : keys) {
+            uint32_t bit = fingerprint(word).first & ((1u << 20) - 1);
+            bloom[bit >> 6] |= uint64_t(1) << (bit & 63);
         }
     }
 
