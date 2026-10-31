@@ -276,8 +276,9 @@ public:
             slot.metadata = id | (uint64_t(column) << 20) | (uint64_t(head) << 40);
         }
         bloom.assign(1u << 14, 0);
-        for (string_view word : keys) {
-            uint32_t bit = fingerprint(word).first & ((1u << 20) - 1);
+        for (size_t id = 0; id < keys.size(); ++id) {
+            if (columns[id] == numeric_limits<uint32_t>::max() && heads[id] < 0) continue;
+            uint32_t bit = fingerprint(keys[id]).first & ((1u << 20) - 1);
             bloom[bit >> 6] |= uint64_t(1) << (bit & 63);
         }
     }
