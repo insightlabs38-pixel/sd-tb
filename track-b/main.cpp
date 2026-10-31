@@ -452,6 +452,50 @@ public:
         delta += 32u * popcount(bits & 0xffffffff00000000ULL);
         row.total += delta;
     }
+    // Exact count and position sum of a dense bitmap: bytes weigh their index, bits their offset.
+    template<size_t words>
+    static pair<uint32_t, uint64_t> dense_stats(const uint64_t *data) {
+        static_assert(words % 4 == 0);
+        const __m256i pop_lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+        const __m256i weight_lut = _mm256_setr_epi8(0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6);
+        const __m256i low = _mm256_set1_epi8(15), zero = _mm256_setzero_si256(), ones = _mm256_set1_epi16(1);
+        const __m256i lanes = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+        __m256i count = zero, scaled = zero, weighted = zero, bits = zero;
+        for (size_t k = 0; k < words / 4; ++k) {
+            __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data) + k);
+            __m256i lo = _mm256_and_si256(x, low), hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), low);
+            __m256i pop_hi = _mm256_shuffle_epi8(pop_lut, hi);
+            __m256i pop = _mm256_add_epi8(_mm256_shuffle_epi8(pop_lut, lo), pop_hi);
+            // High-nibble bits sit four positions higher, adding four per set bit.
+            __m256i weight = _mm256_add_epi8(_mm256_add_epi8(_mm256_shuffle_epi8(weight_lut, lo), _mm256_shuffle_epi8(weight_lut, hi)),
+                                             _mm256_slli_epi16(_mm256_and_si256(pop_hi, low), 2));
+            __m256i sad = _mm256_sad_epu8(pop, zero);
+            count = _mm256_add_epi64(count, sad);
+            scaled = _mm256_add_epi64(scaled, _mm256_mul_epu32(sad, _mm256_set1_epi64x(static_cast<long long>(32 * k))));
+            bits = _mm256_add_epi64(bits, _mm256_sad_epu8(weight, zero));
+            weighted = _mm256_add_epi32(weighted, _mm256_madd_epi16(_mm256_maddubs_epi16(pop, lanes), ones));
+        }
+        auto sum64 = [](__m256i v) {
+            alignas(32) uint64_t lane[4];
+            _mm256_store_si256(reinterpret_cast<__m256i *>(lane), v);
+            return lane[0] + lane[1] + lane[2] + lane[3];
+        };
+        alignas(32) uint32_t part[8];
+        _mm256_store_si256(reinterpret_cast<__m256i *>(part), weighted);
+        uint64_t index_sum = sum64(scaled) + part[0] + part[1] + part[2] + part[3] + part[4] + part[5] + part[6] + part[7];
+        return {static_cast<uint32_t>(sum64(count)), bits_total(sum64(bits)) + 8 * index_sum};
+    }
+    static uint64_t bits_total(uint64_t value) { return value; }
+    template<size_t words>
+    void add_dense(size_t query, const uint64_t *data, size_t in_block, uint32_t base) {
+        Summary &row = rows[query];
+        if (row.count() < kept_ids) {
+            for (size_t w = 0; w < (in_block + 63) / 64; ++w) add_bits(query, data[w], base + static_cast<uint32_t>(w * 64));
+            return;
+        }
+        const auto [count, sum] = dense_stats<words>(data);
+        row.total += (uint64_t(base) + (uint64_t(1) << 35)) * count + sum;
+    }
     void merge(const Results &source) {
         if (source.rows.empty()) return;
         // Worker ranges are merged in document order.
@@ -690,8 +734,7 @@ class Engine {
                 for (unsigned j = 0; j < size; ++j) results.add(q.output, block_base + small_position(state, j));
             } else if (state) {
                 const uint64_t *data = state == local_value ? value.data() : matrix.data() + state * words;
-                for (size_t w = 0; w < (in_block + 63) / 64; ++w)
-                    results.add_bits(q.output, data[w], block_base + static_cast<uint32_t>(w * 64));
+                results.template add_dense<words>(q.output, data, in_block, block_base);
             }
         }
     }
