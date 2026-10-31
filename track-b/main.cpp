@@ -229,6 +229,12 @@ public:
         uint32_t hash;
         uint64_t key;
     };
+    struct CompactProbe {
+        uint64_t key;
+        uint32_t offset;
+        uint32_t hash_size;
+    };
+    static_assert(sizeof(CompactProbe) == 16);
     Probe prepare(string_view word, const char *read_end = nullptr) const {
         const auto [hash, key] = fingerprint(word, read_end);
         __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
@@ -246,6 +252,10 @@ public:
             i = (i + 1) & (slots.size() - 1);
         }
     }
+    const Slot *resolve(const CompactProbe &probe, const char *base) const {
+        return resolve(Probe{string_view(base + probe.offset, probe.hash_size >> 24),
+                             probe.hash_size & 0xffffffu, probe.key});
+    }
     uint32_t lookup(string_view word, const char *read_end = nullptr) const {
         const Slot *slot = resolve(prepare(word, read_end));
         return slot ? slot->id() : numeric_limits<uint32_t>::max();
@@ -259,6 +269,10 @@ public:
         if ((expected >> 62) != 2) return expected == probe.key;
         return probe.key == ((uint64_t(1) << 63) | static_cast<uint32_t>(expected)) &&
             FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
+    }
+    bool phrase_equal(uint64_t expected, const CompactProbe &probe, const char *base) const {
+        return phrase_equal(expected, Probe{string_view(base + probe.offset, probe.hash_size >> 24),
+                                            probe.hash_size & 0xffffffu, probe.key});
     }
     void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
         // The frozen query limit keeps IDs/columns within 20 bits and heads within 24.
@@ -448,8 +462,8 @@ class Engine {
 
     }
 
-    void match_document(uint32_t doc, const vector<FlatDictionary::Probe> &probes,
-                        span<const pair<uint32_t, int32_t>> anchors,
+    void match_document(uint32_t doc, const vector<FlatDictionary::CompactProbe> &probes,
+                        const char *doc_begin, span<const pair<uint32_t, int32_t>> anchors,
                         Results &results, vector<uint32_t> &last) const {
         for (const auto &[pos, head] : anchors) {
             for (int32_t pid = head; pid >= 0; pid = phrases[pid].next) {
@@ -458,10 +472,10 @@ class Engine {
                 const size_t anchor = plan.anchor, count = plan.count;
                 if (pos < anchor || count - anchor > probes.size() - pos) continue;
                 size_t start = pos - anchor, j = 0;
-                while (j < anchor && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
+                while (j < anchor && dictionary.phrase_equal(plan.keys[j], probes[start + j], doc_begin)) ++j;
                 if (j != anchor) continue;
                 j = anchor + 1;
-                while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
+                while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j], doc_begin)) ++j;
                 if (j == count) {
                     last[pid] = doc;
                     results.add(plan.output, doc);
@@ -581,7 +595,7 @@ class Engine {
                 vector<uint32_t> last(phrases.size(), numeric_limits<uint32_t>::max());
                 vector<pair<uint32_t, int32_t>> anchors;
                 anchors.reserve(128);
-                vector<FlatDictionary::Probe> probes;
+                vector<FlatDictionary::CompactProbe> probes;
                 probes.reserve(1024);
                 const char *p = bounds[idx], *stop = bounds[idx + 1];
                 while (p < stop) {
@@ -601,13 +615,18 @@ class Engine {
                     probes.clear();
                     TokenScanner scanner(tab + 1, line_end);
                     string_view word;
-                    while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    const char *doc_begin = tab + 1;
+                    while (scanner.next(word)) {
+                        auto probe = dictionary.prepare(word, end);
+                        probes.push_back({probe.key, static_cast<uint32_t>(word.data() - doc_begin),
+                                          (probe.hash & 0xffffffu) | (uint32_t(word.size()) << 24)});
+                    }
                     const uint64_t document_bit = uint64_t(1) << (in_block % 64);
                     const size_t document_word = in_block / 64;
                     if (anchors.size() < probes.size()) anchors.resize(probes.size());
                     for (size_t index = 0; index < probes.size(); ++index) {
                         const auto &probe = probes[index];
-                        const auto *entry = dictionary.resolve(probe);
+                        const auto *entry = dictionary.resolve(probe, doc_begin);
                         if (entry) {
                             int32_t head = entry->head();
                             if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
@@ -629,7 +648,7 @@ class Engine {
                             }
                         }
                     }
-                    match_document(doc, probes, {anchors.data(), anchor_count}, c.results, last);
+                    match_document(doc, probes, doc_begin, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
                     if (++in_block == block_docs) flush();
                 }
