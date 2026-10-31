@@ -1,5 +1,6 @@
 #include <algorithm>
-#include <atomic>
+#include <bit>
+#include <immintrin.h>
 #include <array>
 #include <charconv>
 #include <cstdint>
@@ -9,14 +10,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <queue>
 #include <thread>
 #include <exception>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <fcntl.h>
@@ -47,45 +47,144 @@ struct MappedFile {
     MappedFile &operator=(const MappedFile &) = delete;
 };
 
-static inline unsigned char lower_ascii(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + 32) : c;
-}
-static inline bool token_char(unsigned char c) {
-    const unsigned folded = static_cast<unsigned>(c | 0x20u);
-    return ((folded - 'a') < 26u) | ((static_cast<unsigned>(c) - '0') < 10u);
-}
+class TokenScanner {
+    const char *cursor, *end, *base;
+    uint32_t valid = 0;
+    void refill() {
+        base = cursor;
+        size_t count = min<size_t>(end - cursor, 32);
+        alignas(32) char tail[32]{};
+        const char *load = cursor;
+        if (count < 32) {
+            memcpy(tail, cursor, count);
+            load = tail;
+        }
+        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(load));
+        __m256i fold = _mm256_or_si256(bytes, _mm256_set1_epi8(32));
+        __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, _mm256_set1_epi8('a' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), fold));
+        __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, _mm256_set1_epi8('0' - 1)), _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), bytes));
+        valid = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
+        cursor += count;
+    }
+public:
+    TokenScanner(const char *begin, const char *last) : cursor(begin), end(last), base(begin) {}
+    bool next(string_view &word) {
+        while (!valid) {
+            if (cursor == end) return false;
+            refill();
+        }
+        unsigned first = countr_zero(valid);
+        const char *start = base + first;
+        unsigned count = countr_one(valid >> first);
+        if (first + count < 32) {
+            valid &= ~((uint32_t(1) << (first + count)) - 1);
+            word = string_view(start, count);
+            return true;
+        }
+        do {
+            refill();
+            count = countr_one(valid);
+        } while (count == 32);
+        const char *stop = base + count;
+        valid &= ~((uint32_t(1) << count) - 1);
+        word = string_view(start, stop - start);
+        return true;
+    }
+};
+
 struct FoldEqual {
     using is_transparent = void;
     bool operator()(string_view a, string_view b) const noexcept {
         if (a.size() != b.size()) return false;
-        for (size_t i = 0; i < a.size(); ++i)
-            if ((static_cast<unsigned char>(a[i]) | 0x20u) != (static_cast<unsigned char>(b[i]) | 0x20u)) return false;
+        const char *x = a.data(), *y = b.data();
+        size_t count = a.size();
+        while (count >= 8) {
+            uint64_t left, right;
+            memcpy(&left, x, 8);
+            memcpy(&right, y, 8);
+            if ((left | 0x2020202020202020ULL) != (right | 0x2020202020202020ULL)) return false;
+            x += 8; y += 8; count -= 8;
+        }
+        if (count & 4) {
+            uint32_t left, right;
+            memcpy(&left, x, 4); memcpy(&right, y, 4);
+            if ((left | 0x20202020u) != (right | 0x20202020u)) return false;
+            x += 4; y += 4;
+        }
+        if (count & 2) {
+            uint16_t left, right;
+            memcpy(&left, x, 2); memcpy(&right, y, 2);
+            if ((left | 0x2020u) != (right | 0x2020u)) return false;
+            x += 2; y += 2;
+        }
+        if ((count & 1) && ((*x | 32) != (*y | 32))) return false;
         return true;
     }
 };
 
 class FlatDictionary {
+public:
+    // ASCII token bytes leave bit 63 clear; long-token fingerprints set it.
     struct Slot {
-        uint32_t hash = 0;
-        uint32_t id = 0;
+        uint64_t key = 0;
+        uint64_t metadata = 0;
+        uint32_t id() const { return static_cast<uint32_t>(metadata) & 0xfffffu; }
+        uint32_t column() const { return static_cast<uint32_t>(metadata >> 20) & 0xfffffu; }
+        int32_t head() const { return static_cast<int32_t>(metadata >> 40) - 1; }
     };
+private:
     vector<Slot> slots;
     vector<string_view> keys;
 
-    static uint32_t fingerprint(string_view word) {
-        uint32_t hash = 2166136261u;
-        for (unsigned char c : word) {
-            hash ^= lower_ascii(c);
-            hash *= 16777619u;
+    static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
+        if (word.size() <= 8) {
+            uint64_t key = 0;
+            size_t count = word.size();
+            const uint64_t mask = ~uint64_t(0) >> (64 - count * 8);
+            if (read_end && read_end - word.data() >= 8) memcpy(&key, word.data(), 8);
+            else {
+                const char *p = word.data();
+                unsigned shift = 0;
+                if (count & 4) { uint32_t bytes; memcpy(&bytes, p, 4); key = bytes; p += 4; shift = 32; }
+                if (count & 2) { uint16_t bytes; memcpy(&bytes, p, 2); key |= uint64_t(bytes) << shift; p += 2; shift += 16; }
+                if (count & 1) key |= uint64_t(static_cast<unsigned char>(*p)) << shift;
+                if (count == 8) memcpy(&key, word.data(), 8);
+            }
+            key = (key | 0x2020202020202020ULL) & mask;
+            uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+            return {hash ? hash : 1, key};
         }
-        return hash ? hash : 1;
+        uint64_t first;
+        memcpy(&first, word.data(), 8);
+        first |= 0x2020202020202020ULL;
+        uint64_t last;
+        memcpy(&last, word.data() + word.size() - 8, 8);
+        last |= 0x2020202020202020ULL;
+        uint64_t hash64 = _mm_crc32_u64(2166136261u, first);
+        // The frozen 32-byte maximum makes these chunks cover every token byte.
+        if (word.size() > 16) {
+            uint64_t middle;
+            memcpy(&middle, word.data() + 8, 8);
+            hash64 = _mm_crc32_u64(hash64, middle | 0x2020202020202020ULL);
+        }
+        if (word.size() > 24) {
+            uint64_t middle;
+            memcpy(&middle, word.data() + 16, 8);
+            hash64 = _mm_crc32_u64(hash64, middle | 0x2020202020202020ULL);
+        }
+        uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(hash64, last ^ word.size()));
+        hash = hash ? hash : 1;
+        return {hash, (uint64_t(1) << 63) | hash};
     }
     void rehash(size_t capacity) {
         vector<Slot> fresh(capacity);
         for (const Slot &slot : slots) {
-            if (!slot.hash) continue;
-            size_t i = slot.hash & (capacity - 1);
-            while (fresh[i].hash) i = (i + 1) & (capacity - 1);
+            if (!slot.key) continue;
+            uint32_t hash = slot.key >> 63 ? static_cast<uint32_t>(slot.key)
+                : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
+            if (!hash) hash = 1;
+            size_t i = hash & (capacity - 1);
+            while (fresh[i].key) i = (i + 1) & (capacity - 1);
             fresh[i] = slot;
         }
         slots.swap(fresh);
@@ -101,40 +200,87 @@ public:
         if (slots.empty()) rehash(16);
         if ((keys.size() + 1) * 10 >= slots.size() * 7)
             rehash(slots.size() * 2);
-        const uint32_t hash = fingerprint(word);
+        const auto [hash, key] = fingerprint(word);
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             Slot &slot = slots[i];
-            if (!slot.hash) {
+            if (!slot.key) {
                 uint32_t id = static_cast<uint32_t>(keys.size());
                 keys.push_back(word);
-                slot = {hash, id};
+                slot = {key, id};
                 return {id, true};
             }
-            if (slot.hash == hash && FoldEqual{}(keys[slot.id], word))
-                return {slot.id, false};
+            if (slot.key == key && (!(key >> 63) || FoldEqual{}(keys[slot.id()], word)))
+                return {slot.id(), false};
             i = (i + 1) & (slots.size() - 1);
         }
     }
-    uint32_t lookup(string_view word, uint32_t known_hash = 0) const {
-        if (slots.empty()) return numeric_limits<uint32_t>::max();
-        const uint32_t hash = known_hash ? known_hash : fingerprint(word);
+    struct Probe {
+        string_view word;
+        uint32_t hash;
+        uint64_t key;
+    };
+    Probe prepare(string_view word, const char *read_end = nullptr) const {
+        const auto [hash, key] = fingerprint(word, read_end);
+        __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
+        return {word, hash, key};
+    }
+    const Slot *resolve(const Probe &probe) const {
+        if (slots.empty()) return nullptr;
+        const auto &[word, hash, key] = probe;
         size_t i = hash & (slots.size() - 1);
         for (;;) {
             const Slot &slot = slots[i];
-            if (!slot.hash) return numeric_limits<uint32_t>::max();
-            if (slot.hash == hash && FoldEqual{}(keys[slot.id], word))
-                return slot.id;
+            if (!slot.key) return nullptr;
+            if (slot.key == key && (!(key >> 63) || FoldEqual{}(keys[slot.id()], word)))
+                return &slot;
             i = (i + 1) & (slots.size() - 1);
         }
     }
+    uint32_t lookup(string_view word, const char *read_end = nullptr) const {
+        const Slot *slot = resolve(prepare(word, read_end));
+        return slot ? slot->id() : numeric_limits<uint32_t>::max();
+    }
+
+    uint64_t phrase_key(uint32_t term) const {
+        uint64_t key = fingerprint(keys[term]).second;
+        return key | ((key >> 63) ? uint64_t(term) << 32 : 0);
+    }
+    bool phrase_equal(uint64_t expected, const Probe &probe) const {
+        if (!(expected >> 63)) return expected == probe.key;
+        return probe.key == ((uint64_t(1) << 63) | static_cast<uint32_t>(expected)) &&
+            FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
+    }
+    void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
+        // The frozen query limit keeps IDs/columns within 20 bits and heads within 24.
+        if (keys.size() > (1u << 20)) throw runtime_error("query metadata capacity");
+        for (Slot &slot : slots) if (slot.key) {
+            uint32_t id = slot.id();
+            uint32_t column = columns[id] + 1;
+            uint32_t head = static_cast<uint32_t>(heads[id] + 1);
+            if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
+            slot.metadata = id | (uint64_t(column) << 20) | (uint64_t(head) << 40);
+        }
+    }
+
 };
 
 struct Query {
+    array<uint32_t, 8> terms{};
+    array<char, 5> ops{};
+    uint8_t term_count = 0, op_count = 0;
     bool phrase = false;
-    vector<uint32_t> terms;
-    vector<char> ops;
+    void add_term(uint32_t term) {
+        if (term_count == terms.size()) throw runtime_error("too many query terms");
+        terms[term_count++] = term;
+    }
+    void add_operator(char op) {
+        if (op_count == ops.size()) throw runtime_error("too many query operators");
+        ops[op_count++] = op;
+    }
+    span<const uint32_t> words() const { return {terms.data(), term_count}; }
 };
+
 struct Result {
     uint32_t count = 0;
     uint64_t sum = 0;
@@ -144,228 +290,166 @@ struct Result {
         ++count;
         sum += id;
     }
-    void print(ostream &os) const {
-        os << count << ' ' << sum;
-        for (size_t i = 0; i < min<size_t>(count, first.size()); ++i) os << ' ' << first[i];
-        os << '\n';
+    template<class Integer> static char *number(char *p, Integer value) {
+        return to_chars(p, p + 24, value).ptr;
     }
+    char *append(char *p) const {
+        p = number(p, count);
+        *p++ = ' ';
+        p = number(p, sum);
+        for (size_t i = 0; i < min<size_t>(count, first.size()); ++i) {
+            *p++ = ' ';
+            p = number(p, first[i]);
+        }
+        *p++ = '\n';
+        return p;
+    }
+
 };
 
 class Engine {
     FlatDictionary dictionary;
-    vector<vector<uint32_t>> postings;
-    vector<uint32_t> seen;
-    vector<vector<uint32_t>> tape_chunks;
-    vector<vector<uint16_t>> tape16_chunks;
-    vector<uint32_t> tape_bases;
-    vector<uint8_t> doc_chunk;
-    vector<uint32_t> phrase_token;
-    bool compact_tape = false;
-    vector<uint32_t> offsets;
+    static constexpr size_t block_docs = 2048, words = block_docs / 64;
+    size_t term_count = 0;
     vector<Query> queries;
-    vector<int32_t> precomputed_pattern;
-    vector<Result> pattern_results;
-
-    uint32_t phrase_id(uint32_t term) const {
-        return compact_tape ? phrase_token[term] : term + 1;
-    }
-
-    struct ACNode {
-        unordered_map<uint32_t, uint32_t> edges;
-        uint32_t fail = 0;
-        vector<uint32_t> outputs;
+    struct PhrasePlan {
+        uint32_t output = 0;
+        int32_t next = -1;
+        uint8_t count = 0, anchor = 0;
+        array<uint64_t, 8> keys{};
     };
+    vector<PhrasePlan> phrases;
+    size_t query_count = 0;
+    size_t boolean_count = 0;
+    struct BooleanQuery {
+        array<uint32_t, 6> terms{};
+        array<char, 5> ops{};
+        uint8_t count = 0;
+        uint32_t output = 0;
+    };
+    vector<BooleanQuery> boolean_queries;
+    vector<Result> answers;
 
-    void precompute_common_phrases() {
-        const size_t threshold = 500;
-        precomputed_pattern.assign(queries.size(), -1);
-        vector<ACNode> nodes(1);
-        unordered_map<string, uint32_t> dedup;
+    void compile_queries(const MappedFile &input) {
+        // Sampling affects anchor choice, never whether a match is accepted.
+        vector<uint32_t> frequency(term_count);
+        const char *stop = input.data + min<size_t>(input.size, 2u << 20);
+        TokenScanner scanner(input.data, stop);
+        string_view word;
+        while (scanner.next(word)) {
+            uint32_t term = dictionary.lookup(word, input.data + input.size);
+            if (term != numeric_limits<uint32_t>::max()) ++frequency[term];
+        }
+        vector<int32_t> anchor_head(term_count, -1);
+        query_count = queries.size();
+        size_t bool_count = static_cast<size_t>(count_if(queries.begin(), queries.end(), [](const Query &q) { return !q.phrase; }));
+        boolean_queries.reserve(bool_count);
+        phrases.reserve(query_count - bool_count);
+        vector<uint32_t> boolean_column(term_count, numeric_limits<uint32_t>::max());
         for (size_t qi = 0; qi < queries.size(); ++qi) {
             const Query &q = queries[qi];
-            if (!q.phrase) continue;
-            size_t least = numeric_limits<size_t>::max();
-            for (uint32_t t : q.terms) least = min(least, postings[t].size());
-            if (least < threshold) continue;
-            string key;
-            key.reserve(q.terms.size() * sizeof(uint32_t));
-            for (uint32_t t : q.terms)
-                key.append(reinterpret_cast<const char *>(&t), sizeof(t));
-            auto it = dedup.find(key);
-            if (it != dedup.end()) {
-                precomputed_pattern[qi] = static_cast<int32_t>(it->second);
+            if (!q.phrase) {
+                for (uint32_t term : q.words())
+                    if (boolean_column[term] == numeric_limits<uint32_t>::max()) boolean_column[term] = static_cast<uint32_t>(boolean_count++);
+                BooleanQuery plan;
+                plan.output = static_cast<uint32_t>(qi);
+                plan.count = static_cast<uint8_t>(q.term_count);
+                for (size_t i = 0; i < q.term_count; ++i) plan.terms[i] = boolean_column[q.terms[i]];
+                plan.ops = q.ops;
+                boolean_queries.push_back(plan);
                 continue;
             }
-            uint32_t pid = static_cast<uint32_t>(pattern_results.size());
-            dedup.emplace(move(key), pid);
-            pattern_results.emplace_back();
-            precomputed_pattern[qi] = static_cast<int32_t>(pid);
-            uint32_t state = 0;
-            for (uint32_t t : q.terms) {
-                const uint32_t tok = phrase_id(t);
-                auto edge = nodes[state].edges.find(tok);
-                if (edge == nodes[state].edges.end()) {
-                    uint32_t next = static_cast<uint32_t>(nodes.size());
-                    nodes[state].edges.emplace(tok, next);
-                    nodes.emplace_back();
-                    state = next;
-                } else state = edge->second;
-            }
-            nodes[state].outputs.push_back(pid);
+            size_t best = 0;
+            for (size_t i = 1; i < q.term_count; ++i)
+                if (frequency[q.terms[i]] < frequency[q.terms[best]]) best = i;
+            uint32_t term = q.terms[best];
+            PhrasePlan plan;
+            for (size_t i = 0; i < q.term_count; ++i) plan.keys[i] = dictionary.phrase_key(q.terms[i]);
+            plan.output = static_cast<uint32_t>(qi);
+            plan.count = q.term_count;
+            plan.anchor = static_cast<uint8_t>(best);
+            plan.next = anchor_head[term];
+            anchor_head[term] = static_cast<int32_t>(phrases.size());
+            phrases.push_back(plan);
         }
-        if (pattern_results.empty()) return;
-        vector<uint32_t> root_edges(postings.size() + 1, 0);
-        queue<uint32_t> bfs;
-        for (const auto &[tok, next] : nodes[0].edges) {
-            root_edges[tok] = next;
-            nodes[next].fail = 0;
-            bfs.push(next);
-        }
-        while (!bfs.empty()) {
-            uint32_t state = bfs.front(); bfs.pop();
-            for (const auto &[tok, next] : nodes[state].edges) {
-                uint32_t f = nodes[state].fail;
-                while (f && !nodes[f].edges.contains(tok)) f = nodes[f].fail;
-                auto it = nodes[f].edges.find(tok);
-                nodes[next].fail = it == nodes[f].edges.end() ? 0 : it->second;
-                const auto &suffix = nodes[nodes[next].fail].outputs;
-                nodes[next].outputs.insert(nodes[next].outputs.end(), suffix.begin(), suffix.end());
-                bfs.push(next);
-            }
-        }
-        const size_t doc_count = offsets.size() - 1;
-        const size_t workers = doc_count >= 1000
-            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
-        vector<vector<Result>> partial(workers, vector<Result>(pattern_results.size()));
-        vector<exception_ptr> errors(workers);
-        auto scan = [&](size_t worker) {
-            try {
-                vector<uint32_t> last(pattern_results.size(), numeric_limits<uint32_t>::max());
-                const size_t first_doc = doc_count * worker / workers;
-                const size_t last_doc = doc_count * (worker + 1) / workers;
-                for (size_t d = first_doc; d < last_doc; ++d) {
-                    const uint32_t doc = static_cast<uint32_t>(d);
-                    uint32_t state = 0;
-                    const uint32_t chunk = doc_chunk[doc];
-                    const uint32_t base = tape_bases[chunk];
-                    const uint16_t *t16 = compact_tape ? tape16_chunks[chunk].data() : nullptr;
-                    const uint32_t *t32 = compact_tape ? nullptr : tape_chunks[chunk].data();
-                    for (uint32_t i = offsets[doc] - base; i < offsets[doc + 1] - base; ++i) {
-                        uint32_t tok = compact_tape ? t16[i] : t32[i];
-                        while (state) {
-                            auto edge = nodes[state].edges.find(tok);
-                            if (edge != nodes[state].edges.end()) {
-                                state = edge->second;
-                                break;
-                            }
-                            state = nodes[state].fail;
-                        }
-                        if (!state) state = root_edges[tok];
-                        for (uint32_t pid : nodes[state].outputs) {
-                            if (last[pid] != doc) {
-                                last[pid] = doc;
-                                partial[worker][pid].add(doc);
-                            }
-                        }
-                    }
+        dictionary.configure_metadata(boolean_column, anchor_head);
+        vector<Query>().swap(queries);
+
+    }
+
+    void match_document(uint32_t doc, const vector<FlatDictionary::Probe> &probes,
+                        const vector<pair<uint32_t, int32_t>> &anchors,
+                        vector<Result> &results, vector<uint32_t> &last) const {
+        for (const auto &[pos, head] : anchors) {
+            for (int32_t pid = head; pid >= 0; pid = phrases[pid].next) {
+                if (last[pid] == doc) continue;
+                const PhrasePlan &plan = phrases[pid];
+                const size_t anchor = plan.anchor, count = plan.count;
+                if (pos < anchor || count - anchor > probes.size() - pos) continue;
+                size_t start = pos - anchor, j = 0;
+                while (j < anchor && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
+                if (j != anchor) continue;
+                j = anchor + 1;
+                while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
+                if (j == count) {
+                    last[pid] = doc;
+                    results[plan.output].add(doc);
                 }
-            } catch (...) {
-                errors[worker] = current_exception();
-            }
-        };
-        vector<thread> threads;
-        threads.reserve(workers - 1);
-        for (size_t i = 1; i < workers; ++i) threads.emplace_back(scan, i);
-        scan(0);
-        for (thread &t : threads) t.join();
-        for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-        for (size_t pid = 0; pid < pattern_results.size(); ++pid) {
-            Result &dst = pattern_results[pid];
-            for (size_t worker = 0; worker < workers; ++worker) {
-                const Result &src = partial[worker][pid];
-                const size_t kept = min<size_t>(dst.count, dst.first.size());
-                const size_t add = min<size_t>(src.count, dst.first.size() - kept);
-                for (size_t i = 0; i < add; ++i) dst.first[kept + i] = src.first[i];
-                dst.count += src.count;
-                dst.sum += src.sum;
             }
         }
     }
 
-
-    uint32_t intern(string_view word) {
-        auto [id, fresh] = dictionary.intern(word);
-        if (fresh) {
-            postings.emplace_back();
-            seen.push_back(numeric_limits<uint32_t>::max());
-        }
-        return id;
-    }
-
-    void parse_queries(const MappedFile &input) {
-        const char *p = input.data, *end = p + input.size;
-        dictionary.reserve(40000);
-        while (p < end) {
-            const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
-            if (!line_end) line_end = end;
-            string_view line(p, line_end - p);
-            Query q;
-            if (line.starts_with("BOOL ")) {
-                size_t start = 5;
-                bool term = true;
-                while (start < line.size()) {
-                    size_t stop = line.find(' ', start);
-                    if (stop == string_view::npos) stop = line.size();
-                    string_view word = line.substr(start, stop - start);
-                    if (term) q.terms.push_back(intern(word));
-                    else q.ops.push_back(word[0]); // A, O, N are unique
-                    term = !term;
-                    start = stop + 1;
+    void evaluate_block(const vector<uint64_t> &matrix, const vector<uint32_t> &active,
+                        size_t in_block, uint32_t block_base, vector<Result> &results) const {
+        for (const BooleanQuery &q : boolean_queries) {
+            const size_t qi = q.output;
+            bool possible = active[q.terms[0]] != 0;
+            for (size_t i = 0; i < size_t(q.count - 1); ++i) {
+                if (q.ops[i] == 'A') possible &= active[q.terms[i + 1]] != 0;
+                else if (q.ops[i] == 'O') possible |= active[q.terms[i + 1]] != 0;
+            }
+            if (!possible) continue;
+            array<uint64_t, words> value;
+            copy_n(matrix.data() + active[q.terms[0]] * words, words, value.data());
+            for (size_t i = 0; i < size_t(q.count - 1); ++i) {
+                const uint64_t *rhs = matrix.data() + active[q.terms[i + 1]] * words;
+                if (q.ops[i] == 'A') for (size_t w = 0; w < words; ++w) value[w] &= rhs[w];
+                else if (q.ops[i] == 'O') for (size_t w = 0; w < words; ++w) value[w] |= rhs[w];
+                else for (size_t w = 0; w < words; ++w) value[w] &= ~rhs[w];
+            }
+            for (size_t word = 0; word < (in_block + 63) / 64; ++word) {
+                uint64_t bits = value[word];
+                if (!bits) continue;
+                Result &r = results[qi];
+                uint32_t base = block_base + static_cast<uint32_t>(word * 64);
+                uint64_t first = bits;
+                size_t kept = min<size_t>(r.count, r.first.size());
+                while (first && kept < r.first.size()) {
+                    r.first[kept++] = base + countr_zero(first);
+                    first &= first - 1;
                 }
-            } else if (line.starts_with("PHRASE \"") && line.size() >= 9 && line.back() == '"') {
-                q.phrase = true;
-                size_t start = 8, last = line.size() - 1;
-                while (start < last) {
-                    size_t stop = line.find(' ', start);
-                    if (stop == string_view::npos || stop > last) stop = last;
-                    q.terms.push_back(intern(line.substr(start, stop - start)));
-                    start = stop + 1;
-                }
-            } else throw runtime_error("invalid query line");
-            if (q.terms.empty() || (!q.phrase && q.ops.size() + 1 != q.terms.size()))
-                throw runtime_error("invalid query grammar");
-            queries.push_back(move(q));
-            p = line_end < end ? line_end + 1 : end;
+                unsigned count = popcount(bits);
+                r.count += count;
+                r.sum += uint64_t(base) * count;
+                r.sum += popcount(bits & 0xaaaaaaaaaaaaaaaaULL);
+                r.sum += 2u * popcount(bits & 0xccccccccccccccccULL);
+                r.sum += 4u * popcount(bits & 0xf0f0f0f0f0f0f0f0ULL);
+                r.sum += 8u * popcount(bits & 0xff00ff00ff00ff00ULL);
+                r.sum += 16u * popcount(bits & 0xffff0000ffff0000ULL);
+                r.sum += 32u * popcount(bits & 0xffffffff00000000ULL);
+            }
         }
     }
 
-    void configure_tape() {
-        phrase_token.assign(postings.size(), 0);
-        uint32_t next = 0;
-        for (const Query &q : queries) {
-            if (!q.phrase) continue;
-            for (uint32_t term : q.terms)
-                if (!phrase_token[term]) phrase_token[term] = ++next;
-        }
-        compact_tape = next <= numeric_limits<uint16_t>::max();
-        fprintf(stderr, "PHRASE_TAPE16=%d PHRASE_TERMS=%u QUERY_TERMS=%zu\n",
-                int(compact_tape), next, postings.size());
-        if (!compact_tape) phrase_token.clear();
-    }
-
-    void build_index(const MappedFile &input) {
+    void scan_corpus(const MappedFile &input) {
         struct Chunk {
-            vector<uint32_t> tape;
-            vector<uint16_t> tape16;
-            vector<uint32_t> offsets;
-            vector<vector<uint32_t>> postings;
-            vector<uint32_t> seen;
+            vector<Result> results;
             uint32_t first_doc = 0, last_doc = 0;
             size_t docs = 0;
         };
         const char *begin = input.data, *end = begin + input.size;
-        const unsigned cores = max(1u, thread::hardware_concurrency());
-        const size_t workers = input.size >= (8u << 20) ? min<size_t>(4, cores) : 1;
+        const size_t workers = input.size >= (8u << 20)
+            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
         vector<const char *> bounds(workers + 1);
         bounds[0] = begin;
         bounds[workers] = end;
@@ -379,14 +463,25 @@ class Engine {
         auto parse_chunk = [&](size_t idx) {
             try {
                 Chunk &c = chunks[idx];
-                c.postings.resize(postings.size());
-                c.seen.assign(postings.size(), numeric_limits<uint32_t>::max());
+                c.results.resize(query_count);
+                vector<uint64_t> matrix(words);
+                matrix.reserve(words * (boolean_count + 1));
+                vector<uint32_t> active(boolean_count);
+                uint32_t block_base = 0;
+                size_t in_block = 0;
+                auto flush = [&] {
+                    evaluate_block(matrix, active, in_block, block_base, c.results);
+                    matrix.resize(words);
+                    fill(active.begin(), active.end(), 0);
+                    in_block = 0;
+                };
+                vector<uint32_t> last(phrases.size(), numeric_limits<uint32_t>::max());
+                vector<pair<uint32_t, int32_t>> anchors;
+                anchors.reserve(128);
+                vector<FlatDictionary::Probe> probes;
+                probes.reserve(1024);
                 const char *p = bounds[idx], *stop = bounds[idx + 1];
-                if (compact_tape) c.tape16.reserve(static_cast<size_t>(stop - p) / 7);
-                else c.tape.reserve(static_cast<size_t>(stop - p) / 7);
-                c.offsets.reserve(static_cast<size_t>(stop - p) / 500);
                 while (p < stop) {
-                    c.offsets.push_back(static_cast<uint32_t>(compact_tape ? c.tape16.size() : c.tape.size()));
                     const char *line_end = static_cast<const char *>(memchr(p, '\n', stop - p));
                     if (!line_end) line_end = stop;
                     const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
@@ -398,251 +493,119 @@ class Engine {
                     else if (doc != c.last_doc + 1) throw runtime_error("nonconsecutive document id");
                     c.last_doc = doc;
                     ++c.docs;
-                    const char *s = tab + 1;
-                    while (s < line_end) {
-                        while (s < line_end && !token_char(static_cast<unsigned char>(*s))) ++s;
-                        if (s == line_end) break;
-                        const char *start = s;
-                        uint32_t hash = 2166136261u;
-                        do {
-                            const unsigned char c = static_cast<unsigned char>(*s);
-                            hash ^= static_cast<unsigned char>(c | 0x20u);
-                            hash *= 16777619u;
-                            ++s;
-                        } while (s < line_end && token_char(static_cast<unsigned char>(*s)));
-                        if (!hash) hash = 1;
-                        uint32_t term = dictionary.lookup(string_view(start, s - start), hash);
-                        uint32_t id = term == numeric_limits<uint32_t>::max() ? 0 : term + 1;
-                        if (compact_tape)
-                            c.tape16.push_back(id ? static_cast<uint16_t>(phrase_token[id - 1]) : 0);
-                        else c.tape.push_back(id);
-                        if (id && c.seen[id - 1] != doc) {
-                            c.seen[id - 1] = doc;
-                            c.postings[id - 1].push_back(doc);
+                    if (!in_block) block_base = doc;
+                    anchors.clear();
+                    probes.clear();
+                    TokenScanner scanner(tab + 1, line_end);
+                    string_view word;
+                    while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    for (size_t index = 0; index < probes.size(); ++index) {
+                        const auto &probe = probes[index];
+                        const auto *entry = dictionary.resolve(probe);
+                        if (entry) {
+                            int32_t head = entry->head();
+                            if (head >= 0) anchors.emplace_back(static_cast<uint32_t>(index), head);
+                            uint32_t column = entry->column();
+                            if (column) {
+                                --column;
+                                uint32_t &row = active[column];
+                                if (!row) {
+                                    row = static_cast<uint32_t>(matrix.size() / words);
+                                    matrix.resize(matrix.size() + words, 0);
+                                }
+                                matrix[row * words + in_block / 64] |= uint64_t(1) << (in_block % 64);
+                            }
                         }
                     }
+                    match_document(doc, probes, anchors, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
+                    if (++in_block == block_docs) flush();
                 }
-                c.offsets.push_back(static_cast<uint32_t>(compact_tape ? c.tape16.size() : c.tape.size()));
-            } catch (...) {
-                errors[idx] = current_exception();
-            }
+                if (in_block) flush();
+            } catch (...) { errors[idx] = current_exception(); }
         };
         vector<thread> threads;
-        threads.reserve(workers - 1);
         for (size_t i = 1; i < workers; ++i) threads.emplace_back(parse_chunk, i);
         parse_chunk(0);
         for (thread &t : threads) t.join();
         for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-
-        size_t total_tokens = 0, total_docs = 0;
+        answers.swap(chunks[0].results);
+        uint32_t expected_doc = 0;
         for (const Chunk &c : chunks) {
-            total_tokens += compact_tape ? c.tape16.size() : c.tape.size();
-            total_docs += c.docs;
-        }
-        tape_chunks.reserve(chunks.size());
-        tape16_chunks.reserve(chunks.size());
-        tape_bases.reserve(chunks.size());
-        doc_chunk.reserve(total_docs);
-        offsets.reserve(total_docs + 1);
-        uint32_t expected_doc = 0, base = 0;
-        for (size_t ci = 0; ci < chunks.size(); ++ci) {
-            Chunk &c = chunks[ci];
-            if (c.docs && c.first_doc != expected_doc)
-                throw runtime_error("nonconsecutive document chunks");
+            if (c.docs && c.first_doc != expected_doc) throw runtime_error("nonconsecutive document chunks");
             expected_doc += static_cast<uint32_t>(c.docs);
-            tape_bases.push_back(base);
-            for (size_t j = 0; j < c.docs; ++j) {
-                offsets.push_back(base + c.offsets[j]);
-                doc_chunk.push_back(static_cast<uint8_t>(ci));
-            }
-            base += static_cast<uint32_t>(compact_tape ? c.tape16.size() : c.tape.size());
-            if (compact_tape) tape16_chunks.push_back(move(c.tape16));
-            else tape_chunks.push_back(move(c.tape));
-        }
-        offsets.push_back(base);
-        for (size_t term = 0; term < postings.size(); ++term) {
-            size_t total = 0;
-            for (const Chunk &c : chunks) total += c.postings[term].size();
-            postings[term].reserve(total);
-            for (const Chunk &c : chunks) {
-                const auto &part = c.postings[term];
-                postings[term].insert(postings[term].end(), part.begin(), part.end());
+            for (size_t qi = 0; qi < c.results.size(); ++qi) {
+                Result &dst = answers[qi];
+                const Result &src = c.results[qi];
+                size_t kept = min<size_t>(dst.count, dst.first.size());
+                size_t add = min<size_t>(src.count, dst.first.size() - kept);
+                for (size_t i = 0; i < add; ++i) dst.first[kept + i] = src.first[i];
+                dst.count += src.count;
+                dst.sum += src.sum;
             }
         }
+
     }
 
-    bool contains_phrase(uint32_t doc, const vector<uint32_t> &terms,
-                         size_t anchor) const {
-        const uint32_t chunk = doc_chunk[doc];
-        const uint32_t base = tape_bases[chunk];
-        const uint32_t begin = offsets[doc] - base, end = offsets[doc + 1] - base;
-        const size_t k = terms.size();
-        if (end - begin < k) return false;
-        const uint16_t *t16 = compact_tape ? tape16_chunks[chunk].data() : nullptr;
-        const uint32_t *t32 = compact_tape ? nullptr : tape_chunks[chunk].data();
-        auto at = [&](uint32_t i) -> uint32_t {
-            return compact_tape ? t16[i] : t32[i];
-        };
-        const uint32_t key = phrase_id(terms[anchor]);
-        for (uint32_t i = begin + anchor; i + k - anchor <= end; ++i) {
-            if (at(i) != key) continue;
-            const uint32_t start = i - static_cast<uint32_t>(anchor);
-            size_t j = 0;
-            while (j < k && at(start + j) == phrase_id(terms[j])) ++j;
-            if (j == k) return true;
-        }
-        return false;
+    uint32_t intern(string_view word) {
+        auto [id, fresh] = dictionary.intern(word);
+        if (fresh) ++term_count;
+        return id;
     }
 
-    Result run_phrase(const Query &q) const {
-        size_t best = 0;
-        for (size_t i = 1; i < q.terms.size(); ++i)
-            if (postings[q.terms[i]].size() < postings[q.terms[best]].size()) best = i;
-        Result r;
-        for (uint32_t doc : postings[q.terms[best]])
-            if (contains_phrase(doc, q.terms, best)) r.add(doc);
-        return r;
-    }
-
-    Result run_bool(const Query &q, vector<uint32_t> &work, vector<uint32_t> &tmp) const {
-        const vector<uint32_t> &initial = postings[q.terms[0]];
-        if (q.ops.empty()) {
-            Result r;
-            for (uint32_t id : initial) r.add(id);
-            return r;
-        }
-        // A final AND/NOT suffix can only remove documents from its AND terms.
-        size_t last_or = q.ops.size();
-        for (size_t i = 0; i < q.ops.size(); ++i)
-            if (q.ops[i] == 'O') last_or = i;
-        size_t anchor = last_or == q.ops.size() ? 0 : q.terms.size();
-        for (size_t i = 0; i < q.ops.size(); ++i) {
-            if (q.ops[i] != 'A' || (last_or != q.ops.size() && i <= last_or))
-                continue;
-            if (anchor == q.terms.size() ||
-                postings[q.terms[i + 1]].size() < postings[q.terms[anchor]].size())
-                anchor = i + 1;
-        }
-        if (anchor != q.terms.size()) {
-            const auto &candidates = postings[q.terms[anchor]];
-            uint64_t merge_work = initial.size();
-            for (size_t i = 1; i < q.terms.size(); ++i)
-                merge_work += postings[q.terms[i]].size();
-            if (candidates.empty() ||
-                (candidates.size() <= 8192 &&
-                 candidates.size() * (q.terms.size() * 12) < merge_work)) {
-                Result result;
-                for (uint32_t doc : candidates) {
-                    bool match = anchor == 0 ||
-                        binary_search(initial.begin(), initial.end(), doc);
-                    if (!match && last_or == q.ops.size()) continue;
-                    for (size_t step = 0; step < q.ops.size(); ++step) {
-                        const auto &rhs = postings[q.terms[step + 1]];
-                        bool present = step + 1 == anchor ||
-                            binary_search(rhs.begin(), rhs.end(), doc);
-                        switch (q.ops[step]) {
-                            case 'A': match = match && present; break;
-                            case 'O': match = match || present; break;
-                            case 'N': match = match && !present; break;
-                            default: throw runtime_error("invalid boolean operator");
-                        }
-                        if (!match && (last_or == q.ops.size() || step >= last_or))
-                            break;
-                    }
-                    if (match) result.add(doc);
+    void parse_queries(const MappedFile &input) {
+        const char *p = input.data, *end = p + input.size;
+        dictionary.reserve(40000);
+        queries.reserve(static_cast<size_t>(count(input.data, input.data + input.size, '\n')));
+        while (p < end) {
+            const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
+            if (!line_end) line_end = end;
+            string_view line(p, line_end - p);
+            Query q;
+            if (line.starts_with("BOOL ")) {
+                size_t start = 5;
+                bool term = true;
+                while (start < line.size()) {
+                    size_t stop = line.find(' ', start);
+                    if (stop == string_view::npos) stop = line.size();
+                    string_view word = line.substr(start, stop - start);
+                    if (term) q.add_term(intern(word));
+                    else q.add_operator(word[0]); // A, O, N are unique
+                    term = !term;
+                    start = stop + 1;
                 }
-                return result;
-            }
+            } else if (line.starts_with("PHRASE \"") && line.size() >= 9 && line.back() == '"') {
+                q.phrase = true;
+                size_t start = 8, last = line.size() - 1;
+                while (start < last) {
+                    size_t stop = line.find(' ', start);
+                    if (stop == string_view::npos || stop > last) stop = last;
+                    q.add_term(intern(line.substr(start, stop - start)));
+                    start = stop + 1;
+                }
+            } else throw runtime_error("invalid query line");
+            if (q.term_count == 0 || (!q.phrase && q.op_count + 1 != q.term_count))
+                throw runtime_error("invalid query grammar");
+            queries.push_back(move(q));
+            p = line_end < end ? line_end + 1 : end;
         }
-        work.assign(initial.begin(), initial.end());
-        for (size_t step = 0; step < q.ops.size(); ++step) {
-            const vector<uint32_t> &rhs = postings[q.terms[step + 1]];
-            char op = q.ops[step];
-            tmp.clear();
-            if (op == 'A') {
-                if (work.size() * 16 < rhs.size()) {
-                    for (uint32_t doc : work)
-                        if (binary_search(rhs.begin(), rhs.end(), doc))
-                            tmp.push_back(doc);
-                } else if (rhs.size() * 16 < work.size()) {
-                    for (uint32_t doc : rhs)
-                        if (binary_search(work.begin(), work.end(), doc))
-                            tmp.push_back(doc);
-                } else {
-                    size_t i = 0, j = 0;
-                    while (i < work.size() && j < rhs.size()) {
-                        if (work[i] < rhs[j]) ++i;
-                        else if (rhs[j] < work[i]) ++j;
-                        else { tmp.push_back(work[i]); ++i; ++j; }
-                    }
-                }
-            } else if (op == 'O') {
-                size_t i = 0, j = 0;
-                while (i < work.size() && j < rhs.size()) {
-                    if (work[i] < rhs[j]) tmp.push_back(work[i++]);
-                    else if (rhs[j] < work[i]) tmp.push_back(rhs[j++]);
-                    else { tmp.push_back(work[i]); ++i; ++j; }
-                }
-                tmp.insert(tmp.end(), work.begin() + i, work.end());
-                tmp.insert(tmp.end(), rhs.begin() + j, rhs.end());
-            } else if (op == 'N') {
-                size_t i = 0, j = 0;
-                while (i < work.size() && j < rhs.size()) {
-                    if (work[i] < rhs[j]) tmp.push_back(work[i++]);
-                    else if (rhs[j] < work[i]) ++j;
-                    else { ++i; ++j; }
-                }
-                tmp.insert(tmp.end(), work.begin() + i, work.end());
-            } else throw runtime_error("invalid boolean operator");
-            work.swap(tmp);
-        }
-        Result r;
-        for (uint32_t id : work) r.add(id);
-        return r;
     }
 
 public:
     void run(const string &data_dir, const string &out_dir) {
         MappedFile query_file(data_dir + "/queries.txt");
         parse_queries(query_file);
-        configure_tape();
         MappedFile docs_file(data_dir + "/docs.txt");
-        build_index(docs_file);
-        precompute_common_phrases();
+        compile_queries(docs_file);
+        scan_corpus(docs_file);
         filesystem::create_directories(out_dir);
         ofstream output(out_dir + "/results.txt", ios::binary);
         if (!output) throw runtime_error("cannot open output");
-        vector<Result> results(queries.size());
-        const size_t workers = queries.size() >= 1000
-            ? min<size_t>(4, max(1u, thread::hardware_concurrency())) : 1;
-        vector<exception_ptr> errors(workers);
-        atomic<size_t> next_query{0};
-        auto evaluate = [&](size_t worker) {
-            try {
-                vector<uint32_t> work, tmp;
-                for (;;) {
-                    const size_t first = next_query.fetch_add(64, memory_order_relaxed);
-                    if (first >= queries.size()) break;
-                    const size_t last = min(first + 64, queries.size());
-                    for (size_t qi = first; qi < last; ++qi) {
-                    const Query &q = queries[qi];
-                    results[qi] = precomputed_pattern[qi] >= 0
-                        ? pattern_results[precomputed_pattern[qi]]
-                        : (q.phrase ? run_phrase(q) : run_bool(q, work, tmp));
-                    }
-                }
-            } catch (...) {
-                errors[worker] = current_exception();
-            }
-        };
-        vector<thread> threads;
-        threads.reserve(workers - 1);
-        for (size_t i = 1; i < workers; ++i) threads.emplace_back(evaluate, i);
-        evaluate(0);
-        for (thread &t : threads) t.join();
-        for (const exception_ptr &e : errors) if (e) rethrow_exception(e);
-        for (const Result &r : results) r.print(output);
+        array<char, 256> line;
+        for (const Result &r : answers) {
+            char *end = r.append(line.data());
+            output.write(line.data(), end - line.data());
+        }
         if (!output) throw runtime_error("output write failure");
     }
 };
