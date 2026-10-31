@@ -93,24 +93,8 @@ private:
     vector<string_view> keys;
     vector<uint64_t> fingerprints;
 
-    static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
-        if (word.size() <= 8) {
-            uint64_t key = 0;
-            size_t count = word.size();
-            const uint64_t mask = ~uint64_t(0) >> (64 - count * 8);
-            if (read_end && read_end - word.data() >= 8) memcpy(&key, word.data(), 8);
-            else {
-                const char *p = word.data();
-                unsigned shift = 0;
-                if (count & 4) { uint32_t bytes; memcpy(&bytes, p, 4); key = bytes; p += 4; shift = 32; }
-                if (count & 2) { uint16_t bytes; memcpy(&bytes, p, 2); key |= uint64_t(bytes) << shift; p += 2; shift += 16; }
-                if (count & 1) key |= uint64_t(static_cast<unsigned char>(*p)) << shift;
-                if (count == 8) memcpy(&key, word.data(), 8);
-            }
-            key = (key | 0x2020202020202020ULL) & mask;
-            uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
-            return {hash ? hash : 1, key};
-        }
+    // Fingerprint of a token longer than eight bytes; shorter tokens are keyed by prepare_line.
+    static pair<uint32_t, uint64_t> fingerprint(string_view word) {
         uint64_t first;
         memcpy(&first, word.data(), 8);
         first |= 0x2020202020202020ULL;
@@ -177,29 +161,29 @@ public:
         while (buckets_needed * 2 < count) buckets_needed *= 2;
         grow(buckets_needed);
     }
-    pair<uint32_t, bool> intern(string_view word) {
+    uint32_t intern(const Probe &probe) {
         // The frozen query limit keeps IDs and columns within 20 bits.
         if (keys.size() + 2 >= (1u << 20)) throw runtime_error("query metadata capacity");
         if (buckets.empty()) grow(1024);
         else if (keys.size() > buckets.size() * 2) grow(buckets.size() * 2);
-        const auto [hash, key] = fingerprint(word);
-        for (size_t b = hash & bucket_mask;; b = (b + 1) & bucket_mask) {
+        for (size_t b = probe.hash & bucket_mask;; b = (b + 1) & bucket_mask) {
             Bucket &bucket = buckets[b];
-            for (unsigned hit = match_mask(bucket, key); hit; hit &= hit - 1) {
+            for (unsigned hit = match_mask(bucket, probe.key); hit; hit &= hit - 1) {
                 uint32_t id = term_id(bucket.meta[countr_zero(hit)]);
-                if ((key >> 62) != 2 || FoldEqual{}(keys[id], word)) return {id, false};
+                if ((probe.key >> 62) != 2 || FoldEqual{}(keys[id], probe.word)) return id;
             }
             for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) {
                 uint32_t id = static_cast<uint32_t>(keys.size());
-                keys.push_back(word);
-                fingerprints.push_back(key);
-                bucket.keys[i] = key;
+                keys.push_back(probe.word);
+                fingerprints.push_back(probe.key);
+                bucket.keys[i] = probe.key;
                 bucket.meta[i] = id + 1;
-                return {id, true};
+                return id;
             }
         }
     }
     static uint32_t term_id(uint64_t meta) { return (static_cast<uint32_t>(meta) & 0xfffffu) - 1; }
+    size_t size() const { return keys.size(); }
     size_t term_length(uint32_t term) const { return keys[term].size(); }
     void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
         for (Bucket &bucket : buckets) for (unsigned i = 0; i < 4; ++i) if (bucket.keys[i]) {
@@ -210,10 +194,6 @@ public:
             if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
             bucket.meta[i] = (id + 1) | (uint64_t(column) << 20) | (uint64_t(head) << 40);
         }
-    }
-    Probe prepare(string_view word, const char *read_end = nullptr) const {
-        const auto [hash, key] = fingerprint(word, read_end);
-        return {word, hash, key};
     }
     // Writes every token boundary (start, end, start, end, ...) of [b, b+len) to bounds.
     // b must be readable for len+64 bytes; returns the boundary count (twice the token count).
@@ -239,7 +219,7 @@ public:
         return n;
     }
     // Fingerprints every token; 1-8 byte tokens take a branch-free batch path, the rest a scalar one.
-    void prepare_line(const char *b, size_t n, const uint32_t *bounds, Probe *out, uint32_t *longs, const char *read_end) const {
+    void prepare_line(const char *b, size_t n, const uint32_t *bounds, Probe *out, uint32_t *longs) const {
         size_t nl = 0;
         for (size_t i = 0; i < n; ++i) {
             uint32_t s = bounds[2 * i], len = bounds[2 * i + 1] - s;
@@ -252,7 +232,10 @@ public:
             longs[nl] = static_cast<uint32_t>(i);
             nl += len > 8;
         }
-        for (size_t k = 0; k < nl; ++k) out[longs[k]] = prepare(out[longs[k]].word, read_end);
+        for (size_t k = 0; k < nl; ++k) {
+            Probe &probe = out[longs[k]];
+            tie(probe.hash, probe.key) = fingerprint(probe.word);
+        }
     }
     void prefetch(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
     // Returns the metadata word, or zero on a miss; long-token matches are verified byte for byte.
@@ -292,19 +275,21 @@ struct LineTokens {
     vector<char> tail;
     size_t count = 0;
     void load(const FlatDictionary &dictionary, const char *text, const char *line_end, const char *file_end) {
+        const char *original = text;
         size_t length = line_end - text;
-        const char *read_end = file_end;
-        if (file_end - line_end < 128) {
+        const bool padded = file_end - line_end < 128;
+        if (padded) {
             // Only the file's last lines need a padded copy so SIMD loads stay in bounds.
             tail.assign(length + 128, 0);
             memcpy(tail.data(), text, length);
             text = tail.data();
-            read_end = nullptr;
         }
         size_t capacity = length / 2 + 40;
         if (longs.size() < capacity) { bounds.resize(2 * capacity + 8); longs.resize(capacity); probes.resize(capacity); }
         count = FlatDictionary::tokenize(text, length, bounds.data()) / 2;
-        dictionary.prepare_line(text, count, bounds.data(), probes.data(), longs.data(), read_end);
+        dictionary.prepare_line(text, count, bounds.data(), probes.data(), longs.data());
+        // Words always refer to the original bytes, never to the temporary copy.
+        if (padded) for (size_t i = 0; i < count; ++i) probes[i].word = string_view(original + (probes[i].word.data() - text), probes[i].word.size());
     }
 };
 
@@ -480,7 +465,6 @@ class Engine {
         uint64_t difference = (state ^ (uint64_t(position) * lanes)) | ~valid;
         return ((difference - lanes) & ~difference & (lanes << 11)) != 0;
     }
-    size_t term_count = 0;
     vector<Query> queries;
     struct PhrasePlan {
         uint32_t output = 0;
@@ -507,6 +491,7 @@ class Engine {
     size_t hot_columns = 0;
     void compile_queries(const MappedFile &input) {
         // Sampling affects anchor choice, never whether a match is accepted.
+        const size_t term_count = dictionary.size();
         vector<uint32_t> frequency(term_count);
         const char *file_end = input.data + input.size, *stop = input.data + min<size_t>(input.size, sample_bytes);
         LineTokens line;
@@ -824,42 +809,26 @@ class Engine {
         for (const string &chunk : text) out.write(chunk.data(), chunk.size());
     }
 
-    uint32_t intern(string_view word) {
-        auto [id, fresh] = dictionary.intern(word);
-        if (fresh) ++term_count;
-        return id;
-    }
-
     void parse_queries(const MappedFile &input) {
         const char *p = input.data, *end = p + input.size;
         dictionary.reserve(input.size / 24);
         queries.reserve(input.size / 20);
+        LineTokens line;
         while (p < end) {
             const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
             if (!line_end) line_end = end;
-            string_view line(p, line_end - p);
+            line.load(dictionary, p, line_end, end);
             Query q;
-            if (line.starts_with("BOOL ")) {
-                size_t start = 5;
-                bool term = true;
-                while (start < line.size()) {
-                    size_t stop = line.find(' ', start);
-                    if (stop == string_view::npos) stop = line.size();
-                    string_view word = line.substr(start, stop - start);
-                    if (term) q.add_term(intern(word));
-                    else q.add_operator(word[0]); // A, O, N are unique
-                    term = !term;
-                    start = stop + 1;
+            auto is = [&](size_t i, string_view text) { return line.probes[i].word == text; };
+            if (line.count && is(0, "BOOL")) {
+                // Terms and operators alternate; A, O and N identify AND, OR and NOT.
+                for (size_t i = 1; i < line.count; ++i) {
+                    if (i % 2) q.add_term(dictionary.intern(line.probes[i]));
+                    else q.add_operator(line.probes[i].word[0]);
                 }
-            } else if (line.starts_with("PHRASE \"") && line.size() >= 9 && line.back() == '"') {
+            } else if (line.count && is(0, "PHRASE")) {
                 q.phrase = true;
-                size_t start = 8, last = line.size() - 1;
-                while (start < last) {
-                    size_t stop = line.find(' ', start);
-                    if (stop == string_view::npos || stop > last) stop = last;
-                    q.add_term(intern(line.substr(start, stop - start)));
-                    start = stop + 1;
-                }
+                for (size_t i = 1; i < line.count; ++i) q.add_term(dictionary.intern(line.probes[i]));
             } else throw runtime_error("invalid query line");
             if (q.term_count == 0 || (!q.phrase && q.op_count + 1 != q.term_count))
                 throw runtime_error("invalid query grammar");
