@@ -260,6 +260,11 @@ Development host (4 cores, GCC 13), seed 1, full corpus, interleaved min of 9-11
 4 workers 391 -> 242 ms; 12 workers 408 -> 246 ms; anonymous memory 38.5 -> 42.1 MB (12 workers). Seed 2 matches the
 independent Python reference byte for byte. These are runner and development-host measurements, not board scores.
 
+Worker scaling on the 4-vCPU SMT runner ([sweep 41247058378](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41247058378), final source, 7 paired runs, seeds 1/2 mean T):
+2 workers **0.419 s**, 3 workers **0.369 s**, 4 workers **0.332 s** (best, equals the logical CPU count), 6 **0.344 s**, 8 **0.357 s**, 12 **0.377 s**, 16 **0.382 s**;
+peak memory 17 / 21 / 23 / 29 / 35 / 46 / 58 MB; champion (12 workers) 0.526 s / 42.6 MB. Using both SMT siblings is worth ~21% over one thread per core, and
+oversubscription costs ~5-15%, so one worker per logical CPU (at most twelve) is the right default; the 12-logical-CPU scoring host keeps 12.
+
 ### Handoff for Luna (exact source)
 
 * Source: `track-b/main.cpp` at `a84e0b5d0ddd844bfe5a8b7eb7318ce09bf277a6` on `branch/festive-hawking-wn31k1`, blob
