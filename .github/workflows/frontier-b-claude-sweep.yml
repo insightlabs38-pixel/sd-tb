@@ -1,6 +1,9 @@
 name: Frontier B parameter sweep
 on:
   workflow_dispatch:
+  push:
+    branches: [branch/festive-hawking-wn31k1]
+    paths: [experiments/frontier/sweep.trigger]
 permissions:
   contents: read
 jobs:

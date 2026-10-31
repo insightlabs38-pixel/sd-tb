@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [branch/festive-hawking-wn31k1, frontier/b-claude-postings-20261031]
-    paths: [track-b/main.cpp, experiments/frontier/**, tests/**, .github/workflows/frontier-b-claude.yml]
+    paths: [track-b/main.cpp, tests/**, .github/workflows/frontier-b-claude.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
 permissions:
   contents: read
 concurrency:
