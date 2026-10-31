@@ -135,6 +135,9 @@ public:
 private:
     vector<Slot> slots;
     vector<string_view> keys;
+    struct alignas(64) Bucket { uint64_t keys[4]; uint64_t meta[4]; };
+    vector<Bucket> buckets;
+    size_t bucket_mask = 0;
 
     static pair<uint32_t, uint64_t> fingerprint(string_view word, const char *read_end = nullptr) {
         if (word.size() <= 8) {
@@ -234,6 +237,7 @@ public:
         __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
         return {word, hash, key};
     }
+    void prefetch(const Probe &probe) const { __builtin_prefetch(&slots[probe.hash & (slots.size() - 1)], 0, 3); }
     const Slot *resolve(const Probe &probe) const {
         if (slots.empty()) return nullptr;
         const auto &[word, hash, key] = probe;
@@ -245,6 +249,61 @@ public:
                 return &slot;
             i = (i + 1) & (slots.size() - 1);
         }
+    }
+
+    // Writes every token boundary (start, end, start, end, ...) of [b, b+len) to bounds.
+    // b must be readable for len+64 bytes; returns the boundary count (twice the token count).
+    static size_t tokenize(const char *b, size_t len, uint32_t *bounds) {
+        const __m256i z = _mm256_set1_epi8('a' - 1), zz = _mm256_set1_epi8('z' + 1);
+        const __m256i d0 = _mm256_set1_epi8('0' - 1), d9 = _mm256_set1_epi8('9' + 1), bit = _mm256_set1_epi8(32);
+        auto classify = [&](const char *p) -> uint32_t {
+            __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+            __m256i fold = _mm256_or_si256(bytes, bit);
+            __m256i letters = _mm256_and_si256(_mm256_cmpgt_epi8(fold, z), _mm256_cmpgt_epi8(zz, fold));
+            __m256i digits = _mm256_and_si256(_mm256_cmpgt_epi8(bytes, d0), _mm256_cmpgt_epi8(d9, bytes));
+            return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
+        };
+        uint64_t carry = 0;
+        size_t n = 0;
+        for (size_t off = 0; off <= len; off += 64) {
+            uint64_t m = classify(b + off) | (uint64_t(classify(b + off + 32)) << 32);
+            size_t rem = len - off;
+            if (rem < 64) m &= rem ? ~uint64_t(0) >> (64 - rem) : 0;
+            uint64_t t = m ^ ((m << 1) | carry);
+            carry = m >> 63;
+            const unsigned count = popcount(t);
+            uint32_t *out = bounds + n;
+            for (unsigned k = 0; k < count; k += 4) {
+                out[k] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
+                out[k + 1] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
+                out[k + 2] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
+                out[k + 3] = static_cast<uint32_t>(off) + countr_zero(t); t &= t - 1;
+            }
+            n += count;
+        }
+        return n;
+    }
+    // Fingerprints and prefetches every token; 1-8 byte tokens take a branch-free batch path.
+    size_t prepare_line(const char *b, size_t n, const uint32_t *bounds,
+                        Probe *out, uint32_t *longs, const char *read_end) const {
+        size_t nl = 0;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t s = bounds[2 * i], len = bounds[2 * i + 1] - s;
+            uint64_t word;
+            memcpy(&word, b + s, 8);
+            unsigned used = len < 8 ? len : 8;
+            uint64_t key = (word | 0x2020202020202020ULL) & (~uint64_t(0) >> (64 - used * 8));
+            uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+            hash = hash ? hash : 1;
+            out[i] = {string_view(b + s, len), hash, key};
+            longs[nl] = static_cast<uint32_t>(i);
+            nl += len > 8;
+        }
+        for (size_t k = 0; k < nl; ++k) {
+            Probe &probe = out[longs[k]];
+            probe = prepare(probe.word, read_end);
+        }
+        return n;
     }
     uint32_t lookup(string_view word, const char *read_end = nullptr) const {
         const Slot *slot = resolve(prepare(word, read_end));
@@ -269,6 +328,55 @@ public:
             uint32_t head = static_cast<uint32_t>(heads[id] + 1);
             if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
             slot.metadata = id | (uint64_t(column) << 20) | (uint64_t(head) << 40);
+        }
+        build_buckets();
+    }
+    // Four-way buckets: overflow spills linearly into following buckets.
+    void build_buckets() {
+        size_t count = 1024;
+        while (count * 2 < keys.size()) count *= 2;
+        buckets.assign(count, Bucket{});
+        bucket_mask = count - 1;
+        for (const Slot &slot : slots) if (slot.key) {
+            uint32_t hash = (slot.key >> 62) == 2 ? static_cast<uint32_t>(slot.key)
+                : static_cast<uint32_t>(_mm_crc32_u64(2166136261u, slot.key));
+            if (!hash) hash = 1;
+            for (size_t b = hash & bucket_mask;; b = (b + 1) & bucket_mask) {
+                unsigned used = 0;
+                while (used < 4 && buckets[b].keys[used]) ++used;
+                if (used < 4) { buckets[b].keys[used] = slot.key; buckets[b].meta[used] = slot.metadata; break; }
+            }
+        }
+    }
+    void prefetch_bucket(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
+    // Returns slot metadata, or zero on a miss; long-token matches are verified byte for byte.
+    uint64_t resolve_meta(const Probe &probe) const {
+        const size_t mask = bucket_mask;
+        size_t b = probe.hash & mask;
+        for (;;) {
+            const Bucket &bucket = buckets[b];
+            __m256i eq = _mm256_cmpeq_epi64(_mm256_load_si256(reinterpret_cast<const __m256i *>(bucket.keys)), _mm256_set1_epi64x(static_cast<long long>(probe.key)));
+            unsigned hit = static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(eq)));
+            if (__builtin_expect(hit != 0, 1)) {
+                uint64_t meta = bucket.meta[countr_zero(hit)];
+                if (__builtin_expect((probe.key >> 62) == 2, 0) && !FoldEqual{}(keys[static_cast<uint32_t>(meta) & 0xfffffu], probe.word)) {
+                    // Equal 32-bit fingerprint but different bytes: keep scanning later slots.
+                    if (hit & (hit - 1)) { /* unreachable: keys unique per fingerprint+bytes handled below */ }
+                    return resolve_long_slow(probe, b);
+                }
+                return meta;
+            }
+            if (bucket.keys[3] == 0) return 0;
+            b = (b + 1) & mask;
+        }
+    }
+    uint64_t resolve_long_slow(const Probe &probe, size_t b) const {
+        for (;; b = (b + 1) & bucket_mask) {
+            const Bucket &bucket = buckets[b];
+            for (unsigned i = 0; i < 4; ++i) {
+                if (bucket.keys[i] == probe.key && FoldEqual{}(keys[static_cast<uint32_t>(bucket.meta[i]) & 0xfffffu], probe.word)) return bucket.meta[i];
+            }
+            if (bucket.keys[3] == 0) return 0;
         }
     }
 
@@ -469,12 +577,15 @@ class Engine {
             anchor_head[term] = static_cast<int32_t>(phrases.size());
             phrases.push_back(plan);
         }
+        sort(boolean_queries.begin(), boolean_queries.end(), [](const BooleanQuery &a, const BooleanQuery &b) {
+            return a.terms < b.terms;
+        });
         dictionary.configure_metadata(boolean_column, anchor_head);
         vector<Query>().swap(queries);
 
     }
 
-    void match_document(uint32_t doc, const vector<FlatDictionary::Probe> &probes,
+    void match_document(uint32_t doc, span<const FlatDictionary::Probe> probes,
                         span<const pair<uint32_t, int32_t>> anchors,
                         Results &results, vector<uint32_t> &last) const {
         for (const auto &[pos, head] : anchors) {
@@ -624,7 +735,8 @@ class Engine {
                 vector<pair<uint32_t, int32_t>> anchors;
                 anchors.reserve(128);
                 vector<FlatDictionary::Probe> probes;
-                probes.reserve(1024);
+                vector<uint32_t> edges, longs;
+                vector<char> tail;
                 const char *p = bounds[idx], *stop = bounds[idx + 1];
                 while (p < stop) {
                     const char *line_end = static_cast<const char *>(memchr(p, '\n', stop - p));
@@ -640,20 +752,33 @@ class Engine {
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     size_t anchor_count = 0;
-                    probes.clear();
-                    TokenScanner scanner(tab + 1, line_end);
-                    string_view word;
-                    while (scanner.next(word)) probes.push_back(dictionary.prepare(word, end));
+                    const char *text = tab + 1;
+                    size_t text_len = line_end - text;
+                    const char *read_end = end;
+                    if (end - line_end < 128) {
+                        // Only the file's last lines need a padded copy so SIMD loads stay in bounds.
+                        tail.assign(text_len + 128, 0);
+                        memcpy(tail.data(), text, text_len);
+                        text = tail.data();
+                        read_end = nullptr;
+                    }
+                    size_t capacity = text_len / 2 + 40;
+                    if (longs.size() < capacity) { edges.resize(2 * capacity + 8); longs.resize(capacity); probes.resize(capacity); }
+                    constexpr size_t kAhead = 8;
+                    size_t token_count = FlatDictionary::tokenize(text, text_len, edges.data()) / 2;
+                    dictionary.prepare_line(text, token_count, edges.data(), probes.data(), longs.data(), read_end);
+                    for (size_t i = 0; i < kAhead && i < token_count; ++i) dictionary.prefetch_bucket(probes[i]);
                     const uint64_t document_bit = uint64_t(1) << (in_block % 64);
                     const size_t document_word = in_block / 64;
-                    if (anchors.size() < probes.size()) anchors.resize(probes.size());
-                    for (size_t index = 0; index < probes.size(); ++index) {
+                    if (anchors.size() < token_count) anchors.resize(token_count);
+                    for (size_t index = 0; index < token_count; ++index) {
+                        if (index + kAhead < token_count) dictionary.prefetch_bucket(probes[index + kAhead]);
                         const auto &probe = probes[index];
-                        const auto *entry = dictionary.resolve(probe);
-                        if (entry) {
-                            int32_t head = entry->head();
+                        const uint64_t entry = dictionary.resolve_meta(probe);
+                        {
+                            int32_t head = static_cast<int32_t>(entry >> 40) - 1;
                             if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
-                            uint32_t column = entry->column();
+                            uint32_t column = static_cast<uint32_t>(entry >> 20) & 0xfffffu;
                             if (column) {
                                 --column;
                                 uint64_t &row = active[column];
@@ -680,7 +805,7 @@ class Engine {
                             }
                         }
                     }
-                    match_document(doc, probes, {anchors.data(), anchor_count}, c.results, last);
+                    match_document(doc, {probes.data(), token_count}, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
                     if (++in_block == block_docs) flush();
                 }
