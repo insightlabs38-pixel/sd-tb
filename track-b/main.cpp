@@ -503,6 +503,9 @@ class Engine {
 
     // A short corpus prefix ranks phrase terms by rarity; ties prefer longer words. Only speed depends on it.
     static constexpr size_t sample_bytes = 512u << 10;
+    // Boolean terms seen at least hot_min times in the sample get permanent rows, at most hot_cap of them.
+    static constexpr size_t hot_min = 4, hot_cap = 3000;
+    size_t hot_columns = 0;
     void compile_queries(const MappedFile &input) {
         // Sampling affects anchor choice, never whether a match is accepted.
         vector<uint32_t> frequency(term_count);
@@ -525,6 +528,18 @@ class Engine {
         boolean_queries.reserve(bool_count);
         phrases.reserve(query_count - bool_count);
         vector<uint32_t> boolean_column(term_count, numeric_limits<uint32_t>::max());
+        {   // Frequent Boolean terms take the first columns and permanent bitmap rows.
+            vector<uint32_t> hot;
+            vector<uint8_t> seen(term_count);
+            for (const Query &q : queries) if (!q.phrase) for (uint32_t term : q.words())
+                if (!seen[term]++ && frequency[term] >= hot_min) hot.push_back(term);
+            if (hot.size() > hot_cap) {
+                nth_element(hot.begin(), hot.begin() + hot_cap, hot.end(), [&](uint32_t a, uint32_t b) { return frequency[a] > frequency[b]; });
+                hot.resize(hot_cap);
+            }
+            for (uint32_t term : hot) boolean_column[term] = static_cast<uint32_t>(boolean_count++);
+            hot_columns = boolean_count;
+        }
         for (size_t qi = 0; qi < queries.size(); ++qi) {
             const Query &q = queries[qi];
             if (!q.phrase) {
@@ -691,14 +706,24 @@ class Engine {
             try {
                 Chunk &c = chunks[idx];
                 c.results.reset(query_count);
-                vector<uint64_t> matrix(words);
-                matrix.reserve(words * (boolean_count + 1));
+                // Row 0 is empty, rows 1..hot_columns are permanent hot rows, the next row absorbs non-hot writes.
+                const size_t base_rows = hot_columns + 2;
+                vector<uint64_t> matrix(words * base_rows);
+                matrix.reserve(words * (boolean_count + 2));
+                vector<uint32_t> cold(1024);
                 vector<uint64_t> active(boolean_count);
                 uint32_t block_base = 0;
                 size_t in_block = 0;
                 auto flush = [&] {
+                    for (size_t column = 0; column < hot_columns; ++column) {
+                        const uint64_t *hot_row = matrix.data() + (column + 1) * words;
+                        uint64_t any = 0;
+                        for (size_t w = 0; w < words; ++w) any |= hot_row[w];
+                        active[column] = any ? column + 1 : 0;
+                    }
                     evaluate_block<block_docs>(matrix, active, in_block, block_base, c.results);
-                    matrix.resize(words);
+                    matrix.resize(base_rows * words);
+                    fill(matrix.begin() + words, matrix.end(), 0);
                     fill(active.begin(), active.end(), 0);
                     in_block = 0;
                 };
@@ -728,40 +753,45 @@ class Engine {
                     for (size_t i = 0; i < kAhead && i < token_count; ++i) dictionary.prefetch(probes[i]);
                     const uint64_t document_bit = uint64_t(1) << (in_block % 64);
                     const size_t document_word = in_block / 64;
-                    if (anchors.size() < token_count) anchors.resize(token_count);
+                    if (anchors.size() < token_count + 1) anchors.resize(token_count + 1);
+                    if (cold.size() < token_count) cold.resize(token_count);
+                    uint64_t *hot_rows = matrix.data();
+                    size_t cold_count = 0;
                     for (size_t index = 0; index < token_count; ++index) {
                         if (index + kAhead < token_count) dictionary.prefetch(probes[index + kAhead]);
-                        const auto &probe = probes[index];
-                        const uint64_t entry = dictionary.resolve(probe);
-                        {
-                            int32_t head = static_cast<int32_t>(entry >> 40) - 1;
-                            if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
-                            uint32_t column = static_cast<uint32_t>(entry >> 20) & 0xfffffu;
-                            if (column) {
-                                --column;
-                                uint64_t &row = active[column];
-                                unsigned size = small_count(row);
-                                if (!row) row = (uint64_t(1) << small_shift) | in_block;
-                                else if (size) {
-                                    if (small_position(row, size - 1) != in_block) {
-                                        if (size < small_limit) {
-                                            row = (row & ((uint64_t(1) << small_shift) - 1)) |
-                                                (uint64_t(in_block) << (size * position_bits)) |
-                                                (uint64_t(size + 1) << small_shift);
-                                        } else {
-                                            uint64_t previous = row;
-                                            row = matrix.size() / words;
-                                            matrix.resize(matrix.size() + words, 0);
-                                            for (unsigned j = 0; j < small_limit; ++j) {
-                                                uint32_t position = small_position(previous, j);
-                                                matrix[row * words + position / 64] |= uint64_t(1) << (position % 64);
-                                            }
-                                            matrix[row * words + document_word] |= document_bit;
-                                        }
+                        const uint64_t entry = dictionary.resolve(probes[index]);
+                        const int32_t head = static_cast<int32_t>(entry >> 40) - 1;
+                        anchors[anchor_count] = {static_cast<uint32_t>(index), head};
+                        anchor_count += head >= 0;
+                        const uint32_t column = static_cast<uint32_t>(entry >> 20) & 0xfffffu;
+                        const bool hot = column - 1 < hot_columns;
+                        hot_rows[(hot ? column : hot_columns + 1) * words + document_word] |= document_bit;
+                        cold[cold_count] = column;
+                        cold_count += column > hot_columns;
+                    }
+                    for (size_t k = 0; k < cold_count; ++k) {
+                        const uint32_t column = cold[k] - 1;
+                        uint64_t &row = active[column];
+                        unsigned size = small_count(row);
+                        if (!row) row = (uint64_t(1) << small_shift) | in_block;
+                        else if (size) {
+                            if (small_position(row, size - 1) != in_block) {
+                                if (size < small_limit) {
+                                    row = (row & ((uint64_t(1) << small_shift) - 1)) |
+                                        (uint64_t(in_block) << (size * position_bits)) |
+                                        (uint64_t(size + 1) << small_shift);
+                                } else {
+                                    uint64_t previous = row;
+                                    row = matrix.size() / words;
+                                    matrix.resize(matrix.size() + words, 0);
+                                    for (unsigned j = 0; j < small_limit; ++j) {
+                                        uint32_t position = small_position(previous, j);
+                                        matrix[row * words + position / 64] |= uint64_t(1) << (position % 64);
                                     }
-                                } else matrix[row * words + document_word] |= document_bit;
+                                    matrix[row * words + document_word] |= document_bit;
+                                }
                             }
-                        }
+                        } else matrix[row * words + document_word] |= document_bit;
                     }
                     match_document(doc, {probes, token_count}, {anchors.data(), anchor_count}, c.results, last);
                     p = line_end < stop ? line_end + 1 : stop;
