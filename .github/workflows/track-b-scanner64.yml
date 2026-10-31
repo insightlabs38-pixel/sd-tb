@@ -1,0 +1,68 @@
+name: Track B 64-byte scanner qualification
+on:
+  push:
+    branches: [track-b/scanner64]
+    paths: [.github/workflows/track-b-scanner64.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-scanner64
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compile and differential exactness
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer fetch --depth 1 origin 3e365d15d9905a0d73c9f05207d434a654666d3c
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          git show 48887044d40a71753a28b5386f2b015ad4605371:track-b/main.cpp > /tmp/scanner-base.cpp
+          for variant in base candidate; do
+            if [ "$variant" = base ]; then src=/tmp/scanner-base.cpp; else src=track-b/main.cpp; fi
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "$src" -o "/tmp/scanner-$variant"
+          done
+          python3 tests/differential.py /tmp/scanner-candidate
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/scanner-sanitized
+          python3 tests/differential.py /tmp/scanner-sanitized
+      - name: Generate independent full seeds
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/scanner-data-$seed"
+          done
+          mkdir -p /tmp/scanner-ref-2
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/scanner-data-2 --out /tmp/scanner-ref-2
+      - name: Paired production-flag timings and hashes
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/scanner-out
+          for seed in 1 2; do
+            for repeat in 1 2 3; do
+              for variant in base candidate; do
+                echo "SCANNER64 seed=$seed repeat=$repeat variant=$variant"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/scanner-$variant" --data "/tmp/scanner-data-$seed" --out /tmp/scanner-out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/scanner-out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/scanner-out/results.txt /tmp/scanner-ref-2/results.txt
+                fi
+              done
+            done
+          done
+      - name: Pinned offline Docker sample
+        run: |
+          set -euo pipefail
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/scanner-sample
+          mkdir -p /tmp/scanner-docker-out
+          chmod 777 /tmp/scanner-docker-out
+          docker build --network=none -t sd-scanner64:verify track-b
+          docker run --rm --user 65534:65534 --network=none --read-only \
+            -v /tmp/scanner-sample:/data:ro -v /tmp/scanner-docker-out:/out:rw sd-scanner64:verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/scanner-docker-out/results.txt' | sha256sum -c -
