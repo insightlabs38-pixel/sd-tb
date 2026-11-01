@@ -224,7 +224,7 @@ static bool small_has(u64 s, u32 p) {
 
 struct Worker {
   vector<u64> rows, state, totals, keys, pending;
-  vector<u32> edge, ids, longs, cold, last, touched;
+  vector<u32> edge, longs, cold, last, touched;
   vector<pair<u32, int>> anchors;
   u64 value[kWords];
 };
@@ -604,11 +604,11 @@ struct Engine {
   void process(Worker &w, u32 doc, u32 slot, const char *text, size_t n) {
     if (w.edge.size() < n + 72) {
       w.edge.resize(n + 72), w.anchors.resize(n / 2 + 1), w.keys.resize(n / 2 + 1);
-      for (auto *v : {&w.ids, &w.longs, &w.cold})
+      for (auto *v : {&w.longs, &w.cold})
         v->resize(n / 2 + 1);
     }
     u32 count = edges(text, n, w.edge.data()) / 2, cold = 0, anchors = 0,
-        nlong = 0, word = slot / 64, *e = w.edge.data(), *ids = w.ids.data();
+        nlong = 0, word = slot / 64, *e = w.edge.data();
     u64 bit = u64(1) << slot % 64, *rows = w.rows.data(), *keys = w.keys.data();
     for (u32 k = 0; k < count; k++) { // Long tokens are keyed afterwards.
       u32 len = e[2 * k + 1] - e[2 * k];
@@ -622,25 +622,29 @@ struct Engine {
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
     // Keep dictionary prefetches near their use instead of prefetching an
     // entire document's random buckets before the first lookup.
-    for (u32 k = 0; k < count; k++)
-      ids[k] = hash_of(keys[k]) & dict.mask();
     constexpr u32 lookahead = 8;
-    for (u32 k = 0; k < min(count, lookahead); k++)
-      _mm_prefetch((const char *)&dict.buckets[ids[k]], _MM_HINT_T0);
-    const u32 hot = this->hot, *bucket = ids;
+    u32 bucket[lookahead];
+    for (u32 k = 0; k < min(count, lookahead); k++) {
+      bucket[k] = hash_of(keys[k]) & dict.mask();
+      _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
+    }
+    const u32 hot = this->hot;
     u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
-      if (k + lookahead < count)
-        _mm_prefetch((const char *)&dict.buckets[ids[k + lookahead]], _MM_HINT_T0);
-      keys[k] = dict.find(text + e[2 * k], keys[k], bucket[k]);
+      u32 at = bucket[k % lookahead];
+      if (k + lookahead < count) {
+        u32 next = hash_of(keys[k + lookahead]) & dict.mask();
+        bucket[k % lookahead] = next;
+        _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
+      }
+      keys[k] = dict.find(text + e[2 * k], keys[k], at);
       u32 col = keys[k] >> 20 & 0xfffff;
       _mm_prefetch((const char *)&rows[(col & -u32(col <= hot)) * kWords + word], _MM_HINT_T0);
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
-      ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
       colds[cold] = col;
       cold += col > hot;
@@ -671,7 +675,7 @@ struct Engine {
         u32 p = w.anchors[a].first, j = 0;
         if (w.last[k] == doc || p < f.anchor || p - f.anchor + f.n > count)
           continue;
-        while (j < f.n && ids[p - f.anchor + j] == f.term[j])
+        while (j < f.n && (keys[p - f.anchor + j] & 0xfffff) == f.term[j])
           j++;
         if (j == f.n)
           w.last[k] = doc, first[f.query].total += (u64(1) << 35) + doc,
