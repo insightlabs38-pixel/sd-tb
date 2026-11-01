@@ -1,5 +1,5 @@
 name: Track B compact engine five-seed qualification
-# Pin the qualified compact source and compare with the verified main champion.
+# Compare the shorter compact variant against the newly promoted compact main.
 on:
   workflow_dispatch:
   push:
@@ -8,10 +8,10 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: track-b-implicit-document-ids-11
+  group: track-b-compact-vs-promoted-11
   cancel-in-progress: true
 env:
-  CHAMPION: 28f8d09024eb534c88d8e34a1cf324f0c4e078f9
+  CHAMPION: c1b9e90f3916f009e4b3d3d64f3395ba0a680b6a
 jobs:
   qualify:
     runs-on: ubuntu-24.04
