@@ -1,0 +1,110 @@
+name: B breakthrough length-sharded exact dictionary
+on:
+  push:
+    branches:
+      - 'research/b-breakthrough-20261101-length-sharded-dictionary'
+    paths:
+      - 'experiments/breakthrough/**'
+      - '.github/workflows/b-length-shards.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: b-length-shards-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin organizer and compile full engines
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          mkdir -p /tmp/bin /tmp/evidence /tmp/baseline /tmp/challenger
+          src=experiments/breakthrough/length_shards.cpp
+          test -n "$src"
+          printf '%s\n' "$src" | tee /tmp/evidence/candidate-path.txt
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/bin/base
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "$src" -o /tmp/bin/challenger
+          cp track-b/Dockerfile /tmp/baseline/
+          cp track-b/main.cpp /tmp/baseline/main.cpp
+          cp track-b/Dockerfile /tmp/challenger/
+          cp "$src" /tmp/challenger/main.cpp
+          docker build --network=none -t breakthrough:base /tmp/baseline
+          docker build --network=none -t breakthrough:challenger /tmp/challenger
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bin/sd-timer
+      - name: Fast independent correctness, adversarial and sanitizers
+        run: |
+          set -euo pipefail
+          src=$(cat /tmp/evidence/candidate-path.txt)
+          python3 tests/differential.py /tmp/bin/challenger
+          python3 tests/frontier_adversarial.py /tmp/bin/challenger
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie "$src" -o /tmp/bin/asan
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/differential.py /tmp/bin/asan
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/asan
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie "$src" -o /tmp/bin/tsan
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/tsan
+      - name: Official sample, tiny, and full independent seeds
+        run: |
+          set -euo pipefail
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/sample-1
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/tiny-7
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/tiny-7 --out /tmp/ref-tiny
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"
+            if [ "$seed" != 1 ]; then
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/data-$seed" --out "/tmp/ref-$seed"
+            fi
+          done
+          mkdir -p /tmp/verify
+          /tmp/bin/challenger --data /tmp/sample-1 --out /tmp/verify
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/verify/results.txt' | sha256sum -c -
+          /tmp/bin/challenger --data /tmp/tiny-7 --out /tmp/verify
+          cmp /tmp/verify/results.txt /tmp/ref-tiny/results.txt
+      - name: Repeated paired pinned-Docker cgroup benchmarks
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then
+              expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else
+              expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1)
+            fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --repeat 5 --results /tmp/evidence/measurements.jsonl breakthrough:base breakthrough:challenger
+          done
+          sudo python3 experiments/frontier/compare.py --data /tmp/sample-1 --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl breakthrough:challenger
+      - name: Static size and ratio summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, math, statistics
+          from pathlib import Path
+          path=Path('/tmp/evidence/measurements.jsonl')
+          if not path.exists(): exit(0)
+          rows=[json.loads(x) for x in path.read_text().splitlines()]
+          summary={}
+          for seed in sorted(set(r['seed'] for r in rows)):
+              group=[r for r in rows if r['seed']==seed]
+              a=[r['T'] for r in group if r['image']=='breakthrough:base']
+              b=[r['T'] for r in group if r['image']=='breakthrough:challenger']
+              am=max(r['M'] for r in group if r['image']=='breakthrough:base')
+              bm=max(r['M'] for r in group if r['image']=='breakthrough:challenger')
+              summary[seed]={'base_T_median_s':statistics.median(a),'candidate_T_median_s':statistics.median(b),'speedup':statistics.median(a)/statistics.median(b),'base_cgroup_memory_bytes':am,'candidate_cgroup_memory_bytes':bm}
+          Path('/tmp/evidence/summary.json').write_text(json.dumps(summary,indent=2))
+          print(json.dumps(summary,indent=2))
+          PY
+          src=$(cat /tmp/evidence/candidate-path.txt)
+          wc -l "$src" track-b/main.cpp | tee /tmp/evidence/source-lines.txt
+          git rev-parse HEAD > /tmp/evidence/commit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b-breakthrough-evidence
+          path: /tmp/evidence/
