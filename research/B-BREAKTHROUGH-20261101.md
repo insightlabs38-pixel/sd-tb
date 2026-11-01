@@ -1,6 +1,6 @@
 # Track B breakthrough campaign: research receipts, November 1, 2026
 
-**In progress. No production candidate qualified for integration.**
+**Current pass: multiple full-engine architectures measured; none has qualified for integration.**
 All tests in separate `research/b-breakthrough-20261101*` branches; `main`, scheduled developer branches, and `sd-sm` unchanged.
 
 ## Official baseline
@@ -82,3 +82,66 @@ Other research avenue: query-aware rare anchor evaluation integrated into the co
 representation, not the 2-second unordered-map postings prototype.
 
 **No integration performed. This is a dated, interim evidence ledger.**
+
+## Follow-up exact full-engine experiments (November 1)
+All repeat timings below are matched seed/runner medians, NOT official scoring host results.
+
+### Exact-key compressed stream, full qualification
+Branch `research/b-breakthrough-20261101-compressed-exact`, head
+`1bbc318f5e33efb3f230f419fa9311e3850bfa8e`.
+[CI 41290098418](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290098418)
+passed exact differential/adversarial (including 338k distinct tokens), full seeds
+1/2/3, 5 paired repetitions and pinned offline read-only Docker.
+Candidate median T=0.27/0.26/0.26 s; contemporaneous C++ champion=0.22/0.20/0.20 s.
+Compared sample host, process RSS ~300MB KiB-scale /usr/bin/time KB vs ~272MB KiB-scale.
+Loss. Public upstream MIT code hash-only equality was **not** accepted: on every
+candidate fingerprint match this research version verifies full exact key bytes.
+
+### Exact compact-key compressed stream
+Branch `research/b-breakthrough-20261101-compact-exact`, source commit
+`ca1375782d714325604be92e40422198c09efef6`,
+[CI 41290613100](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290613100)
+passed all three full seeds, five paired repeats, differential/adversarial and Docker.
+Candidate scalar packed-key T=0.29/0.27/0.27 s; compressed predecessor
+0.26/0.25/0.25 s; C++ champion 0.20/0.19/0.19 s. Loss.
+
+### Exact BMI2/SIMD packing repair
+Branch `research/b-breakthrough-20261101-compact-bmi2`, source commit
+`30fabf2acea2984d953ab496818d811bd76278f1`, CI head
+`fd64e677304c90cf6c030020e84bf81f0a080025`.
+[CI 41291072193](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291072193)
+passed all differential/adversarial and three-full-seed five-repeat plus Docker
+checks. Candidate T=0.41/0.42/0.41 s, prior scalar=0.44/0.44/0.44 s,
+C++ champ=0.32/0.32/0.32 s. Repair gains 5-7% against scalar on that
+runner, but not enough to beat production (28-31% slower).
+
+### Bloom-gated exact dictionary prefilter
+Branch `research/b-breakthrough-20261101-bloom-filter`,
+source `61e57320a3cba00300a5101495b39c55b4ff55b6`,
+CI head `2b0c95e8542ef29f3fdc47148d3e22214813b18c`.
+[CI 41290748429](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290748429)
+passed full exact seeds 1/2/3 five times, differential/adversarial,
+ASan+UBSan and pinned offline Docker. Bloom candidate median 0.41/0.41/0.41 s
+vs champion 0.32/0.32/0.32 s, no material memory reduction. Loss.
+
+### Pinned cgroup K qualification in progress
+[Run 41291188697](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291188697)
+on `research/b-breakthrough-20261101-report` at
+`a36cde782ad488d49b8ceb869fe1469c126f892c` uses organizer pinned
+sd-timer, cgroup memory.peak, full exact independent seeds, canonical
+formatting, scc source count and D=1. Four independent Docker images:
+champion, Bloom gated, compressed exact, BMI2 exact. Results are
+runner-local and not submission scores.
+
+## Proven decision and continuation
+**Do not integrate any candidate from these rounds:** no consistent full
+end-to-end gain was found against main champion.
+The difference between exact small-key fusion and hash-only shortcut is critical:
+the latter fails the exact-identity requirement even if its probability of
+collision is low. The scan-stage bottleneck remains the highest-value research
+area, especially replacing redundant dictionary probes, avoiding per-token
+side effects and scheduling document work to eliminate memory stalls without
+additional lookups.
+The temporary `research/b-breakthrough-20261101-query-dag` branch is a reservation
+only, not implemented or benchmarked: low prefix reuse argued against this path.
+No developer or production branch was changed by this work.
