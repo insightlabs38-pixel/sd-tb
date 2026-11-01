@@ -1,4 +1,4 @@
-name: Track B implicit document-ID qualification
+name: Track B implicit document-ID five-seed confirmation
 on:
   workflow_dispatch:
   push:
@@ -48,7 +48,7 @@ jobs:
       - name: Organizer corpora and references
         run: |
           set -euo pipefail
-          for seed in 1 2 3; do
+          for seed in 1 2 3 4 5; do
             python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"
             if [ "$seed" != 1 ]; then python3 /tmp/organizer/reference/b_index.py --data "/tmp/data-$seed" --out "/tmp/ref-$seed"; fi
           done
@@ -58,10 +58,10 @@ jobs:
       - name: Paired production Docker measurements
         run: |
           set -euo pipefail
-          for seed in 1 2 3; do
+          for seed in 1 2 3 4 5; do
             if [ "$seed" = 1 ]; then expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
             else expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1); fi
-            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --repeat 5 --results /tmp/evidence/measurements.jsonl frontier:champion frontier:candidate
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --repeat 7 --results /tmp/evidence/measurements.jsonl frontier:champion frontier:candidate
           done
           sudo python3 experiments/frontier/compare.py --data /tmp/sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl frontier:candidate
           expected=$(sha256sum /tmp/ref-tiny/results.txt | cut -d' ' -f1)
@@ -84,5 +84,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: track-b-implicit-document-ids-evidence
+          name: track-b-implicit-document-ids-five-seed-evidence
           path: /tmp/evidence/
