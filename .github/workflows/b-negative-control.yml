@@ -21,7 +21,8 @@ jobs:
           mkdir -p /tmp/bctrl/evidence /tmp/bctrl/bin
           git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/bctrl/organizer
           git -C /tmp/bctrl/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
-          cp track-b/main.cpp /tmp/bctrl/base.cpp\n          git rev-parse HEAD > /tmp/bctrl/evidence/ci-head.txt
+          cp track-b/main.cpp /tmp/bctrl/base.cpp
+          git rev-parse HEAD > /tmp/bctrl/evidence/ci-head.txt
           for variant in base ctrl19 ctrl20 ctrl21 ctrl22; do
             mkdir -p "/tmp/bctrl/$variant"
             cp track-b/Dockerfile "/tmp/bctrl/$variant/Dockerfile"
