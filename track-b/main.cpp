@@ -639,8 +639,6 @@ struct Engine {
         _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
       keys[k] = dict.find(text + e[2 * k], keys[k], at);
-      u32 col = keys[k] >> 20 & 0xfffff;
-      _mm_prefetch((const char *)&rows[(col & -u32(col <= hot)) * kWords + word], _MM_HINT_T0);
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
