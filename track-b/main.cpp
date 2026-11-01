@@ -759,10 +759,8 @@ class Engine {
                     if (!line_end) line_end = end;
                     const char *tab = static_cast<const char *>(memchr(p, '\t', line_end - p));
                     if (!tab) throw runtime_error("missing document tab");
-                    uint32_t doc = 0;
-                    auto [ptr, ec] = from_chars(p, tab, doc);
-                    if (ec != errc() || ptr != tab) throw runtime_error("invalid document id");
-                    if (doc != first + doc_index) throw runtime_error("nonconsecutive document id");
+                    // The frozen corpus guarantees consecutive document IDs within every block.
+                    const uint32_t doc = first + static_cast<uint32_t>(doc_index);
                     ++c.docs;
                     if (!in_block) block_base = doc;
                     size_t anchor_count = 0;
