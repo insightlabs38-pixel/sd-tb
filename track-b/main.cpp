@@ -633,7 +633,6 @@ struct Engine {
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
-      ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
       colds[cold] = col;
       cold += col > hot;
@@ -664,7 +663,7 @@ struct Engine {
         u32 p = w.anchors[a].first, j = 0;
         if (w.last[k] == doc || p < f.anchor || p - f.anchor + f.n > count)
           continue;
-        while (j < f.n && ids[p - f.anchor + j] == f.term[j])
+        while (j < f.n && (keys[p - f.anchor + j] & 0xfffff) == f.term[j])
           j++;
         if (j == f.n)
           w.last[k] = doc, first[f.query].total += (u64(1) << 35) + doc,
