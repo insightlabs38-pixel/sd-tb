@@ -15,6 +15,7 @@
 //!    bitmap term starts the query or is OR-ed in.
 use std::arch::x86_64::*;
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -127,7 +128,7 @@ fn hash(k: __m256i) -> u64 {
 /// stored or read back: with some 600,000 distinct tokens and 76,000 terms,
 /// a false match has a chance of about 1 in 10^9 per run. A token that is no
 /// term gets the id one past the last term, so callers need no branch.
-const ID_BITS: u32 = 18; // ids below 2^18 - 1
+const ID_BITS: u32 = 20; // exact-key term dictionary supports adversarial 338k-term corpora
 
 struct Terms {
     slot: Vec<u64>,
@@ -464,6 +465,70 @@ impl Units {
 }
 
 
+
+fn fallback_many_terms(text: &[u8], spans: &[(bool, u32, u32)], ids: &[u32], ops: &[u8], keys: &[[u8; 32]]) {
+    // Only for an adversarial number of query terms beyond the packed unit format.
+    let mut dict: HashMap<[u8; 32], u32> = HashMap::with_capacity(keys.len());
+    for (i, &k) in keys.iter().enumerate() { dict.insert(k, i as u32); }
+    let mut results: Vec<(u64, u64, Vec<u32>)> = (0..spans.len()).map(|_| (0, 0, Vec::new())).collect();
+    for line in text.split(|&x| x == b'\n').filter(|x| !x.is_empty()) {
+        let Some(tab) = line.iter().position(|&x| x == b'\t') else { continue };
+        let doc = number(line, 0);
+        let mut tokens = Vec::new();
+        let body = &line[tab + 1..];
+        let mut pos = 0usize;
+        while pos < body.len() {
+            if !body[pos].is_ascii_alphanumeric() { pos += 1; continue; }
+            let start = pos;
+            while pos < body.len() && body[pos].is_ascii_alphanumeric() { pos += 1; }
+            let len = pos - start;
+            let mut k = [0u8; 32];
+            if len <= 32 {
+                for i in 0..len { k[i] = body[start + i].to_ascii_lowercase(); }
+                tokens.push(dict.get(&k).copied().unwrap_or(NONE));
+            } else { tokens.push(NONE); }
+        }
+        if tokens.iter().all(|&x| x == NONE) { continue; }
+        let present: HashSet<u32> = tokens.iter().copied().filter(|&x| x != NONE).collect();
+        for (qidx, &(phrase, start, stop)) in spans.iter().enumerate() {
+            let first = start as usize;
+            let last = stop as usize;
+            let truth = if phrase {
+                let expected = &ids[first..last];
+                tokens.windows(expected.len()).any(|window| window == expected)
+            } else {
+                let mut state = present.contains(&ids[first]);
+                for k in first + 1..last {
+                    let matched = present.contains(&ids[k]);
+                    match ops[k-1] {
+                        b'A' => state &= matched,
+                        b'O' => state |= matched,
+                        b'N' => state &= !matched,
+                        _ => unreachable!("operator"),
+                    }
+                }
+                state
+            };
+            if truth {
+                let r = &mut results[qidx];
+                r.0 += 1;
+                r.1 += doc as u64;
+                if r.2.len() < 10 { r.2.push(doc); }
+            }
+        }
+    }
+    let outdir = std::env::var("B_OUT_DIR").unwrap_or_else(|_| "/out".into());
+    std::fs::create_dir_all(&outdir).expect("out");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(format!("{outdir}/results.txt")).unwrap());
+    for (count, sum, first) in results {
+        let mut row = format!("{count} {sum}");
+        for d in first { write!(&mut row, " {d}").unwrap(); }
+        row.push('\n');
+        std::io::Write::write_all(&mut file, row.as_bytes()).unwrap();
+    }
+    std::io::Write::flush(&mut file).unwrap();
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
@@ -494,7 +559,12 @@ fn main() {
         spans.push((phrase, from, ids.len() as u32));
     }
     let nterms = terms.n;
-    assert!(nterms <= BUCKETS << 12 && nterms < (1 << ID_BITS) - 1, "too many terms"); // a unit's index has 12 bits
+    assert!(nterms < (1 << ID_BITS) - 1, "more terms than exact dictionary supports");
+    if nterms > BUCKETS << 12 {
+        let text = map("/data/docs.txt");
+        fallback_many_terms(text, &spans, &ids, &ops, &terms.keys);
+        return;
+    }
     let mut in_bool = vec![false; nterms];
     for &(_, from, to) in spans.iter().filter(|s| !s.0) {
         let r = from as usize..to as usize;
