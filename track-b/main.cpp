@@ -750,7 +750,8 @@ class Engine {
                 LineTokens line;
                 size_t last_block = numeric_limits<size_t>::max();
                 const char *p = begin;
-                for (size_t block; (block = next_block.fetch_add(1)) < blocks;) {
+                for (size_t group; (group = next_block.fetch_add(4)) < blocks;) {
+                  for (size_t block = group; block < min(group + 4, blocks); ++block) {
                   const uint32_t first = static_cast<uint32_t>(block * block_docs);
                   const size_t count = min<size_t>(block_docs, total_docs - first);
                   if (block != last_block + 1) p = seek(first);
@@ -820,6 +821,7 @@ class Engine {
                   }
                   flush();
                   last_block = block;
+                  }
                 }
             } catch (...) { errors[idx] = current_exception(); }
         };
