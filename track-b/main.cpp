@@ -209,9 +209,9 @@ struct First {
   u32 n = 0, id[10];
 };
 
-// A block's term sets are rows of 2,048 bits or, up to five positions, 12-bit
+// A block's term sets are rows of 3,072 bits or, up to five positions, 12-bit
 // fields under a 3-bit count.
-constexpr u32 kDocs = 2048, kWords = kDocs / 64, kSmall = 5;
+constexpr u32 kDocs = 3072, kWords = kDocs / 64, kSmall = 5;
 constexpr u64 kLocal = u64(1) << 60, kOne = u64(1) << 61;
 static u32 count_of(u64 s) { return s >> 61; }
 static u32 at(u64 s, u32 i) { return s >> (12 * i) & 4095; }
@@ -544,7 +544,7 @@ struct Engine {
   }
 
   // Workers claim line-aligned byte ranges that shrink towards the end, and
-  // gather up to 2,048 consecutive documents per block.
+  // gather up to 3,072 consecutive documents per block.
   void scan(const char *docs, size_t size, vector<Worker> &all) {
     atomic<size_t> next{0};
     parallel(all.size(), [&](u32 me) {
