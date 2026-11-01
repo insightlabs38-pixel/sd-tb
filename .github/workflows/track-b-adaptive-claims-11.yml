@@ -1,0 +1,88 @@
+name: Track B adaptive block-claim qualification
+on:
+  workflow_dispatch:
+  push:
+    branches: [track-b/adaptive-claims-11]
+    paths: [track-b/main.cpp, tests/**, .github/workflows/track-b-adaptive-claims-11.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
+permissions:
+  contents: read
+concurrency:
+  group: track-b-adaptive-claims-11
+  cancel-in-progress: true
+env:
+  CHAMPION: d3e315625ec088b7e44b530cafb7c6dbe501e2db
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pinned organizer, images and builds
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          docker pull gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce
+          docker pull debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+          mkdir -p /tmp/champion /tmp/bin /tmp/evidence
+          cp track-b/Dockerfile /tmp/champion/
+          git show "$CHAMPION:track-b/main.cpp" > /tmp/champion/main.cpp
+          docker build --network=none -t frontier:champion /tmp/champion
+          docker build --network=none -t frontier:candidate track-b
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bin/sd-timer
+          g++ -std=c++20 -O3 -march=x86-64-v3 -pthread -Wall -Wextra track-b/main.cpp -o /tmp/bin/candidate
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/bin/asan
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie track-b/main.cpp -o /tmp/bin/tsan
+      - name: Differential, adversarial and sanitizer gates
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          python3 tests/differential.py /tmp/bin/candidate
+          python3 tests/frontier_adversarial.py /tmp/bin/candidate
+          python3 tests/differential.py /tmp/bin/asan
+          python3 tests/frontier_adversarial.py /tmp/bin/asan
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/tsan
+      - name: Organizer corpora and references
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"
+            if [ "$seed" != 1 ]; then python3 /tmp/organizer/reference/b_index.py --data "/tmp/data-$seed" --out "/tmp/ref-$seed"; fi
+          done
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/sample
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/tiny
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/tiny --out /tmp/ref-tiny
+      - name: Paired production Docker measurements
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1); fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --repeat 5 --results /tmp/evidence/measurements.jsonl frontier:champion frontier:candidate
+          done
+          sudo python3 experiments/frontier/compare.py --data /tmp/sample --expected eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f --timer /tmp/bin/sd-timer --seed 1 --repeat 1 --results /tmp/evidence/sample.jsonl frontier:candidate
+          expected=$(sha256sum /tmp/ref-tiny/results.txt | cut -d' ' -f1)
+          sudo python3 experiments/frontier/compare.py --data /tmp/tiny --expected "$expected" --timer /tmp/bin/sd-timer --seed 7 --repeat 1 --results /tmp/evidence/tiny.jsonl frontier:candidate
+      - name: Canonical source and dependency axes
+        run: |
+          set -euo pipefail
+          python3 -m pip install clang-format==23.1.3
+          curl -fL https://github.com/boyter/scc/releases/download/v4.1.0/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
+          echo 'c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b  /tmp/scc.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/scc.tar.gz -C /tmp/bin scc
+          for variant in champion candidate; do
+            mkdir -p "/tmp/count-$variant"
+            if [ "$variant" = candidate ]; then source=track-b/main.cpp; else source=/tmp/champion/main.cpp; fi
+            clang-format --style=LLVM "$source" > "/tmp/count-$variant/main.cpp"
+            cp track-b/Dockerfile "/tmp/count-$variant/"
+            /tmp/bin/scc --format json "/tmp/count-$variant" > "/tmp/evidence/static-$variant.json"
+          done
+          python3 experiments/frontier/summarize_pair.py /tmp/evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: track-b-adaptive-claims-evidence
+          path: /tmp/evidence/
