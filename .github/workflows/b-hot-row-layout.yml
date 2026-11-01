@@ -1,0 +1,85 @@
+name: B breakthrough hot-row physical-layout sweep
+on:
+  push:
+    branches: ['research/b-breakthrough-20261101-hot-row-layout']
+    paths:
+      - '.github/workflows/b-hot-row-layout.yml'
+      - 'experiments/breakthrough/hot_layout.cpp'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: b-hot-row-layout-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate complete independent engines and pinned images
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          mkdir -p /tmp/benchmark-evidence /tmp/bin
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bin/sd-timer
+          for cap in 750 1200 1800 2400 3000 4000; do
+            mkdir -p "/tmp/build-$cap"
+            cp track-b/Dockerfile "/tmp/build-$cap/Dockerfile"
+            sed "s/HOT_CAP_EXPERIMENT/$cap/" experiments/breakthrough/hot_layout.cpp > "/tmp/build-$cap/main.cpp"
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/build-$cap/main.cpp" -o "/tmp/bin/engine-$cap"
+            docker build --network=none -t "b-hot:$cap" "/tmp/build-$cap"
+          done
+      - name: Exact adversarial and sanitizer checks
+        run: |
+          set -euo pipefail
+          python3 tests/differential.py /tmp/bin/engine-750
+          python3 tests/differential.py /tmp/bin/engine-4000
+          python3 tests/frontier_adversarial.py /tmp/bin/engine-750
+          python3 tests/frontier_adversarial.py /tmp/bin/engine-4000
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie /tmp/build-750/main.cpp -o /tmp/bin/asan
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/differential.py /tmp/bin/asan
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie /tmp/build-4000/main.cpp -o /tmp/bin/tsan
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bin/tsan
+      - name: Three independent full-size official corpora
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"
+            if [ "$seed" != 1 ]; then
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/data-$seed" --out "/tmp/ref-$seed"
+            fi
+          done
+      - name: Paired exact timer and cgroup memory measurements
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then
+              expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else
+              expected=$(sha256sum "/tmp/ref-$seed/results.txt" | cut -d' ' -f1)
+            fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --repeat 5 --results /tmp/benchmark-evidence/measurements.jsonl b-hot:750 b-hot:1200 b-hot:1800 b-hot:2400 b-hot:3000 b-hot:4000
+          done
+      - name: Rank by runtime and memory (no official K inference)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,statistics
+          from collections import defaultdict
+          from pathlib import Path
+          rows=[json.loads(x) for x in Path('/tmp/benchmark-evidence/measurements.jsonl').read_text().splitlines()]
+          groups=defaultdict(list)
+          for r in rows: groups[(r['seed'],r['image'])].append(r)
+          for (seed,image),rr in sorted(groups.items()):
+              print(json.dumps({'seed':seed,'image':image,'median_wall_s':statistics.median(x['T'] for x in rr),
+                                'max_cgroup_memory_bytes':max(x['M'] for x in rr)},sort_keys=True))
+          PY
+          git rev-parse HEAD > /tmp/benchmark-evidence/source-commit.txt
+          wc -l experiments/breakthrough/hot_layout.cpp > /tmp/benchmark-evidence/physical-lines.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b-hot-row-layout-evidence
+          path: /tmp/benchmark-evidence/
