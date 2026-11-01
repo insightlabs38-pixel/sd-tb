@@ -385,3 +385,11 @@ Projected box K against BEST 26.690516 (S 691, M saturated): 30.3 if T equals th
 ## 1024-document six-entry packing (rejected, November 1)
 
 [Three-seed, five-repeat qualification 41346237609](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41346237609) passed exact full seed-1 published hash, independently generated full seed-2/3 references, differential/adversarial checks, ASan/UBSan, TSan and offline Docker. The 1024-document block with six 10-bit packed positions reduced runner-local memory on some runs but lost end-to-end K on every seed. Candidate/champion ratios **0.990760 / 0.988408 / 0.988406**, geometric mean **0.989191 (-1.081%)**. Both S=695, D=1; representative seed-1 median T champion **0.236910 s**, candidate **0.241349 s**. Reject PR #14; preserve source blob `6450d009a5d07f719f3678becea49d89b136737a`. These are runner-local, not official board measurements.
+
+## 3072-document block size (rejected, November 1)
+
+[Three-seed, five-repeat paired qualification 41350829279](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41350829279) passed full seed-1 published hash, independent full seeds 2/3, sample/tiny, differential/adversarial tests, ASan/UBSan, TSan and pinned offline Docker. Increasing blocks from 2048 to 3072 documents preserved S=695 and D=1 but increased runner peak from roughly 22-24 MiB to 31-35 MiB. Candidate/champion runner-local K ratios **0.994467 / 0.980714 / 0.983110**, geometric mean **0.986079 (-1.3921%)**, losing all three seeds. Reject PR #15; retain champion source blob `6450d009a5d07f719f3678becea49d89b136737a`. These are runner-local, not official board scores.
+
+## SIMD Boolean bitmap operations (provisional, November 1)
+
+[Three-seed, five-repeat qualification 41350926249](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41350926249) passed exact full hashes on seeds 1/2/3, sample/tiny, differential/adversarial, ASan/UBSan, TSan and offline Docker. AVX2 OR/AND/ANDNOT for 2048-bit rows produced runner-local K ratios **1.070307 / 1.007625 / 1.000588**, geometric mean **1.025701 (+2.5701%)** versus champion; candidate S=702 versus 695, D=1. Seed-1 timings were noisy, so a five-full-seed seven-repeat confirmation was launched at branch `track-b/boolean-simd-confirm-11`, commit `44259eac64537eac393c0db8fa1173f5e920b9d9`. Do not promote before confirmation.
