@@ -211,7 +211,7 @@ struct First {
 
 // A block's term sets are rows of 2,048 bits or, up to five positions, 12-bit
 // fields under a 3-bit count.
-constexpr u32 kDocs = 2048, kWords = kDocs / 64, kSmall = 5;
+constexpr u32 kDocs = 4096, kWords = kDocs / 64, kSmall = 5;
 constexpr u64 kLocal = u64(1) << 60, kOne = u64(1) << 61;
 static u32 count_of(u64 s) { return s >> 61; }
 static u32 at(u64 s, u32 i) { return s >> (12 * i) & 4095; }
