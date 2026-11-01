@@ -645,7 +645,8 @@ struct Engine {
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
-      rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
+      if (col && col <= hot)
+        rows[col * kWords + word] |= bit;
       colds[cold] = col;
       cold += col > hot;
       if (m >> 40)
