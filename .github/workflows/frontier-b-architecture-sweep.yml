@@ -1,0 +1,63 @@
+name: Frontier B architecture variant sweep
+on:
+  workflow_dispatch:
+  push:
+    branches: [frontier/b-architecture-sweep]
+    paths: [experiments/arch-sweep/**, .github/workflows/frontier-b-architecture-sweep.yml]
+permissions:
+  contents: read
+concurrency:
+  group: frontier-b-architecture-sweep
+  cancel-in-progress: true
+env:
+  CHAMPION: 28f8d09024eb534c88d8e34a1cf324f0c4e078f9
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Organizer, images and variants
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          docker pull gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce
+          docker pull debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+          mkdir -p /tmp/bin /tmp/evidence
+          gcc -O2 -static /tmp/organizer/harness/timer/sd-timer.c -o /tmp/bin/sd-timer
+          python3 -m pip install clang-format==23.1.3
+          curl -fL https://github.com/boyter/scc/releases/download/v4.1.0/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
+          echo 'c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b  /tmp/scc.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/scc.tar.gz -C /tmp/bin scc
+          git show "$CHAMPION:track-b/main.cpp" > experiments/arch-sweep/champion.cpp
+          for src in experiments/arch-sweep/*.cpp; do
+            name=$(basename "$src" .cpp)
+            mkdir -p "/tmp/v-$name" "/tmp/count-$name"
+            cp track-b/Dockerfile "/tmp/v-$name/"; cp track-b/Dockerfile "/tmp/count-$name/"; cp "$src" "/tmp/v-$name/main.cpp"
+            docker build --network=none -t "frontier:$name" "/tmp/v-$name"
+            clang-format --style=LLVM "$src" > "/tmp/count-$name/main.cpp"
+            /tmp/bin/scc --format json "/tmp/count-$name" > "/tmp/evidence/static-$name.json"
+          done
+          echo "IMAGES=$(for src in experiments/arch-sweep/*.cpp; do printf 'frontier:%s ' "$(basename "$src" .cpp)"; done)" >> "$GITHUB_ENV"
+      - name: Corpora
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"; done
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/data-2 --out /tmp/ref-2
+      - name: Measurements
+        run: |
+          set -euo pipefail
+          for seed in 1 2; do
+            if [ "$seed" = 1 ]; then expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else expected=$(sha256sum /tmp/ref-2/results.txt | cut -d' ' -f1); fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/data-$seed" --expected "$expected" --timer /tmp/bin/sd-timer --seed "$seed" --repeat 7 --results /tmp/evidence/measurements.jsonl $IMAGES
+          done
+          python3 experiments/frontier/summarize_variants.py /tmp/evidence | tee /tmp/evidence/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontier-b-architecture-sweep
+          path: /tmp/evidence/
