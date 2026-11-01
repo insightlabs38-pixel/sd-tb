@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [track-b/skip-cold-scratch-11]
-    paths: [track-b/main.cpp, tests/**, .github/workflows/frontier-b-claude.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
+    paths: [track-b/main.cpp, tests/**, .github/workflows/track-b-scratch-11.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
 permissions:
   contents: read
 concurrency:
