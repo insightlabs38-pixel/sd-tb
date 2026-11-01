@@ -27,7 +27,7 @@ jobs:
           git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
           git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
           mkdir -p /tmp/bin /tmp/evidence /tmp/baseline /tmp/challenger
-          src=$(find experiments/breakthrough -maxdepth 1 -name '*.cpp' -print -quit)
+          src=experiments/breakthrough/prefix_direct_bitmap.cpp
           test -n "$src"
           printf '%s\n' "$src" | tee /tmp/evidence/candidate-path.txt
           g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra track-b/main.cpp -o /tmp/bin/base
