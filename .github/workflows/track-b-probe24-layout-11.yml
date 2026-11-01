@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: track-b-implicit-document-ids-11
+  group: track-b-probe24-layout-11
   cancel-in-progress: true
 env:
   CHAMPION: 28f8d09024eb534c88d8e34a1cf324f0c4e078f9
