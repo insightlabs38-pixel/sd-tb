@@ -542,7 +542,7 @@ struct Engine {
     atomic<size_t> next{0};
     parallel(all.size(), [&](u32 me) {
       Worker &w = all[me];
-      w.rows.reserve((2 * hot + 64) * kWords); // Spill rows grow in place.
+      w.rows.reserve((2 * hot + 1024) * kWords); // Spill rows grow in place.
       w.rows.assign((hot + 1) * kWords, 0);
       w.state.assign(cols, 0);
       w.totals.assign(bools.size(), 0);
@@ -550,7 +550,7 @@ struct Engine {
       w.pending.assign(bools.size() / 64 + 1, 0);
       for (size_t from = 0; (from = next.load()) < size;) {
         size_t step = clamp<size_t>((size - from) / (4 * all.size()), 256 << 10,
-                                    12 << 20);
+                                    6 << 20);
         if (!next.compare_exchange_weak(from, from + step))
           continue;
         u32 base = 0, n = 0;
@@ -616,8 +616,13 @@ struct Engine {
     const u32 hot = this->hot, *bucket = ids;
     u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
+    for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
+      keys[k] = dict.find(text + e[2 * k], keys[k], bucket[k]);
+      u32 col = keys[k] >> 20 & 0xfffff;
+      _mm_prefetch((const char *)&rows[(col & -u32(col <= hot)) * kWords + word], _MM_HINT_T0);
+    }
     for (u32 k = 0; k < count; k++) {
-      u64 m = dict.find(text + e[2 * k], keys[k], bucket[k]);
+      u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
       ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.

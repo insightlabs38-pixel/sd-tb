@@ -148,8 +148,8 @@ struct Dictionary {
     _mm_prefetch((const char *)&buckets[hash_of(key) & mask()], _MM_HINT_T0);
   }
   // The token's metadata, or zero when it is no query term.
-  u64 find(const char *p, u64 key) const {
-    const Bucket &b = buckets[hash_of(key) & mask()];
+  u64 find(const char *p, u64 key, u32 bucket) const {
+    const Bucket &b = buckets[bucket];
     u32 m = match(b, key);
     if (__builtin_expect((key >> 62 == 2) | (!m & (b.key[3] != 0)), 0))
       return find_slow(p, key);
@@ -334,7 +334,8 @@ struct Engine {
         e.resize(eol - p + 72);
       // Edges 0 and 1 delimit the document ID.
       for (u32 i = 2, n = edges(p, eol - p, e.data()); i < n; i += 2)
-        freq[dict.find(p + e[i], key_of(p + e[i], e[i + 1] - e[i])) & 0xfffff]++;
+        if (u64 key = key_of(p + e[i], e[i + 1] - e[i]); true)
+          freq[dict.find(p + e[i], key, hash_of(key) & dict.mask()) & 0xfffff]++;
     }
     freq[0] = 0;
     for (Bool &b : bools)
@@ -541,7 +542,7 @@ struct Engine {
     atomic<size_t> next{0};
     parallel(all.size(), [&](u32 me) {
       Worker &w = all[me];
-      w.rows.reserve((2 * hot + 64) * kWords); // Spill rows grow in place.
+      w.rows.reserve((2 * hot + 1024) * kWords); // Spill rows grow in place.
       w.rows.assign((hot + 1) * kWords, 0);
       w.state.assign(cols, 0);
       w.totals.assign(bools.size(), 0);
@@ -549,7 +550,7 @@ struct Engine {
       w.pending.assign(bools.size() / 64 + 1, 0);
       for (size_t from = 0; (from = next.load()) < size;) {
         size_t step = clamp<size_t>((size - from) / (4 * all.size()), 256 << 10,
-                                    1536 << 10);
+                                    6 << 20);
         if (!next.compare_exchange_weak(from, from + step))
           continue;
         u32 base = 0, n = 0;
@@ -610,19 +611,20 @@ struct Engine {
     }
     for (u32 i = 0, k; i < nlong; i++)
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
-    for (u32 k = 0; k < count && k < 8; k++)
-      dict.prefetch(keys[k]);
+    for (u32 k = 0; k < count; k++) // IDs hold bucket indices until found.
+      ids[k] = hash_of(keys[k]) & dict.mask(), _mm_prefetch((const char *)&dict.buckets[ids[k]], _MM_HINT_T0);
+    const u32 hot = this->hot, *bucket = ids;
+    u32 *colds = w.cold.data();
+    auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) {
-      if (k + 8 < count)
-        dict.prefetch(keys[k + 8]);
-      u64 m = dict.find(text + e[2 * k], keys[k]);
+      u64 m = dict.find(text + e[2 * k], keys[k], bucket[k]);
       u32 col = m >> 20 & 0xfffff;
       ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
-      w.cold[cold] = col;
+      colds[cold] = col;
       cold += col > hot;
       if (m >> 40)
-        w.anchors[anchors++] = {k, int(m >> 40) - 1};
+        anchor[anchors++] = {k, int(m >> 40) - 1};
     }
     for (u32 k = 0; k < cold; k++) {
       u64 &r = w.state[w.cold[k]];
