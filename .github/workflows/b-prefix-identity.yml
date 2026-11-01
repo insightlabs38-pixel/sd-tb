@@ -5,7 +5,7 @@ on:
       - 'research/b-breakthrough-20261101-prefix-identity'
     paths:
       - 'experiments/breakthrough/**'
-      - '.github/workflows/b-breakthrough.yml'
+      - '.github/workflows/b-prefix-identity.yml'
   workflow_dispatch:
 
 permissions:
