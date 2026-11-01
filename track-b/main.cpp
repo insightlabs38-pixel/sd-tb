@@ -209,12 +209,12 @@ struct First {
   u32 n = 0, id[10];
 };
 
-// A block's term sets are rows of 2,048 bits or, up to five positions, 12-bit
+// A block's term sets are rows of 1,024 bits or, up to six positions, 10-bit
 // fields under a 3-bit count.
-constexpr u32 kDocs = 2048, kWords = kDocs / 64, kSmall = 5;
+constexpr u32 kDocs = 1024, kWords = kDocs / 64, kSmall = 6;
 constexpr u64 kLocal = u64(1) << 60, kOne = u64(1) << 61;
 static u32 count_of(u64 s) { return s >> 61; }
-static u32 at(u64 s, u32 i) { return s >> (12 * i) & 4095; }
+static u32 at(u64 s, u32 i) { return s >> (10 * i) & 1023; }
 static bool small_has(u64 s, u32 p) {
   for (u32 i = 0; i < count_of(s); i++)
     if (at(s, i) == p)
@@ -481,13 +481,13 @@ struct Engine {
       u64 out = 0, k = 0;
       for (u32 i = 0; i < count_of(s); i++)
         if (has(o, at(s, i)) == keep)
-          out |= u64(at(s, i)) << (12 * k++);
+          out |= u64(at(s, i)) << (10 * k++);
       return k ? out | k << 61 : 0;
     };
     auto unite = [&](u64 o) { // Unions may leave positions unsorted.
       for (u32 j = 0; j < count_of(o); j++)
         if (!small_has(r, at(o, j)))
-          r = (r + kOne) | u64(at(o, j)) << (12 * count_of(r));
+          r = (r + kOne) | u64(at(o, j)) << (10 * count_of(r));
     };
     auto apply = [&](char op, u64 o) { // Makes r a row in v, then applies o.
       if (r != kLocal && count_of(r))
@@ -544,7 +544,7 @@ struct Engine {
   }
 
   // Workers claim line-aligned byte ranges that shrink towards the end, and
-  // gather up to 2,048 consecutive documents per block.
+  // gather up to 1,024 consecutive documents per block.
   void scan(const char *docs, size_t size, vector<Worker> &all) {
     atomic<size_t> next{0};
     parallel(all.size(), [&](u32 me) {
@@ -657,7 +657,7 @@ struct Engine {
       else if (!c)
         w.rows[r * kWords + word] |= bit;
       else if (at(r, c - 1) != slot && c < kSmall)
-        r = (r + kOne) | u64(slot) << (12 * c);
+        r = (r + kOne) | u64(slot) << (10 * c);
       else if (at(r, c - 1) != slot) {
         u64 row = w.rows.size() / kWords;
         w.rows.resize(w.rows.size() + kWords);
