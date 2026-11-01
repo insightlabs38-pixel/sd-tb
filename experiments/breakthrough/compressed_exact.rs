@@ -138,14 +138,15 @@ fn compact_key(word: __m256i, len: usize) -> u64 {
     let w: [u64; 4] = unsafe { std::mem::transmute(word) };
     if len <= 8 { return w[0]; }
     if len <= 12 {
-        let bytes: [u8; 32] = unsafe { std::mem::transmute(word) };
-        let mut result = 1u64 << 63;
-        for i in 0..len {
-            let c = bytes[i];
-            if !(b'a'..=b'z').contains(&c) { return NO_FAST_KEY; }
-            result |= ((c - b'a' + 1) as u64) << (5 * i);
-        }
-        return result;
+        let a = unsafe { _mm256_cmpgt_epi8(word, _mm256_set1_epi8(b'a' as i8 - 1)) };
+        let b = unsafe { _mm256_cmpgt_epi8(_mm256_set1_epi8(b'z' as i8 + 1), word) };
+        let letters = unsafe { _mm256_movemask_epi8(_mm256_and_si256(a, b)) as u32 };
+        let needed = (1u32 << len) - 1;
+        if (letters & needed) != needed { return NO_FAST_KEY; }
+        let first = unsafe { _pext_u64(w[0], 0x1f1f1f1f1f1f1f1f) };
+        let restmask = (1u64 << (8 * (len - 8))) - 1;
+        let second = unsafe { _pext_u64(w[1], restmask & 0x1f1f1f1f1f1f1f1f) };
+        return (1u64 << 63) | first | (second << 40);
     }
     NO_FAST_KEY
 }
