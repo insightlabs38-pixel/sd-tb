@@ -21,6 +21,7 @@
 using namespace std;
 using u64 = uint64_t;
 using u32 = uint32_t;
+using u16 = uint16_t;
 typedef unsigned char B32 __attribute__((vector_size(32)));
 typedef u64 Q4 __attribute__((vector_size(32)));
 static B32 load32(const void *p) {
@@ -195,6 +196,7 @@ struct Dictionary {
 struct Bool {
   u32 query, n, term[6];
   char op[5];
+  u16 shape; // Term count and operators; AND, NOT, OR differ in low bits.
 };
 struct Phrase {
   u32 query, n, anchor, term[8];
@@ -271,6 +273,9 @@ struct Engine {
           Bool &b = w.bools.emplace_back(Bool{w.lines, n / 2});
           for (u32 i = 1; i < n; i++)
             i % 2 ? b.term[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
+          b.shape = b.n;
+          for (char op : b.op)
+            b.shape = b.shape << 2 | (op & 3);
         } else {
           Phrase &f = w.phrases.emplace_back(Phrase{w.lines, n - 1});
           for (u32 i = 1; i < n; i++)
@@ -349,14 +354,8 @@ struct Engine {
         b.term[i] = c;
       }
     // Sorting by operator shape makes the evaluator's branches repeat.
-    auto shape = [](const Bool &b) {
-      u32 key = b.n;
-      for (char op : b.op) // AND, NOT, OR and none differ in their low bits.
-        key = key << 2 | (op & 3);
-      return key;
-    };
     sort(bools.begin(), bools.end(),
-         [&](const Bool &a, const Bool &b) { return shape(a) < shape(b); });
+         [](const Bool &a, const Bool &b) { return a.shape < b.shape; });
     plan_guards(weight);
     for (u32 k = 0; k < phrases.size(); k++) {
       Phrase &f = phrases[k];

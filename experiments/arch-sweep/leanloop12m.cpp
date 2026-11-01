@@ -21,6 +21,7 @@
 using namespace std;
 using u64 = uint64_t;
 using u32 = uint32_t;
+using u16 = uint16_t;
 typedef unsigned char B32 __attribute__((vector_size(32)));
 typedef u64 Q4 __attribute__((vector_size(32)));
 static B32 load32(const void *p) {
@@ -147,8 +148,8 @@ struct Dictionary {
     _mm_prefetch((const char *)&buckets[hash_of(key) & mask()], _MM_HINT_T0);
   }
   // The token's metadata, or zero when it is no query term.
-  u64 find(const char *p, u64 key) const {
-    const Bucket &b = buckets[hash_of(key) & mask()];
+  u64 find(const char *p, u64 key, u32 bucket) const {
+    const Bucket &b = buckets[bucket];
     u32 m = match(b, key);
     if (__builtin_expect((key >> 62 == 2) | (!m & (b.key[3] != 0)), 0))
       return find_slow(p, key);
@@ -195,6 +196,7 @@ struct Dictionary {
 struct Bool {
   u32 query, n, term[6];
   char op[5];
+  u16 shape; // Term count and operators; AND, NOT, OR differ in low bits.
 };
 struct Phrase {
   u32 query, n, anchor, term[8];
@@ -271,6 +273,9 @@ struct Engine {
           Bool &b = w.bools.emplace_back(Bool{w.lines, n / 2});
           for (u32 i = 1; i < n; i++)
             i % 2 ? b.term[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
+          b.shape = b.n;
+          for (char op : b.op)
+            b.shape = b.shape << 2 | (op & 3);
         } else {
           Phrase &f = w.phrases.emplace_back(Phrase{w.lines, n - 1});
           for (u32 i = 1; i < n; i++)
@@ -329,7 +334,8 @@ struct Engine {
         e.resize(eol - p + 72);
       // Edges 0 and 1 delimit the document ID.
       for (u32 i = 2, n = edges(p, eol - p, e.data()); i < n; i += 2)
-        freq[dict.find(p + e[i], key_of(p + e[i], e[i + 1] - e[i])) & 0xfffff]++;
+        if (u64 key = key_of(p + e[i], e[i + 1] - e[i]); true)
+          freq[dict.find(p + e[i], key, hash_of(key) & dict.mask()) & 0xfffff]++;
     }
     freq[0] = 0;
     for (Bool &b : bools)
@@ -349,14 +355,8 @@ struct Engine {
         b.term[i] = c;
       }
     // Sorting by operator shape makes the evaluator's branches repeat.
-    auto shape = [](const Bool &b) {
-      u32 key = b.n;
-      for (char op : b.op) // AND, NOT, OR and none differ in their low bits.
-        key = key << 2 | (op & 3);
-      return key;
-    };
     sort(bools.begin(), bools.end(),
-         [&](const Bool &a, const Bool &b) { return shape(a) < shape(b); });
+         [](const Bool &a, const Bool &b) { return a.shape < b.shape; });
     plan_guards(weight);
     for (u32 k = 0; k < phrases.size(); k++) {
       Phrase &f = phrases[k];
@@ -550,7 +550,7 @@ struct Engine {
       w.pending.assign(bools.size() / 64 + 1, 0);
       for (size_t from = 0; (from = next.load()) < size;) {
         size_t step = clamp<size_t>((size - from) / (4 * all.size()), 256 << 10,
-                                    1536 << 10);
+                                    12 << 20);
         if (!next.compare_exchange_weak(from, from + step))
           continue;
         u32 base = 0, n = 0;
@@ -594,42 +594,37 @@ struct Engine {
   // Marks the document's terms in block slot `slot` and matches its phrases.
   void process(Worker &w, u32 doc, u32 slot, const char *text, size_t n) {
     if (w.edge.size() < n + 72) {
-      w.edge.resize(n + 72), w.anchors.resize(n / 2 + 1), w.keys.resize(n / 2 + 5);
+      w.edge.resize(n + 72), w.anchors.resize(n / 2 + 1), w.keys.resize(n / 2 + 1);
       for (auto *v : {&w.ids, &w.longs, &w.cold})
-        v->resize(n / 2 + 5);
+        v->resize(n / 2 + 1);
     }
     u32 count = edges(text, n, w.edge.data()) / 2, cold = 0, anchors = 0,
         nlong = 0, word = slot / 64, *e = w.edge.data(), *ids = w.ids.data();
     u64 bit = u64(1) << slot % 64, *rows = w.rows.data(), *keys = w.keys.data();
-    // Four short keys at a time: gather eight bytes per token, lowercase and
-    // cut them to the token; longer tokens are keyed afterwards.
-    for (u32 k = 0; k < count; k += 4) {
-      __m256i pair = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(e + 2 * k)),
-                                                 _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7));
-      Q4 from = (Q4)_mm256_cvtepu32_epi64(_mm256_castsi256_si128(pair)),
-         len = (Q4)_mm256_cvtepu32_epi64(_mm256_extracti128_si256(pair, 1)) - from,
-         live = (Q4)_mm256_set1_epi64x(count - k) > (Q4){0, 1, 2, 3};
-      Q4 word = (Q4)_mm256_mask_i64gather_epi64(__m256i{}, (const long long *)text, __m256i(from), __m256i(live), 1);
-      Q4 cut = (Q4)_mm256_srlv_epi64(__m256i(Q4{} - 1), __m256i(64 - 8 * (len < 8 ? len : 8)));
-      _mm256_storeu_si256((__m256i *)(keys + k), __m256i((word | 0x2020202020202020) & cut));
-      for (u32 j = 0; j < 4; j++)
-        w.longs[nlong] = k + j, nlong += k + j < count && len[j] > 8;
+    for (u32 k = 0; k < count; k++) { // Long tokens are keyed afterwards.
+      u32 len = e[2 * k + 1] - e[2 * k];
+      u64 a;
+      memcpy(&a, text + e[2 * k], 8);
+      keys[k] = (a | 0x2020202020202020) & ~u64(0) >> (64 - 8 * min(len, 8u));
+      w.longs[nlong] = k;
+      nlong += len > 8;
     }
     for (u32 i = 0, k; i < nlong; i++)
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
-    for (u32 k = 0; k < count && k < 8; k++)
-      dict.prefetch(keys[k]);
+    for (u32 k = 0; k < count; k++) // IDs hold bucket indices until found.
+      ids[k] = hash_of(keys[k]) & dict.mask(), _mm_prefetch((const char *)&dict.buckets[ids[k]], _MM_HINT_T0);
+    const u32 hot = this->hot, *bucket = ids;
+    u32 *colds = w.cold.data();
+    auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) {
-      if (k + 8 < count)
-        dict.prefetch(keys[k + 8]);
-      u64 m = dict.find(text + e[2 * k], keys[k]);
+      u64 m = dict.find(text + e[2 * k], keys[k], bucket[k]);
       u32 col = m >> 20 & 0xfffff;
       ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
-      w.cold[cold] = col;
+      colds[cold] = col;
       cold += col > hot;
       if (m >> 40)
-        w.anchors[anchors++] = {k, int(m >> 40) - 1};
+        anchor[anchors++] = {k, int(m >> 40) - 1};
     }
     for (u32 k = 0; k < cold; k++) {
       u64 &r = w.state[w.cold[k]];
