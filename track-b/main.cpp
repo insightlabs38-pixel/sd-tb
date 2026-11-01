@@ -23,6 +23,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -900,6 +901,8 @@ public:
 };
 
 int main(int argc, char **argv) {
+    // Transparent huge pages would round small per-thread heaps up to 2 MiB.
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     string data_dir = "/data", out_dir = "/out";
     for (int i = 1; i + 1 < argc; i += 2) {
         if (strcmp(argv[i], "--data") == 0) data_dir = argv[i + 1];
