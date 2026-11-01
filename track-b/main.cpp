@@ -622,7 +622,7 @@ struct Engine {
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
     // Keep dictionary prefetches near their use instead of prefetching an
     // entire document's random buckets before the first lookup.
-    constexpr u32 lookahead = 8;
+    constexpr u32 lookahead = 4;
     u32 bucket[lookahead];
     for (u32 k = 0; k < min(count, lookahead); k++) {
       bucket[k] = hash_of(keys[k]) & dict.mask();
