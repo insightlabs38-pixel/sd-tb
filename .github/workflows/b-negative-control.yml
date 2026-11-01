@@ -1,0 +1,100 @@
+name: B breakthrough negative control-plane exact qualification
+on:
+  push:
+    branches: ['research/b-breakthrough-20261101-negative-control-plane']
+    paths: ['experiments/breakthrough/negative_control.cpp', '.github/workflows/b-negative-control.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: b-negative-control
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Immutable baseline, pinned builds and organizer
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bctrl/evidence /tmp/bctrl/bin
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/bctrl/organizer
+          git -C /tmp/bctrl/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          git show c1b9e90f3916f009e4b3d3d64f3395ba0a680b6a:track-b/main.cpp > /tmp/bctrl/base.cpp
+          for variant in base ctrl19 ctrl20 ctrl21 ctrl22; do
+            mkdir -p "/tmp/bctrl/$variant"
+            cp track-b/Dockerfile "/tmp/bctrl/$variant/Dockerfile"
+            if [ "$variant" = base ]; then
+              cp /tmp/bctrl/base.cpp "/tmp/bctrl/$variant/main.cpp"
+            else
+              bits=${variant#ctrl}
+              sed "s/#define HASH_CONTROL_BITS 20/#define HASH_CONTROL_BITS $bits/" experiments/breakthrough/negative_control.cpp > "/tmp/bctrl/$variant/main.cpp"
+            fi
+            g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra "/tmp/bctrl/$variant/main.cpp" -o "/tmp/bctrl/bin/$variant"
+            docker build --network=none -t "b-ctrl:$variant" "/tmp/bctrl/$variant"
+          done
+          gcc -O2 -static /tmp/bctrl/organizer/harness/timer/sd-timer.c -o /tmp/bctrl/bin/sd-timer
+      - name: Strict differential, adversarial, sanitizers
+        run: |
+          set -euo pipefail
+          for variant in ctrl19 ctrl20 ctrl21 ctrl22; do
+            python3 tests/differential.py "/tmp/bctrl/bin/$variant"
+            python3 tests/frontier_adversarial.py "/tmp/bctrl/bin/$variant"
+          done
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie /tmp/bctrl/ctrl20/main.cpp -o /tmp/bctrl/bin/asan
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/differential.py /tmp/bctrl/bin/asan
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bctrl/bin/asan
+          g++ -std=c++20 -O1 -g -march=x86-64-v3 -pthread -fsanitize=thread -fno-omit-frame-pointer -fno-pie -no-pie /tmp/bctrl/ctrl20/main.cpp -o /tmp/bctrl/bin/tsan
+          TSAN_OPTIONS=halt_on_error=1 python3 tests/frontier_adversarial.py /tmp/bctrl/bin/tsan
+      - name: Generate exact full-seed references
+        run: |
+          set -euo pipefail
+          python3 /tmp/bctrl/organizer/generators/b_index.py --seed 1 --scale sample --out /tmp/bctrl/sample
+          for seed in 1 2 3; do
+            python3 /tmp/bctrl/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/bctrl/data-$seed"
+            if [ "$seed" != 1 ]; then
+              python3 /tmp/bctrl/organizer/reference/b_index.py --data "/tmp/bctrl/data-$seed" --out "/tmp/bctrl/reference-$seed"
+            fi
+          done
+          mkdir -p /tmp/bctrl/sample-out
+          /tmp/bctrl/bin/ctrl20 --data /tmp/bctrl/sample --out /tmp/bctrl/sample-out
+          echo 'eeeec1e9319da98a6f3c664c78f93e7078fd603c25c2bb3027174e81e3638a8f  /tmp/bctrl/sample-out/results.txt' | sha256sum -c -
+      - name: Paired pinned Docker measurements of full exact solver
+        run: |
+          set -euo pipefail
+          for seed in 1 2 3; do
+            if [ "$seed" = 1 ]; then
+              expected=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+            else
+              expected=$(sha256sum "/tmp/bctrl/reference-$seed/results.txt" | cut -d' ' -f1)
+            fi
+            sudo python3 experiments/frontier/compare.py --data "/tmp/bctrl/data-$seed" --expected "$expected" --timer /tmp/bctrl/bin/sd-timer --seed "$seed" --repeat 4 --results /tmp/bctrl/evidence/paired.jsonl b-ctrl:base b-ctrl:ctrl19 b-ctrl:ctrl20 b-ctrl:ctrl21 b-ctrl:ctrl22
+          done
+      - name: Report paired latency, exact peak cgroup and source
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json,statistics
+          from collections import defaultdict
+          from pathlib import Path
+          p=Path('/tmp/bctrl/evidence/paired.jsonl')
+          if not p.exists(): exit(0)
+          rows=[json.loads(x) for x in p.read_text().splitlines()]
+          g=defaultdict(list)
+          for r in rows: g[(r['seed'],r['image'])].append(r)
+          out=[]
+          for (seed,img),v in sorted(g.items()):
+            z=dict(seed=seed,image=img,median_seconds=statistics.median(x['T'] for x in v),
+                   peak_bytes=max(x['M'] for x in v),n=len(v))
+            out.append(z)
+            print(json.dumps(z))
+          Path('/tmp/bctrl/evidence/summary.json').write_text(json.dumps(out,indent=2))
+          PY
+          git rev-parse HEAD > /tmp/bctrl/evidence/commit.txt
+          wc -l experiments/breakthrough/negative_control.cpp /tmp/bctrl/base.cpp > /tmp/bctrl/evidence/lines.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b-negative-control-evidence
+          path: /tmp/bctrl/evidence/
