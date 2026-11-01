@@ -203,7 +203,6 @@ struct Phrase {
 // The ten smallest matching IDs of one query, merged under a spin lock.
 struct First {
   atomic<u64> total{0}; // Packed count << 35 | ID sum, as in Worker::totals.
-  atomic<u32> bound{~0u};
   atomic_flag busy;
   u32 n = 0, id[10];
 };
@@ -235,6 +234,7 @@ struct Engine {
   u32 queries = 0, hot = 0, cols = 1;
   vector<u32> guards, guarded; // guarded[guards[c]...] lists column c's queries
   unique_ptr<First[]> first;
+  unique_ptr<atomic<u32>[]> bound; // The tenth smallest ID once a list is full.
 
   // Threads parse line-aligned parts of the query file, then intern their
   // terms concurrently into a table sized for the term count.
@@ -310,7 +310,9 @@ struct Engine {
       };
       place(bools, w.bools, nb[t]), place(phrases, w.phrases, np[t]);
     });
-    first.reset(new First[queries]);
+    first.reset(new First[queries]), bound.reset(new atomic<u32>[queries]);
+    for (u32 q = 0; q < queries; q++)
+      bound[q].store(~0u, memory_order_relaxed);
   }
 
   // A corpus prefix ranks the terms. It decides hot rows, phrase anchors and
@@ -399,7 +401,7 @@ struct Engine {
 
   void offer(u32 q, const u32 *id, u32 k) {
     First &f = first[q];
-    if (id[0] > f.bound.load(memory_order_relaxed))
+    if (id[0] > bound[q].load(memory_order_relaxed))
       return;
     while (f.busy.test_and_set(memory_order_acquire))
       ;
@@ -408,7 +410,7 @@ struct Engine {
       out[m++] = j == k || (i < f.n && f.id[i] < id[j]) ? f.id[i++] : id[j++];
     memcpy(f.id, out, m * 4);
     if ((f.n = m) == 10)
-      f.bound.store(out[9], memory_order_relaxed);
+      bound[q].store(out[9], memory_order_relaxed);
     f.busy.clear(memory_order_release);
   }
   // Plan b's per-worker totals and the query's shared first IDs take a set.
@@ -453,7 +455,7 @@ struct Engine {
     w.totals[b] += (n << 35) + n * base + s[0] + s[1] + s[2] + s[3] +
                    u32(index[0]) + u32(index[1]) + u32(index[2]) + u32(index[3]);
     u32 id[10], k = 0;
-    for (u32 i = 0; i < kWords && k < 10 && base <= first[q].bound; i++)
+    for (u32 i = 0, more = base <= bound[q]; more && i < kWords && k < 10; i++)
       for (u64 b = x[i]; b && k < 10; b &= b - 1)
         id[k++] = base + 64 * i + countr_zero(b);
     if (k)
