@@ -1,4 +1,5 @@
 name: Track B implicit document-ID five-seed confirmation
+# Re-run after an unrelated workflow concurrency collision.
 on:
   workflow_dispatch:
   push:
