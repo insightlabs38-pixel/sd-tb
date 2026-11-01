@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <malloc.h>
 #include <immintrin.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -20,6 +21,13 @@
 using namespace std;
 using u64 = uint64_t;
 using u32 = uint32_t;
+typedef unsigned char B32 __attribute__((vector_size(32)));
+typedef u64 Q4 __attribute__((vector_size(32)));
+static B32 load32(const void *p) {
+  B32 v;
+  memcpy(&v, p, 32);
+  return v;
+}
 
 // Maps a file read-only, followed by zero bytes so SIMD loads may overrun it.
 static const char *map_file(const string &path, size_t &size) {
@@ -66,16 +74,11 @@ static const char *line_at(const char *b, size_t size, size_t off) {
 
 // Bit i is set when byte i of the 64 bytes at p is an ASCII letter or digit.
 static u64 alnum64(const char *p) {
-  auto half = [](const char *q) {
-    __m256i b = _mm256_loadu_si256((const __m256i *)q);
-    __m256i l = _mm256_or_si256(b, _mm256_set1_epi8(32));
-    l = _mm256_add_epi8(l, _mm256_set1_epi8(128 - 'a'));
-    __m256i d = _mm256_add_epi8(b, _mm256_set1_epi8(128 - '0'));
-    l = _mm256_cmpgt_epi8(_mm256_set1_epi8(-128 + 26), l);
-    d = _mm256_cmpgt_epi8(_mm256_set1_epi8(-128 + 10), d);
-    return u64(u32(_mm256_movemask_epi8(_mm256_or_si256(l, d))));
+  auto half = [](B32 b) {
+    B32 is = (B32)((b | 32) - 'a' < 26) | (B32)(b - '0' < 10);
+    return u64(u32(_mm256_movemask_epi8(__m256i(is))));
   };
-  return half(p) | half(p + 32) << 32;
+  return half(load32(p)) | half(load32(p + 32)) << 32;
 }
 
 // Writes the offsets where the tokens of [b, b + n) start and end, alternately,
@@ -187,10 +190,10 @@ struct Dictionary {
   }
 };
 
-// Queries reference Boolean columns or phrase term IDs; plans are reordered,
-// so each keeps its output line.
+// Plans keep their output line. Boolean terms become columns once planned;
+// phrase terms stay term IDs.
 struct Bool {
-  u32 query, n, col[6];
+  u32 query, n, term[6];
   char op[5];
 };
 struct Phrase {
@@ -267,7 +270,7 @@ struct Engine {
         if (is_bool) {
           Bool &b = w.bools.emplace_back(Bool{w.lines, n / 2});
           for (u32 i = 1; i < n; i++)
-            i % 2 ? b.col[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
+            i % 2 ? b.term[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
         } else {
           Phrase &f = w.phrases.emplace_back(Phrase{w.lines, n - 1});
           for (u32 i = 1; i < n; i++)
@@ -298,18 +301,14 @@ struct Engine {
           dict.prefetch(w.keys[i + 16]);
         w.keys[i] = dict.intern(w.at[i], w.keys[i], first_id[t]);
       }
-      for (u32 k = 0; k < w.bools.size(); k++) {
-        Bool &b = bools[nb[t] + k] = w.bools[k];
-        for (u32 i = 0; i < b.n; i++)
-          b.col[i] = w.keys[b.col[i]];
-        b.query += nq[t];
-      }
-      for (u32 k = 0; k < w.phrases.size(); k++) {
-        Phrase &f = phrases[np[t] + k] = w.phrases[k];
-        for (u32 i = 0; i < f.n; i++)
-          f.term[i] = w.keys[f.term[i]];
-        f.query += nq[t];
-      }
+      auto place = [&](auto &all, auto &part, u32 at) {
+        for (auto &x : part) {
+          for (u32 i = 0; i < x.n; i++)
+            x.term[i] = w.keys[x.term[i]];
+          x.query += nq[t], all[at++] = x;
+        }
+      };
+      place(bools, w.bools, nb[t]), place(phrases, w.phrases, np[t]);
     });
     first.reset(new First[queries]);
   }
@@ -333,8 +332,8 @@ struct Engine {
     freq[0] = 0;
     for (Bool &b : bools)
       for (u32 i = 0; i < b.n; i++)
-        if (freq[b.col[i]] >= 4 && !seen[b.col[i]]++)
-          order.push_back(b.col[i]);
+        if (freq[b.term[i]] >= 4 && !seen[b.term[i]]++)
+          order.push_back(b.term[i]);
     sort(order.begin(), order.end(),
          [&](u32 a, u32 b) { return freq[a] > freq[b]; });
     for (u32 i = 0; i < order.size() && i < 3000; i++)
@@ -343,9 +342,9 @@ struct Engine {
     cols = hot + 1;
     for (Bool &b : bools)
       for (u32 i = 0; i < b.n; i++) {
-        u32 &c = column[b.col[i]];
-        weight[c = c ? c : cols++] = freq[b.col[i]] + 1;
-        b.col[i] = c;
+        u32 &c = column[b.term[i]];
+        weight[c = c ? c : cols++] = freq[b.term[i]] + 1;
+        b.term[i] = c;
       }
     // Sorting by operator shape makes the evaluator's branches repeat.
     auto shape = [](const Bool &b) {
@@ -376,10 +375,10 @@ struct Engine {
     auto guard = [&](const Bool &b, u32 *g) {
       u32 best = ~0u, n = 0;
       for (u32 j = 0; j < b.n; j++) {
-        u32 cost = weight[b.col[j]], k = 1, terms[6] = {b.col[j]};
+        u32 cost = weight[b.term[j]], k = 1, terms[6] = {b.term[j]};
         for (u32 i = j + 1; i < b.n; i++)
           if (b.op[i - 1] == 'O')
-            cost += weight[b.col[i]], terms[k++] = b.col[i];
+            cost += weight[b.term[i]], terms[k++] = b.term[i];
         if ((!j || b.op[j - 1] == 'A') && cost < best)
           best = cost, n = k, copy(terms, terms + k, g);
       }
@@ -424,45 +423,32 @@ struct Engine {
     w.totals[b] += (u64(k) << 35) + sum;
     offer(bools[b].query, id, k);
   }
-  // Counts a block row and sums its positions with nibble tables: bytes weigh
-  // eight times their index, bits their offset in the byte.
+  // Counts a block row and sums its positions with nibble tables. A byte j of
+  // word w weighs 64w + 8j per set bit, plus each bit's offset in the byte.
   void add_bits(Worker &w, u32 b, const u64 *x, u32 base) {
     u32 q = bools[b].query;
-    auto bytes = [](auto... v) { return _mm256_setr_epi8(v..., v...); };
-    const __m256i pop = bytes(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4),
-                  weight = bytes(0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6),
-                  lane = _mm256_add_epi8(
-                      bytes(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
-                      _mm256_set_m128i(_mm_set1_epi8(16), _mm_setzero_si128())),
-        low = _mm256_set1_epi8(15), zero = _mm256_setzero_si256();
-    __m256i count = zero, sum = zero, index = zero;
+    auto shuffle = [](B32 t, B32 i) { return (B32)_mm256_shuffle_epi8(__m256i(t), __m256i(i)); };
+    auto sad = [](B32 v) { return (Q4)_mm256_sad_epu8(__m256i(v), __m256i{}); };
+    const B32 pop = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+                     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4},
+              weight = {0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6,
+                        0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6};
+    const Q4 odd = Q4{} + 0xff00ff00ff00ff00, two = Q4{} + 0xffff0000ffff0000,
+             four = Q4{} + 0xffffffff00000000, word = {0, 64, 128, 192};
+    Q4 c = {}, s = {};
     for (u32 i = 0; i < kWords / 4; i++) {
-      __m256i v = _mm256_loadu_si256((const __m256i *)x + i);
-      __m256i lo = _mm256_and_si256(v, low);
-      __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low);
-      __m256i ph = _mm256_shuffle_epi8(pop, hi);
-      __m256i p = _mm256_add_epi8(_mm256_shuffle_epi8(pop, lo), ph);
-      __m256i bits = _mm256_add_epi8(_mm256_shuffle_epi8(weight, lo),
-                                     _mm256_shuffle_epi8(weight, hi));
-      bits = _mm256_add_epi8(bits, _mm256_slli_epi16(ph, 2));
-      __m256i c = _mm256_sad_epu8(p, zero);
-      __m256i at = _mm256_mul_epu32(c, _mm256_set1_epi64x(32 * i));
-      count = _mm256_add_epi64(count, c);
-      sum = _mm256_add_epi64(sum, _mm256_sad_epu8(bits, zero));
-      sum = _mm256_add_epi64(sum, _mm256_slli_epi64(at, 3));
-      __m256i idx = _mm256_maddubs_epi16(p, lane);
-      index = _mm256_add_epi32(index, _mm256_madd_epi16(idx, _mm256_set1_epi16(1)));
+      B32 v = load32(x + 4 * i), lo = v & 15, hi = v >> 4, ph = shuffle(pop, hi);
+      B32 p = shuffle(pop, lo) + ph;
+      Q4 n = sad(p), bytes = sad(p & (B32)odd) + 2 * sad(p & (B32)two) +
+                            4 * sad(p & (B32)four);
+      c += n;
+      s += sad(shuffle(weight, lo) + shuffle(weight, hi) + (ph << 2)) +
+           8 * bytes + n * (word + 256 * i);
     }
-    alignas(32) u64 c[4], s[4];
-    alignas(32) u32 t[8];
-    _mm256_store_si256((__m256i *)c, count);
-    _mm256_store_si256((__m256i *)s, sum);
-    _mm256_store_si256((__m256i *)t, index);
     u64 n = c[0] + c[1] + c[2] + c[3];
     if (!n)
       return;
-    w.totals[b] += (n << 35) + n * base + s[0] + s[1] + s[2] + s[3] +
-                   8 * (u64(t[0]) + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7]);
+    w.totals[b] += (n << 35) + n * base + s[0] + s[1] + s[2] + s[3];
     u32 id[10], k = 0;
     for (u32 i = 0; i < kWords && k < 10 && base <= first[q].bound; i++)
       for (u64 b = x[i]; b && k < 10; b &= b - 1)
@@ -474,17 +460,39 @@ struct Engine {
   // Applies the guarded Boolean queries, strictly left to right, to a block.
   void evaluate(Worker &w, u32 base) {
     const u64 *rows = w.rows.data();
-    u64 *v = w.value;
+    u64 *v = w.value, r;
     auto bits = [&](u64 s) { return s == kLocal ? v : rows + s * kWords; };
     auto has = [&](u64 s, u32 p) {
       return count_of(s) ? small_has(s, p) : bits(s)[p / 64] >> p % 64 & 1;
     };
-    auto filter = [&](u64 s, u64 o, bool keep) {
+    auto filter = [&](u64 s, u64 o, bool keep) { // Positions of s (not) in o.
       u64 out = 0, k = 0;
       for (u32 i = 0; i < count_of(s); i++)
         if (has(o, at(s, i)) == keep)
           out |= u64(at(s, i)) << (12 * k++);
       return k ? out | k << 61 : 0;
+    };
+    auto unite = [&](u64 o) { // Unions may leave positions unsorted.
+      for (u32 j = 0; j < count_of(o); j++)
+        if (!small_has(r, at(o, j)))
+          r = (r + kOne) | u64(at(o, j)) << (12 * count_of(r));
+    };
+    auto apply = [&](char op, u64 o) { // Makes r a row in v, then applies o.
+      if (r != kLocal && count_of(r))
+        memset(v, 0, sizeof w.value);
+      for (u32 i = 0; r != kLocal && i < count_of(r); i++)
+        v[at(r, i) / 64] |= u64(1) << at(r, i) % 64;
+      if (r != kLocal && !count_of(r))
+        memcpy(v, rows + r * kWords, sizeof w.value);
+      r = kLocal;
+      for (u32 j = 0; j < count_of(o); j++) {
+        u64 &x = v[at(o, j) / 64], bit = u64(1) << at(o, j) % 64;
+        x = op == 'O' ? x | bit : x & ~bit;
+      }
+      for (u32 j = 0; !count_of(o) && j < kWords; j++) {
+        u64 x = rows[o * kWords + j];
+        v[j] = op == 'O' ? v[j] | x : op == 'A' ? v[j] & x : v[j] & ~x;
+      }
     };
     for (u32 word = 0; word < w.pending.size(); word++) {
       u32 list[64], n = 0; // Plans and their first sets are prefetched.
@@ -494,58 +502,26 @@ struct Engine {
         if (q + 8 < n)
           _mm_prefetch((const char *)&bools[list[q + 8]], _MM_HINT_T0);
         if (q + 4 < n)
-          _mm_prefetch((const char *)&w.state[bools[list[q + 4]].col[0]], _MM_HINT_T0);
+          _mm_prefetch((const char *)&w.state[bools[list[q + 4]].term[0]], _MM_HINT_T0);
         const Bool &b = bools[list[q]];
-        u64 r = w.state[b.col[0]];
-        auto local = [&] { // Copies the running set into v as a row.
-          if (r != kLocal && count_of(r))
-            memset(v, 0, sizeof w.value);
-          for (u32 i = 0; r != kLocal && i < count_of(r); i++)
-            v[at(r, i) / 64] |= u64(1) << at(r, i) % 64;
-          if (r != kLocal && !count_of(r))
-            memcpy(v, rows + r * kWords, sizeof w.value);
-          r = kLocal;
-        };
+        r = w.state[b.term[0]];
         for (u32 i = 1; i < b.n; i++) {
-          u64 o = w.state[b.col[i]];
+          u64 o = w.state[b.term[i]];
           char op = b.op[i - 1];
-          if (op == 'O') {
-            if (!o || o == r)
-              continue;
-            if (!r) {
-              r = o;
-              continue;
-            }
-            if (count_of(r) && count_of(o) && count_of(r) + count_of(o) <= kSmall) {
-              for (u32 j = 0; j < count_of(o); j++)
-                if (!small_has(r, at(o, j)))
-                  r = (r + kOne) | u64(at(o, j)) << (12 * count_of(r));
-              continue;
-            }
-            local();
-            if (count_of(o))
-              for (u32 j = 0; j < count_of(o); j++)
-                v[at(o, j) / 64] |= u64(1) << at(o, j) % 64;
-            else
-              for (u32 j = 0; j < kWords; j++)
-                v[j] |= rows[o * kWords + j];
-          } else if (r) {
-            if (!o)
-              r = op == 'A' ? 0 : r;
-            else if (count_of(r))
-              r = filter(r, o, op == 'A');
-            else if (count_of(o) && op == 'A')
-              r = filter(o, r, true);
-            else {
-              local();
-              if (count_of(o))
-                for (u32 j = 0; j < count_of(o); j++)
-                  v[at(o, j) / 64] &= ~(u64(1) << at(o, j) % 64);
-              else
-                for (u32 j = 0; j < kWords; j++)
-                  v[j] &= op == 'A' ? rows[o * kWords + j] : ~rows[o * kWords + j];
-            }
-          }
+          if (op == 'O' ? !o || o == r : !r)
+            continue;
+          if (op != 'O' && !o)
+            r = op == 'A' ? 0 : r;
+          else if (op == 'O' && !r)
+            r = o;
+          else if (op != 'O' && count_of(r))
+            r = filter(r, o, op == 'A');
+          else if (op == 'A' && count_of(o))
+            r = filter(o, r, true);
+          else if (count_of(r) && count_of(o) && count_of(r) + count_of(o) <= kSmall)
+            unite(o);
+          else
+            apply(op, o);
         }
         if (count_of(r))
           add_small(w, list[q], r, base);
@@ -676,7 +652,7 @@ struct Engine {
       }
   }
 
-  void write(const string &dir, const vector<Worker> &all) {
+  void write(const string &dir, vector<Worker> &all) {
     vector<string> text(all.size());
     parallel(all.size(), [&](u32 me) {
       for (size_t b = bools.size() * me / all.size();
@@ -684,6 +660,8 @@ struct Engine {
         for (const Worker &w : all)
           first[bools[b].query].total += w.totals[b];
     });
+    for (Worker &w : all) // Frees per-worker totals before the text grows.
+      vector<u64>().swap(w.totals);
     parallel(all.size(), [&](u32 me) {
       for (u32 q = queries * u64(me) / all.size();
            q < queries * u64(me + 1) / all.size(); q++) {
@@ -707,6 +685,7 @@ struct Engine {
 };
 
 int main(int argc, char **argv) {
+  mallopt(M_MMAP_THRESHOLD, 64 << 10); // Freed large buffers leave the heap.
   string data = "/data", out = "/out";
   for (int i = 1; i + 1 < argc; i += 2)
     (strcmp(argv[i], "--data") ? out : data) = argv[i + 1];
