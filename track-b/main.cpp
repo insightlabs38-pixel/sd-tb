@@ -750,8 +750,12 @@ class Engine {
                 LineTokens line;
                 size_t last_block = numeric_limits<size_t>::max();
                 const char *p = begin;
-                for (size_t group; (group = next_block.fetch_add(4)) < blocks;) {
-                  for (size_t block = group; block < min(group + 4, blocks); ++block) {
+                for (;;) {
+                  const size_t observed = next_block.load(memory_order_relaxed);
+                  const size_t claim = observed + workers * 4 < blocks ? 4 : 1;
+                  const size_t group = next_block.fetch_add(claim, memory_order_relaxed);
+                  if (group >= blocks) break;
+                  for (size_t block = group; block < min(group + claim, blocks); ++block) {
                   const uint32_t first = static_cast<uint32_t>(block * block_docs);
                   const size_t count = min<size_t>(block_docs, total_docs - first);
                   if (block != last_block + 1) p = seek(first);
