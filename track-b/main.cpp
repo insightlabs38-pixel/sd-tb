@@ -638,10 +638,7 @@ struct Engine {
         bucket[k % lookahead] = next;
         _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
-      keys[k] = dict.find(text + e[2 * k], keys[k], at);
-    }
-    for (u32 k = 0; k < count; k++) {
-      u64 m = keys[k];
+      u64 m = keys[k] = dict.find(text + e[2 * k], keys[k], at);
       u32 col = m >> 20 & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
       colds[cold] = col;
