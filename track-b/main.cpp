@@ -143,6 +143,17 @@ private:
         return static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(letters, digits)));
     }
 public:
+    // Query grammar already guarantees lowercase ASCII terms, so skip SIMD line tokenization.
+    static Probe query_probe(string_view word) {
+        if (word.size() > 8) {
+            auto [hash, key] = fingerprint(word);
+            return {word, hash, key};
+        }
+        uint64_t key = 0;
+        memcpy(&key, word.data(), word.size());
+        uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
+        return {word, hash ? hash : 1, key};
+    }
     void reserve(size_t count) {
         keys.reserve(count);
         fingerprints.reserve(count);
@@ -856,23 +867,36 @@ class Engine {
         const char *p = input.data, *end = p + input.size;
         dictionary.reserve(input.size / 24);
         queries.reserve(input.size / 20);
-        LineTokens line;
         while (p < end) {
             const char *line_end = static_cast<const char *>(memchr(p, '\n', end - p));
             if (!line_end) line_end = end;
-            line.load(p, line_end, end);
             Query q;
-            auto is = [&](size_t i, string_view text) { return line.probes[i].word == text; };
-            if (line.count && is(0, "BOOL")) {
-                // Terms and operators alternate; A, O and N identify AND, OR and NOT.
-                for (size_t i = 1; i < line.count; ++i) {
-                    if (i % 2) q.add_term(dictionary.intern(line.probes[i]));
-                    else q.add_operator(line.probes[i].word[0]);
-                }
-            } else if (line.count && is(0, "PHRASE")) {
+            const char *cursor, *limit;
+            if (line_end - p >= 5 && memcmp(p, "BOOL ", 5) == 0) {
+                cursor = p + 5;
+                limit = line_end;
+            } else if (line_end - p >= 9 && memcmp(p, "PHRASE \"", 8) == 0 && line_end[-1] == '"') {
                 q.phrase = true;
-                for (size_t i = 1; i < line.count; ++i) q.add_term(dictionary.intern(line.probes[i]));
+                cursor = p + 8;
+                limit = line_end - 1;
             } else throw runtime_error("invalid query line");
+            bool expect_term = true;
+            while (cursor < limit) {
+                const char *space = static_cast<const char *>(memchr(cursor, ' ', limit - cursor));
+                const char *stop = space ? space : limit;
+                if (stop == cursor) throw runtime_error("invalid query grammar");
+                if (q.phrase || expect_term) {
+                    string_view word(cursor, stop - cursor);
+                    q.add_term(dictionary.intern(FlatDictionary::query_probe(word)));
+                } else {
+                    if (stop - cursor == 3 && memcmp(cursor, "AND", 3) == 0) q.add_operator('A');
+                    else if (stop - cursor == 2 && memcmp(cursor, "OR", 2) == 0) q.add_operator('O');
+                    else if (stop - cursor == 3 && memcmp(cursor, "NOT", 3) == 0) q.add_operator('N');
+                    else throw runtime_error("invalid query operator");
+                }
+                expect_term = !expect_term;
+                cursor = space ? stop + 1 : limit;
+            }
             if (q.term_count == 0 || (!q.phrase && q.op_count + 1 != q.term_count))
                 throw runtime_error("invalid query grammar");
             queries.push_back(move(q));
