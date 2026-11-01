@@ -19,26 +19,23 @@ jobs:
           git -C /tmp/org checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
           python3 - <<'PY'
           from pathlib import Path
-          sources = [('base',Path('track-b/main.cpp')),('prefix',Path('experiments/breakthrough/prefix_partition.cpp'))]
-          markers = [
-            ('    engine.parse(queries, qsize, workers.size());',
-             '    auto t0 = std::chrono::steady_clock::now();\\n    engine.parse(queries, qsize, workers.size());\\n    auto t1 = std::chrono::steady_clock::now();'),
-            ('    engine.plan(docs, dsize);',
-             '    engine.plan(docs, dsize);\\n    auto t2 = std::chrono::steady_clock::now();'),
-            ('    engine.planner.join();',
-             '    engine.planner.join();\\n    auto t3 = std::chrono::steady_clock::now();'),
-            ('    engine.write(out, workers);',
-             '    engine.write(out, workers);\\n    auto t4 = std::chrono::steady_clock::now();\\n'
-             '    auto ms = [](auto a,auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };\\n'
-             '    fprintf(stderr,"PHASE_MS parse=%.3f plan=%.3f scan=%.3f output=%.3f\\\\n",'
-             'ms(t0,t1),ms(t1,t2),ms(t2,t3),ms(t3,t4));')
-          ]
-          for name,path in sources:
-            s=path.read_text()
-            for old,new in markers:\n              if old not in s: raise RuntimeError((name,old))\n              s=s.replace(old,new)
-            s=s.replace('#include <algorithm>','#include <algorithm>\n#include <chrono>')
-
-            Path('/tmp/'+name+'-phase.cpp').write_text(s)
+          for label,src in [('base','track-b/main.cpp'),('prefix','experiments/breakthrough/prefix_partition.cpp')]:
+            s=Path(src).read_text()
+            s=s.replace('#include <algorithm>','#include <algorithm>'+chr(10)+'#include <chrono>')
+            pairs=[
+              ('    engine.parse(queries, qsize, workers.size());',
+               '    auto t0=std::chrono::steady_clock::now(); engine.parse(queries,qsize,workers.size()); auto t1=std::chrono::steady_clock::now();'),
+              ('    engine.plan(docs, dsize);',
+               '    engine.plan(docs,dsize); auto t2=std::chrono::steady_clock::now();'),
+              ('    engine.planner.join();',
+               '    engine.planner.join(); auto t3=std::chrono::steady_clock::now();'),
+              ('    engine.write(out, workers);',
+               '    engine.write(out,workers); auto t4=std::chrono::steady_clock::now(); auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();}; fprintf(stderr,"PHASE_MS parse=%.3f plan=%.3f scan=%.3f output=%.3f",ms(t0,t1),ms(t1,t2),ms(t2,t3),ms(t3,t4)); fputc(10,stderr);')
+            ]
+            for a,b in pairs:
+              if a not in s: raise RuntimeError((label,a))
+              s=s.replace(a,b)
+            Path('/tmp/'+label+'-phase.cpp').write_text(s)
           PY
           for label in base prefix; do
             g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread "/tmp/$label-phase.cpp" -o "/tmp/$label-phase"
