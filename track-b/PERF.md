@@ -227,6 +227,66 @@ Source `ea351a5c9a3eb985faab60326e61387b6366b8b6` combines exact 9–12-letter k
 
 Full seeds 1/2/3: organizer five-run trimmed T=0.324628/0.325807/0.326278 s; peak M=42610688/41828352/42856448 B; S=925; D=1; K_local=20.346611/20.309763/20.295099. These are paired four-logical-CPU runner measurements, not official scores or a rejection of higher-core scaling. [Complete evidence and controlled handoff](https://github.com/insightlabs38-pixel/sd-tb/blob/frontier/b-sol-hybrid-qualification/experiments/frontier/HYBRIDS.md). Rollbacks: `b9ab12a`, official `8d5bc54` / PR #3 `338c7cf`, and PR #2 `4069aa9`.
 
+## Claude frontier: window tokenizer, bucket dictionary, hot rows (October 31)
+
+Rollback `d7845bc` (production blob `76946cc`, official `run-dcebadac870d`, K 23.250490). Mechanism, the complete
+postings measurement and every rejected experiment: `experiments/frontier/B-CLAUDE-FRONTIER.md`.
+
+One 64-byte AVX2 window tokenizer fingerprints while it splits (the query file uses it too); one four-way bucket
+dictionary answers term ID, Boolean column and phrase head with a single SIMD compare; frequent Boolean terms own
+permanent dense rows marked branch-free, the rest keep five inline positions; AVX2 exact dense count/sum; workers
+claim document-aligned blocks; plans are grouped by operator shape; 18-bit first-ten lists merged by value; output is
+merged and formatted on all threads; one worker per allowed CPU, at most twelve.
+
+Pinned qualification, run [41246193365](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41246193365) on source
+`a84e0b5` (blob `3c5bce7504eae1a0da6deb4a898a597d03214963`): pinned `gcc:15` offline Docker, uid 65534, read-only root,
+organizer timer, warmed inputs, five paired runs per seed on a 4-vCPU GitHub runner, differential, adversarial,
+randomized-shape fuzz, ASan/UBSan and TSan gates, published seed-1 hash and independent seed-2/3 references. The
+champion keeps its fixed 12 workers; on this runner the candidate therefore uses 4.
+
+| Seed | Champion T / M | Candidate T / M | S (both, incl. Dockerfile) | K_local | K ratio |
+|---|---|---|---|---|---|
+| 1 | 0.420 s / 42.8 MB | 0.267 s / 23.4 MB | 925 / 1110 | 17.88 -> 21.82 | 1.220 |
+| 2 | 0.406 s / 42.9 MB | 0.254 s / 23.5 MB | 925 / 1110 | 18.19 -> 22.40 | 1.231 |
+| 3 | 0.409 s / 42.6 MB | 0.257 s / 23.2 MB | 925 / 1110 | 18.13 -> 22.26 | 1.228 |
+
+Same-worker-count evidence (both at 12 oversubscribed workers, earlier source `893af0d`, [run 41243209029](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41243209029)):
+T 0.476 -> 0.335 s, M 42.8 -> 45.2 MB, K ratio **1.156 / 1.152 / 1.157**. [Parameter sweep 41245241013](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41245241013)
+(7 paired runs, seeds 1-2): hot-row cap 1500/2000, hot threshold 8, 256 KB sample, 1,536-document blocks and word-major hot
+rows are all within +-2% of the base (noise); 4 and 6 workers beat 12 by ~12% on this 4-vCPU runner (3x oversubscribed) at half the memory,
+which is why the worker count now follows the CPU affinity mask. On the 12-logical-CPU scoring host this is still 12.
+
+Development host (4 cores, GCC 13), seed 1, full corpus, interleaved min of 9-11: pinned single core 1,376 -> 786 ms;
+4 workers 391 -> 242 ms; 12 workers 408 -> 246 ms; anonymous memory 38.5 -> 42.1 MB (12 workers). Seed 2 matches the
+independent Python reference byte for byte. These are runner and development-host measurements, not board scores.
+
+Worker scaling on the 4-vCPU SMT runner ([sweep 41247058378](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41247058378), final source, 7 paired runs, seeds 1/2 mean T):
+2 workers **0.419 s**, 3 workers **0.369 s**, 4 workers **0.332 s** (best, equals the logical CPU count), 6 **0.344 s**, 8 **0.357 s**, 12 **0.377 s**, 16 **0.382 s**;
+peak memory 17 / 21 / 23 / 29 / 35 / 46 / 58 MB; champion (12 workers) 0.526 s / 42.6 MB. Using both SMT siblings is worth ~21% over one thread per core, and
+oversubscription costs ~5-15%, so one worker per logical CPU (at most twelve) is the right default; the 12-logical-CPU scoring host keeps 12.
+
+Parameters at the correct worker count ([sweep 41247879158](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41247879158), 4 workers, 7 paired runs, seeds 1/2 mean T):
+base **0.320 s**; hot threshold 2 / 8 / 16 **0.322 / 0.324 / 0.322 s** (flat, noise); prefetch distance 16 **0.319 s** (flat); block size 1,024 **0.331 s** (+3.5%),
+1,536 **0.351 s** (+10%), 3,072 **0.360 s** (+13%). 2,048 documents per block, threshold 4 and distance 8 stay.
+
+Micro-variants at 4 workers ([sweep 41248666184](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41248666184), 7 paired runs): base **0.282 s**;
+without the cold-state prefetch **0.282 s**, prefetch distance 4 / 12 **0.284 / 0.281 s**, 24-byte `Probe` **0.282 s** (all noise; champion 0.453 s).
+Exactness across worker counts: seed-2 output equals the independent Python reference for 1, 2, 3, 5, 7, 12, 16 and 24 workers, and under ASan/UBSan with 3 and 12 workers.
+
+Independent repeat on the final tree ([run 41249438140](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41249438140), source `7706b5b`, same `main.cpp` blob; a faster runner draw):
+champion T 0.318 / 0.322 / 0.317 s, candidate **0.188 / 0.193 / 0.188 s**, M 23 MB, K_local 20.57 -> 25.99, 20.44 -> 25.65, 20.59 -> 26.04, K ratio **1.264 / 1.255 / 1.265**.
+Runner-to-runner variance is large (champion 0.32-0.54 s), so only paired ratios are meaningful.
+Serial phases on the runner (phase-lap build, 4 workers): query parse 12.1 ms, compile 8.7 ms, scan 298 ms, output 5.3 ms; on a 12-thread host these ~26 ms
+become ~20% of T, so parallelizing query interning (sharded buckets) is the most valuable remaining item.
+
+### Handoff for Luna (exact source)
+
+* Source: the engine described above is already on `main` (PR #10, blob `fb67cede8d56f88faf543b57699b580cd9dab14a`, the scheduled developer's promotion of this branch's lineage plus an empty-`active` guard on the cold-state prefetch). This PR keeps that exact blob. The pre-merge branch blob `854acdeda8b5...` ([run 41251446909](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41251446909), K ratio 1.206 / 1.204 / 1.198) differs only by a two-line plan-reserve/anchor-comparison cleanup that was dropped to keep the already-qualified blob. Earlier receipts above used previous blobs of the same lineage. `track-b/Dockerfile` is byte-identical to `sd-sm` (blob `9b064d4031a7...`).
+* Canonical S (clang-format LLVM + scc): 1,101 + 7 Dockerfile lines = 1,108; D = 1; no new dependencies.
+* Suggested A/B: this blob versus `76946cc`, same host and image, five interleaved runs. Expect the scoring host's T to
+  fall by 30-40% (local), or ~25-30% if SMT contention behaves like the 4-vCPU runner; memory should stay near 49-55 MB
+  (12 workers), so the M term is slightly negative while the cap does not apply.
+* Rollback: `d7845bc` / blob `76946cc`.
 ## Boolean revival and touched-column confirmation (October 31)
 
 [Five-seed, seven-repeat revival qualification](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41242428149) passed full-output hashes, adversarial/differential checks, sanitizers and offline Docker. The legacy candidate scored **18.818317** versus **18.663041** runner-local geometric-mean K for the revival prefilter, which lost on all five seeds (0.825% lower). Rejected; no promotion.
