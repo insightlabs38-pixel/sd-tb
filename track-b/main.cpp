@@ -76,8 +76,10 @@ public:
 private:
     // Metadata word: (term ID + 1) in bits 0-19, Boolean column in 20-39, phrase head + 1 above.
     // Four-way buckets hold exact keys; a full bucket spills into the next one.
-    struct alignas(64) Bucket { uint64_t keys[4]; uint64_t meta[4]; };
+    struct alignas(32) Bucket { uint64_t keys[4]; };
+    struct alignas(32) Metadata { uint64_t meta[4]; };
     vector<Bucket> buckets;
+    vector<Metadata> bucket_meta;
     size_t bucket_mask = 0;
     vector<string_view> keys;
     vector<uint64_t> fingerprints;
@@ -126,14 +128,18 @@ private:
     void place(uint64_t key, uint64_t meta) {
         for (size_t b = hash_of(key) & bucket_mask;; b = (b + 1) & bucket_mask) {
             Bucket &bucket = buckets[b];
-            for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) { bucket.keys[i] = key; bucket.meta[i] = meta; return; }
+            for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) { bucket.keys[i] = key; bucket_meta[b].meta[i] = meta; return; }
         }
     }
     void grow(size_t count) {
         vector<Bucket> old(count);
+        vector<Metadata> old_meta(count);
         old.swap(buckets);
+        old_meta.swap(bucket_meta);
         bucket_mask = count - 1;
-        for (const Bucket &bucket : old) for (unsigned i = 0; i < 4; ++i) if (bucket.keys[i]) place(bucket.keys[i], bucket.meta[i]);
+        for (size_t b = 0; b < old.size(); ++b)
+            for (unsigned i = 0; i < 4; ++i)
+                if (old[b].keys[i]) place(old[b].keys[i], old_meta[b].meta[i]);
     }
     static uint32_t alnum_mask(const char *p) {
         const __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
@@ -158,7 +164,7 @@ public:
         for (size_t b = probe.hash & bucket_mask;; b = (b + 1) & bucket_mask) {
             Bucket &bucket = buckets[b];
             for (unsigned hit = match_mask(bucket, probe.key); hit; hit &= hit - 1) {
-                uint32_t id = term_id(bucket.meta[countr_zero(hit)]);
+                uint32_t id = term_id(bucket_meta[b].meta[countr_zero(hit)]);
                 if ((probe.key >> 62) != 2 || FoldEqual{}(keys[id], probe.word)) return id;
             }
             for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) {
@@ -166,7 +172,7 @@ public:
                 keys.push_back(probe.word);
                 fingerprints.push_back(probe.key);
                 bucket.keys[i] = probe.key;
-                bucket.meta[i] = id + 1;
+                bucket_meta[b].meta[i] = id + 1;
                 return id;
             }
         }
@@ -175,13 +181,13 @@ public:
     size_t size() const { return keys.size(); }
     size_t term_length(uint32_t term) const { return keys[term].size(); }
     void configure_metadata(const vector<uint32_t> &columns, const vector<int32_t> &heads) {
-        for (Bucket &bucket : buckets) for (unsigned i = 0; i < 4; ++i) if (bucket.keys[i]) {
-            uint32_t id = term_id(bucket.meta[i]);
+        for (size_t b = 0; b < buckets.size(); ++b) for (unsigned i = 0; i < 4; ++i) if (buckets[b].keys[i]) {
+            uint32_t id = term_id(bucket_meta[b].meta[i]);
             uint32_t column = columns[id] + 1;
             uint32_t head = static_cast<uint32_t>(heads[id] + 1);
             // The frozen query limit keeps columns within 20 bits and heads within 24.
             if (column > 0xfffffu || head > 0xffffffu) throw runtime_error("query metadata capacity");
-            bucket.meta[i] = (id + 1) | (uint64_t(column) << 20) | (uint64_t(head) << 40);
+            bucket_meta[b].meta[i] = (id + 1) | (uint64_t(column) << 20) | (uint64_t(head) << 40);
         }
     }
     // Splits [b, b+len) into tokens and fingerprints them; b must be readable for len+64 bytes.
@@ -236,7 +242,8 @@ public:
         const unsigned hit = match_mask(bucket, probe.key);
         // Misses in a full bucket and long-token candidates are the only cases needing a loop.
         if (__builtin_expect(((probe.key >> 62) == 2) | ((hit == 0) & (bucket.keys[3] != 0)), 0)) return resolve_slow(probe, b);
-        return bucket.meta[countr_zero(hit) & 3] & -uint64_t(hit != 0);
+        if (!hit) return 0;
+        return bucket_meta[b].meta[countr_zero(hit)];
     }
     // Equal 32-bit fingerprints may name different words, so long-token candidates are compared in full.
     uint64_t resolve_slow(const Probe &probe, size_t b) const {
@@ -244,7 +251,7 @@ public:
         for (;; b = (b + 1) & bucket_mask) {
             const Bucket &bucket = buckets[b];
             for (unsigned i = 0; i < 4; ++i)
-                if (bucket.keys[i] == probe.key && (exact || FoldEqual{}(keys[term_id(bucket.meta[i])], probe.word))) return bucket.meta[i];
+                if (bucket.keys[i] == probe.key && (exact || FoldEqual{}(keys[term_id(bucket_meta[b].meta[i])], probe.word))) return bucket_meta[b].meta[i];
             if (bucket.keys[3] == 0) return 0;
         }
     }
