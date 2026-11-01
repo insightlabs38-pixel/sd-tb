@@ -5,7 +5,7 @@ on:
       - 'research/b-breakthrough-20261101-prefix-partition-fast'
     paths:
       - 'experiments/breakthrough/**'
-      - '.github/workflows/b-prefix-fast-fast.yml'
+      - '.github/workflows/b-prefix-partition-fast.yml'
   workflow_dispatch:
 
 permissions:
