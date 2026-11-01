@@ -13,6 +13,11 @@ S^-0.15 (cannot reward smaller than reference), D^-0.15.
 Comparable competitor: Cause Of Death B K=37.235722, T=0.100386s,
 M=42,561,536B, S=823, D=1 (board run `run-3eb48513bdc1`).
 **Competitor source not independently verified**, so this is score evidence only.
+Public source cross-check: Cache Me's repo `manusingh090/speed-demon-2026-entry`,
+board commit `c1ec48304e3f2de5eafd73312caecd53cb494455` has B BEST
+K=29.28357, T=0.17206s, M=47,489,024B, S=612.
+Its public Track B source blob `96124f0bf745ab99d1bc2ed9b6b41e61e735f43f`.
+This code does **not** demonstrate K35–38.
 
 ## Prior evidence and motivation
 `research/b-index-architecture-probes-20261031` demonstrated sparse
@@ -31,9 +36,10 @@ The fundamental bound was construction work and memory, not Boolean lookup.
 | document-major | [41290170972](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290170972) | approx 3.4x slower | Exact; not promoted |
 | late-materialization | [41290564523](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290564523) | -10.8%, -7.5%, -6.5% | Exact; not promoted |
 | phrase-id-fusion | [41290952082](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290952082) | -9.6%, -10.7%, -10.7% | Exact; not promoted |
+| prefix-direct-bitmap | [41291786946](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291786946) | pending | Corrected one-probe prefix predicate |
 | inverted-touched | [41290878805](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41290878805) | pending | Sparse activation repair |
-| prefix-predicate | [41291069032](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291069032) | pending | Pre-fingerprint query-known filter |
-| selective-document-exec | [41291300267](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291300267) | pending | Rare-trigger document/dense-block hybrid |
+| prefix-predicate | [41291069032](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291069032) | -5.0%, -6.5%, -11.4% | Exact; not promoted |
+| selective-document-exec | [41291300267](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41291300267) | -37.2%, -35.5%, -34.8% | Exact; not promoted |
 
 Full-run CI generates official seed 1 and independent seed 2/3 corpus/reference,
 passes published SHA for seed1, applies 5 paired pinned-Docker full runs per seed,
@@ -51,9 +57,14 @@ ASan/UBSan, TSan, exact sample/tiny outputs, and uploads JSON evidence.
    five-inline-offset containers, even when it produces exact answers.
 4. Replacing phrase token fingerprint checks with integer IDs introduces
    36M extra token writes; the full-run regression outweighs small memory savings.
-5. Query-aware prefix filtering can only win if it eliminates costly fingerprint
-   construction *before* lexical lookup; a post-fingerprint Bloom filter
-   does not address that cost.
+5. Two-probe query prefix filtering before long-token hashing passed exactness,
+   but the redundant second hash and Bloom memory probes lost 5–11% wall time.
+   An optimized variant reuses the already available token CRC and probes one
+   bitset location, eliminating that overhead. Its run is pending.
+6. Replacing *all* document-major execution with only rare-trigger queries
+   still lost ~35% in the end-to-end run, including larger worker memory. The
+   per-document membership and watcher pass is too expensive to add to this
+   already-vectorized streaming pipeline.
 
 ## Handoff criteria
 No integration based on synthetic-only, single-seed, or unpaired timing.
