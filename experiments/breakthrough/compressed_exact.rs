@@ -35,7 +35,10 @@ const DOC_BITS: u32 = 15; // a thread's share holds under 2^15 documents
 /// The file, mapped over a spare zero page so loads of 32 bytes past any of
 /// its bytes stay inside the mapping.
 fn map(path: &str) -> &'static [u8] {
-    let file = std::fs::File::open(path).expect(path);
+    let resolved = if let Some(tail) = path.strip_prefix("/data/") {
+        format!("{}/{}", std::env::var("B_DATA_DIR").unwrap_or_else(|_| "/data".into()), tail)
+    } else { path.to_owned() };
+    let file = std::fs::File::open(&resolved).expect(&resolved);
     let len = file.metadata().unwrap().len() as usize;
     unsafe {
         let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0); // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS
@@ -462,6 +465,15 @@ impl Units {
 
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    while let Some(name) = args.next() {
+        let value = args.next().expect("missing argument value");
+        match name.as_str() {
+            "--data" => std::env::set_var("B_DATA_DIR", value),
+            "--out" => std::env::set_var("B_OUT_DIR", value),
+            _ => panic!("unrecognized CLI argument"),
+        }
+    }
     unsafe { mallopt(-3, 1 << 16) }; // M_MMAP_THRESHOLD: freed buffers go back to the kernel
     // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
@@ -720,7 +732,9 @@ fn main() {
         *chunk.lock().unwrap() = out;
     });
     // Chunk by chunk, so the answers are never held twice.
-    let file = std::fs::File::create("/out/results.txt").expect("/out/results.txt");
+    let outdir = std::env::var("B_OUT_DIR").unwrap_or_else(|_| "/out".into());
+    std::fs::create_dir_all(&outdir).expect("output directory");
+    let file = std::fs::File::create(format!("{outdir}/results.txt")).expect("results.txt");
     let mut out = std::io::BufWriter::new(file);
     for c in chunks {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
