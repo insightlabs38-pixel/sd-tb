@@ -2,6 +2,9 @@ name: Track B rolling bucket prefetch qualification
 # Paired three-seed comparison with the promoted compact engine.
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: [track-b/main.cpp, .github/workflows/track-b-rolling-bucket-prefetch-11.yml]
   push:
     branches: [track-b/rolling-bucket-prefetch-11]
     paths: [track-b/main.cpp, tests/**, .github/workflows/track-b-compact-engine-confirm-11.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
