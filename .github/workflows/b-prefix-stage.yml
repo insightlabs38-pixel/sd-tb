@@ -20,32 +20,24 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           sources = [('base',Path('track-b/main.cpp')),('prefix',Path('experiments/breakthrough/prefix_partition.cpp'))]
-          start = '''    engine.parse(queries, qsize, workers.size());
-              const char *docs = map_file(data + "/docs.txt", dsize);
-              engine.plan(docs, dsize);
-              engine.scan(docs, dsize, workers);
-              engine.planner.join();
-              engine.write(out, workers);'''
-          finish = '''    using Clock = std::chrono::steady_clock;
-              auto t0 = Clock::now();
-              engine.parse(queries, qsize, workers.size());
-              auto t1 = Clock::now();
-              const char *docs = map_file(data + "/docs.txt", dsize);
-              engine.plan(docs, dsize);
-              auto t2 = Clock::now();
-              engine.scan(docs, dsize, workers);
-              engine.planner.join();
-              auto t3 = Clock::now();
-              engine.write(out, workers);
-              auto t4 = Clock::now();
-              auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
-              fprintf(stderr, "PHASE_MS parse=%.3f plan=%.3f scan=%.3f output=%.3f\\n",
-                       ms(t0,t1),ms(t1,t2),ms(t2,t3),ms(t3,t4));'''
+          markers = [
+            ('    engine.parse(queries, qsize, workers.size());',
+             '    auto t0 = std::chrono::steady_clock::now();\\n    engine.parse(queries, qsize, workers.size());\\n    auto t1 = std::chrono::steady_clock::now();'),
+            ('    engine.plan(docs, dsize);',
+             '    engine.plan(docs, dsize);\\n    auto t2 = std::chrono::steady_clock::now();'),
+            ('    engine.planner.join();',
+             '    engine.planner.join();\\n    auto t3 = std::chrono::steady_clock::now();'),
+            ('    engine.write(out, workers);',
+             '    engine.write(out, workers);\\n    auto t4 = std::chrono::steady_clock::now();\\n'
+             '    auto ms = [](auto a,auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };\\n'
+             '    fprintf(stderr,"PHASE_MS parse=%.3f plan=%.3f scan=%.3f output=%.3f\\\\n",'
+             'ms(t0,t1),ms(t1,t2),ms(t2,t3),ms(t3,t4));')
+          ]
           for name,path in sources:
             s=path.read_text()
-            if start not in s: raise RuntimeError((name,'baseline marker absent'))
+            for old,new in markers:\n              if old not in s: raise RuntimeError((name,old))\n              s=s.replace(old,new)
             s=s.replace('#include <algorithm>','#include <algorithm>\n#include <chrono>')
-            s=s.replace(start,finish)
+
             Path('/tmp/'+name+'-phase.cpp').write_text(s)
           PY
           for label in base prefix; do
