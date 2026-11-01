@@ -781,8 +781,7 @@ class Engine {
                         if (index + kAhead < token_count) dictionary.prefetch(probes[index + kAhead]);
                         const uint64_t entry = dictionary.resolve(probes[index]);
                         const int32_t head = static_cast<int32_t>(entry >> 40) - 1;
-                        anchors[anchor_count] = {static_cast<uint32_t>(index), head};
-                        anchor_count += head >= 0;
+                        if (head >= 0) anchors[anchor_count++] = {static_cast<uint32_t>(index), head};
                         const uint32_t column = static_cast<uint32_t>(entry >> 20) & 0xfffffu;
                         const bool hot = column - 1 < hot_columns;
                         hot_rows[(hot ? column : hot_columns + 1) * words + document_word] |= document_bit;
