@@ -151,18 +151,20 @@ struct Dictionary {
   u64 find(const char *p, u64 key, u32 bucket) const {
     const Bucket &b = buckets[bucket];
     u32 m = match(b, key);
-    if (__builtin_expect((key >> 62 == 2) | (!m & (b.key[3] != 0)), 0))
-      return find_slow(p, key);
+    if (__builtin_expect(((key >> 62) == 2 && m) || (!m && b.key[3]), 0))
+      return find_slow(p, key, bucket, m);
     return b.meta[countr_zero(m) & 3] & -u64(m != 0);
   }
-  u64 find_slow(const char *p, u64 key) const {
-    for (u32 i = hash_of(key);; i++) {
+  // Reuse the first bucket and its match mask on slow or colliding probes.
+  u64 find_slow(const char *p, u64 key, u32 i, u32 hits) const {
+    for (;;) {
       const Bucket &b = buckets[i & mask()];
-      for (u32 m = match(b, key); m; m &= m - 1)
+      for (u32 m = hits; m; m &= m - 1)
         if (key >> 62 != 2 || same(b.meta[countr_zero(m)], p))
           return b.meta[countr_zero(m)];
       if (!b.key[3])
         return 0;
+      hits = match(buckets[++i & mask()], key);
     }
   }
   bool same(u64 meta, const char *p) const {
