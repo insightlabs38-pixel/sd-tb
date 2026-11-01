@@ -234,6 +234,8 @@ struct Engine {
   vector<Bool> bools;
   vector<Phrase> phrases;
   u32 queries = 0, hot = 0, cols = 1;
+  thread planner;
+  atomic<bool> planned{false};
   vector<u32> guards, guarded; // guarded[guards[c]...] lists column c's queries
   unique_ptr<First[]> first;
   unique_ptr<atomic<u32>[]> bound; // The tenth smallest ID once a list is full.
@@ -355,9 +357,14 @@ struct Engine {
         b.term[i] = c;
       }
     // Sorting by operator shape makes the evaluator's branches repeat.
-    sort(bools.begin(), bools.end(),
-         [](const Bool &a, const Bool &b) { return a.shape < b.shape; });
-    plan_guards(weight);
+    // Evaluation order and guards are first needed at a block's end, so they are
+    // planned while the scan starts.
+    planner = thread([this, weight = std::move(weight)] {
+      sort(bools.begin(), bools.end(),
+           [](const Bool &a, const Bool &b) { return a.shape < b.shape; });
+      plan_guards(weight);
+      planned.store(true, memory_order_release);
+    });
     for (u32 k = 0; k < phrases.size(); k++) {
       Phrase &f = phrases[k];
       for (u32 i = 1; i < f.n; i++)
@@ -576,6 +583,8 @@ struct Engine {
 
   // Runs the block's guarded queries, then clears the block's term sets.
   void flush(Worker &w, u32 base) {
+    while (!planned.load(memory_order_acquire))
+      this_thread::yield();
     for (u32 i = 1; i <= hot; i++)
       if (any_of(&w.rows[i * kWords], &w.rows[i * kWords + kWords],
                  [](u64 x) { return x; }))
@@ -616,8 +625,13 @@ struct Engine {
     const u32 hot = this->hot, *bucket = ids;
     u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
+    for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
+      keys[k] = dict.find(text + e[2 * k], keys[k], bucket[k]);
+      u32 col = keys[k] >> 20 & 0xfffff;
+      _mm_prefetch((const char *)&rows[(col & -u32(col <= hot)) * kWords + word], _MM_HINT_T0);
+    }
     for (u32 k = 0; k < count; k++) {
-      u64 m = dict.find(text + e[2 * k], keys[k], bucket[k]);
+      u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
       ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
@@ -706,6 +720,7 @@ int main(int argc, char **argv) {
     const char *docs = map_file(data + "/docs.txt", dsize);
     engine.plan(docs, dsize);
     engine.scan(docs, dsize, workers);
+    engine.planner.join();
     engine.write(out, workers);
   } catch (const exception &e) {
     fprintf(stderr, "%s\n", e.what());
