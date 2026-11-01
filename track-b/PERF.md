@@ -393,3 +393,7 @@ Projected box K against BEST 26.690516 (S 691, M saturated): 30.3 if T equals th
 ## SIMD Boolean bitmap operations (provisional, November 1)
 
 [Three-seed, five-repeat qualification 41350926249](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41350926249) passed exact full hashes on seeds 1/2/3, sample/tiny, differential/adversarial, ASan/UBSan, TSan and offline Docker. AVX2 OR/AND/ANDNOT for 2048-bit rows produced runner-local K ratios **1.070307 / 1.007625 / 1.000588**, geometric mean **1.025701 (+2.5701%)** versus champion; candidate S=702 versus 695, D=1. Seed-1 timings were noisy, so a five-full-seed seven-repeat confirmation was launched at branch `track-b/boolean-simd-confirm-11`, commit `44259eac64537eac393c0db8fa1173f5e920b9d9`. Do not promote before confirmation.
+
+## SIMD Boolean bitmap confirmation (not promoted, November 1)
+
+[Five-full-seed, seven-repeat confirmation 41356303092](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41356303092) passed published/independent full hashes, sample/tiny, differential/adversarial tests, ASan/UBSan, TSan and pinned offline Docker. Candidate/champion runner-local K ratios: **1.002844 / 1.003496 / 0.998426 / 1.001326 / 1.002824**, geometric mean **1.001782 (+0.1782%)**, four wins and one loss. Candidate S=702 versus champion S=695, D=1. This is a marginal, noise-sensitive advantage, inconsistent with the larger three-seed estimate; do not promote without stronger evidence. Preserve champion source blob `6450d009a5d07f719f3678becea49d89b136737a`. No official board result claimed.
