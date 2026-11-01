@@ -68,11 +68,14 @@ struct FoldEqual {
 
 class FlatDictionary {
 public:
+    // Compact corpus token descriptors avoid copying a 16-byte string_view per token.
     struct Probe {
-        string_view word;
-        uint32_t hash;
         uint64_t key;
+        uint32_t hash;
+        uint32_t span; // byte offset (high 26 bits), token length (low 6 bits)
+        string_view word(const char *base) const { return {base + (span >> 6), span & 63u}; }
     };
+    static_assert(sizeof(Probe) == 16);
 private:
     // Metadata word: (term ID + 1) in bits 0-19, Boolean column in 20-39, phrase head + 1 above.
     // Four-way buckets hold exact keys; a full bucket spills into the next one.
@@ -150,7 +153,7 @@ public:
         while (buckets_needed * 2 < count) buckets_needed *= 2;
         grow(buckets_needed);
     }
-    uint32_t intern(const Probe &probe) {
+    uint32_t intern(const Probe &probe, const char *base) {
         // The frozen query limit keeps IDs and columns within 20 bits.
         if (keys.size() + 2 >= (1u << 20)) throw runtime_error("query metadata capacity");
         if (buckets.empty()) grow(1024);
@@ -159,11 +162,11 @@ public:
             Bucket &bucket = buckets[b];
             for (unsigned hit = match_mask(bucket, probe.key); hit; hit &= hit - 1) {
                 uint32_t id = term_id(bucket.meta[countr_zero(hit)]);
-                if ((probe.key >> 62) != 2 || FoldEqual{}(keys[id], probe.word)) return id;
+                if ((probe.key >> 62) != 2 || FoldEqual{}(keys[id], probe.word(base))) return id;
             }
             for (unsigned i = 0; i < 4; ++i) if (!bucket.keys[i]) {
                 uint32_t id = static_cast<uint32_t>(keys.size());
-                keys.push_back(probe.word);
+                keys.push_back(probe.word(base));
                 fingerprints.push_back(probe.key);
                 bucket.keys[i] = probe.key;
                 bucket.meta[i] = id + 1;
@@ -198,7 +201,7 @@ public:
             const unsigned used = size < 8 ? size : 8;
             const uint64_t key = (word | 0x2020202020202020ULL) & (~uint64_t(0) >> (64 - used * 8));
             const uint32_t hash = static_cast<uint32_t>(_mm_crc32_u64(2166136261u, key));
-            out[count] = {string_view(b + from, size), hash ? hash : 1, key};
+            out[count] = {key, hash ? hash : 1, (from << 6) | size};
             longs[long_count] = static_cast<uint32_t>(count++);
             long_count += size > 8;
         };
@@ -224,27 +227,27 @@ public:
         }
         for (size_t k = 0; k < long_count; ++k) {
             Probe &probe = out[longs[k]];
-            tie(probe.hash, probe.key) = fingerprint(probe.word);
+            tie(probe.hash, probe.key) = fingerprint(probe.word(b));
         }
         return count;
     }
     void prefetch(const Probe &probe) const { __builtin_prefetch(&buckets[probe.hash & bucket_mask], 0, 3); }
     // Returns the metadata word, or zero on a miss; long-token matches are verified byte for byte.
-    uint64_t resolve(const Probe &probe) const {
+    uint64_t resolve(const Probe &probe, const char *base) const {
         const size_t b = probe.hash & bucket_mask;
         const Bucket &bucket = buckets[b];
         const unsigned hit = match_mask(bucket, probe.key);
         // Misses in a full bucket and long-token candidates are the only cases needing a loop.
-        if (__builtin_expect(((probe.key >> 62) == 2) | ((hit == 0) & (bucket.keys[3] != 0)), 0)) return resolve_slow(probe, b);
+        if (__builtin_expect(((probe.key >> 62) == 2) | ((hit == 0) & (bucket.keys[3] != 0)), 0)) return resolve_slow(probe, b, base);
         return bucket.meta[countr_zero(hit) & 3] & -uint64_t(hit != 0);
     }
     // Equal 32-bit fingerprints may name different words, so long-token candidates are compared in full.
-    uint64_t resolve_slow(const Probe &probe, size_t b) const {
+    uint64_t resolve_slow(const Probe &probe, size_t b, const char *base) const {
         const bool exact = (probe.key >> 62) != 2;
         for (;; b = (b + 1) & bucket_mask) {
             const Bucket &bucket = buckets[b];
             for (unsigned i = 0; i < 4; ++i)
-                if (bucket.keys[i] == probe.key && (exact || FoldEqual{}(keys[term_id(bucket.meta[i])], probe.word))) return bucket.meta[i];
+                if (bucket.keys[i] == probe.key && (exact || FoldEqual{}(keys[term_id(bucket.meta[i])], probe.word(base)))) return bucket.meta[i];
             if (bucket.keys[3] == 0) return 0;
         }
     }
@@ -252,15 +255,16 @@ public:
         uint64_t key = fingerprints[term];
         return key | ((key >> 62) == 2 ? uint64_t(term) << 32 : 0);
     }
-    bool phrase_equal(uint64_t expected, const Probe &probe) const {
+    bool phrase_equal(uint64_t expected, const Probe &probe, const char *base) const {
         if ((expected >> 62) != 2) return expected == probe.key;
         return probe.key == ((uint64_t(1) << 63) | static_cast<uint32_t>(expected)) &&
-            FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word);
+            FoldEqual{}(keys[static_cast<uint32_t>(expected >> 32) & 0x7fffffffu], probe.word(base));
     }
 };
 
 // Reusable per-worker buffers that turn one document line into fingerprinted probes.
 struct LineTokens {
+    const char *base = nullptr;
     vector<uint32_t> longs;
     vector<FlatDictionary::Probe> probes;
     vector<char> tail;
@@ -268,6 +272,7 @@ struct LineTokens {
     void load(const char *text, const char *line_end, const char *file_end) {
         const char *original = text;
         size_t length = line_end - text;
+        if (length >= (1u << 26)) throw runtime_error("document line too long");
         const bool padded = file_end - line_end < 128;
         if (padded) {
             // Only the file's last lines need a padded copy so SIMD loads stay in bounds.
@@ -278,9 +283,10 @@ struct LineTokens {
         size_t capacity = length / 2 + 40;
         if (longs.size() < capacity) { longs.resize(capacity); probes.resize(capacity); }
         count = FlatDictionary::tokenize(text, length, probes.data(), longs.data());
-        // Words always refer to the original bytes, never to the temporary copy.
-        if (padded) for (size_t i = 0; i < count; ++i) probes[i].word = string_view(original + (probes[i].word.data() - text), probes[i].word.size());
+        // Offsets are unchanged by padding; long-token equality uses the original bytes.
+        base = original;
     }
+    string_view word(size_t i) const { return probes[i].word(base); }
 };
 
 struct Query {
@@ -497,7 +503,7 @@ class Engine {
             if (tab) {
                 line.load(tab + 1, line_end, file_end);
                 for (size_t i = 0; i < line.count; ++i)
-                    if (uint64_t meta = dictionary.resolve(line.probes[i])) ++frequency[FlatDictionary::term_id(meta)];
+                    if (uint64_t meta = dictionary.resolve(line.probes[i], line.base)) ++frequency[FlatDictionary::term_id(meta)];
             }
             p = line_end < file_end ? line_end + 1 : file_end;
         }
@@ -565,7 +571,7 @@ class Engine {
     }
 
     void match_document(uint32_t doc, span<const FlatDictionary::Probe> probes,
-                        span<const pair<uint32_t, int32_t>> anchors,
+                        span<const pair<uint32_t, int32_t>> anchors, const char *base,
                         Results &results, vector<uint32_t> &last) const {
         for (const auto &[pos, head] : anchors) {
             for (int32_t pid = head; pid >= 0; pid = phrases[pid].next) {
@@ -574,10 +580,10 @@ class Engine {
                 const size_t anchor = plan.anchor, count = plan.count;
                 if (pos < anchor || count - anchor > probes.size() - pos) continue;
                 size_t start = pos - anchor, j = 0;
-                while (j < anchor && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
+                while (j < anchor && dictionary.phrase_equal(plan.keys[j], probes[start + j], base)) ++j;
                 if (j != anchor) continue;
                 j = anchor + 1;
-                while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j])) ++j;
+                while (j < count && dictionary.phrase_equal(plan.keys[j], probes[start + j], base)) ++j;
                 if (j == count) {
                     last[pid] = doc;
                     results.add(plan.output, doc);
@@ -779,7 +785,7 @@ class Engine {
                     size_t cold_count = 0;
                     for (size_t index = 0; index < token_count; ++index) {
                         if (index + kAhead < token_count) dictionary.prefetch(probes[index + kAhead]);
-                        const uint64_t entry = dictionary.resolve(probes[index]);
+                        const uint64_t entry = dictionary.resolve(probes[index], line.base);
                         const int32_t head = static_cast<int32_t>(entry >> 40) - 1;
                         anchors[anchor_count] = {static_cast<uint32_t>(index), head};
                         anchor_count += head >= 0;
@@ -814,7 +820,7 @@ class Engine {
                             }
                         } else matrix[row * words + document_word] |= document_bit;
                     }
-                    match_document(doc, {probes, token_count}, {anchors.data(), anchor_count}, c.results, last);
+                    match_document(doc, {probes, token_count}, {anchors.data(), anchor_count}, line.base, c.results, last);
                     p = line_end < end ? line_end + 1 : end;
                     ++in_block;
                   }
@@ -863,16 +869,16 @@ class Engine {
             if (!line_end) line_end = end;
             line.load(p, line_end, end);
             Query q;
-            auto is = [&](size_t i, string_view text) { return line.probes[i].word == text; };
+            auto is = [&](size_t i, string_view text) { return line.word(i) == text; };
             if (line.count && is(0, "BOOL")) {
                 // Terms and operators alternate; A, O and N identify AND, OR and NOT.
                 for (size_t i = 1; i < line.count; ++i) {
-                    if (i % 2) q.add_term(dictionary.intern(line.probes[i]));
-                    else q.add_operator(line.probes[i].word[0]);
+                    if (i % 2) q.add_term(dictionary.intern(line.probes[i], line.base));
+                    else q.add_operator(line.word(i)[0]);
                 }
             } else if (line.count && is(0, "PHRASE")) {
                 q.phrase = true;
-                for (size_t i = 1; i < line.count; ++i) q.add_term(dictionary.intern(line.probes[i]));
+                for (size_t i = 1; i < line.count; ++i) q.add_term(dictionary.intern(line.probes[i], line.base));
             } else throw runtime_error("invalid query line");
             if (q.term_count == 0 || (!q.phrase && q.op_count + 1 != q.term_count))
                 throw runtime_error("invalid query grammar");
