@@ -620,12 +620,19 @@ struct Engine {
     }
     for (u32 i = 0, k; i < nlong; i++)
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
-    for (u32 k = 0; k < count; k++) // IDs hold bucket indices until found.
-      ids[k] = hash_of(keys[k]) & dict.mask(), _mm_prefetch((const char *)&dict.buckets[ids[k]], _MM_HINT_T0);
+    // Keep dictionary prefetches near their use instead of prefetching an
+    // entire document's random buckets before the first lookup.
+    for (u32 k = 0; k < count; k++)
+      ids[k] = hash_of(keys[k]) & dict.mask();
+    constexpr u32 lookahead = 8;
+    for (u32 k = 0; k < min(count, lookahead); k++)
+      _mm_prefetch((const char *)&dict.buckets[ids[k]], _MM_HINT_T0);
     const u32 hot = this->hot, *bucket = ids;
     u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
+      if (k + lookahead < count)
+        _mm_prefetch((const char *)&dict.buckets[ids[k + lookahead]], _MM_HINT_T0);
       keys[k] = dict.find(text + e[2 * k], keys[k], bucket[k]);
       u32 col = keys[k] >> 20 & 0xfffff;
       _mm_prefetch((const char *)&rows[(col & -u32(col <= hot)) * kWords + word], _MM_HINT_T0);
