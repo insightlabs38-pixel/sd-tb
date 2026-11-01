@@ -1,0 +1,37 @@
+name: B full-system economic telemetry
+on:
+  push:
+    branches: ['research/b-breakthrough-20261101-cost-telemetry']
+    paths:
+      - 'experiments/breakthrough/cost_telemetry.cpp'
+      - '.github/workflows/b-cost-telemetry.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin reference and compile complete instrumented engine
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 3e365d15d9905a0d73c9f05207d434a654666d3c
+          g++ -std=c++20 -O3 -flto -march=x86-64-v3 -DNDEBUG -pthread -Wall -Wextra experiments/breakthrough/cost_telemetry.cpp -o /tmp/b-profile
+      - name: Independent randomized small-dataset exactness
+        run: python3 tests/differential.py /tmp/b-profile
+      - name: Generate official full corpus and capture exact workload statistics
+        run: |
+          set -euo pipefail
+          python3 /tmp/organizer/generators/b_index.py --seed 1 --scale full --out /tmp/full-data
+          mkdir -p /tmp/full-output
+          /usr/bin/time -f 'COMPLETE_WALL=%e PEAK_RSS_KB=%M' /tmp/b-profile --data /tmp/full-data --out /tmp/full-output 2>&1 | tee /tmp/b-profile-stats.txt
+          echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/full-output/results.txt' | sha256sum -c -
+          git rev-parse HEAD >> /tmp/b-profile-stats.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b-engine-cost-telemetry
+          path: /tmp/b-profile-stats.txt
