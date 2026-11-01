@@ -433,22 +433,25 @@ struct Engine {
                      0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4},
               weight = {0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6,
                         0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6};
-    const Q4 odd = Q4{} + 0xff00ff00ff00ff00, two = Q4{} + 0xffff0000ffff0000,
-             four = Q4{} + 0xffffffff00000000, word = {0, 64, 128, 192};
-    Q4 c = {}, s = {};
+    const B32 lane = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+                      11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                      22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+    Q4 c = {}, s = {}, index = {};
     for (u32 i = 0; i < kWords / 4; i++) {
       B32 v = load32(x + 4 * i), lo = v & 15, hi = v >> 4, ph = shuffle(pop, hi);
       B32 p = shuffle(pop, lo) + ph;
-      Q4 n = sad(p), bytes = sad(p & (B32)odd) + 2 * sad(p & (B32)two) +
-                            4 * sad(p & (B32)four);
+      Q4 n = sad(p), at = (Q4)_mm256_mul_epu32(__m256i(n), __m256i(Q4{} + 256 * i));
       c += n;
-      s += sad(shuffle(weight, lo) + shuffle(weight, hi) + (ph << 2)) +
-           8 * bytes + n * (word + 256 * i);
+      s += sad(shuffle(weight, lo) + shuffle(weight, hi) + (ph << 2)) + at;
+      __m256i j = _mm256_maddubs_epi16(__m256i(p), __m256i(lane));
+      index += (Q4)_mm256_madd_epi16(j, _mm256_set1_epi16(8));
     }
+    index += index >> 32; // Pairs of 32-bit lane sums.
     u64 n = c[0] + c[1] + c[2] + c[3];
     if (!n)
       return;
-    w.totals[b] += (n << 35) + n * base + s[0] + s[1] + s[2] + s[3];
+    w.totals[b] += (n << 35) + n * base + s[0] + s[1] + s[2] + s[3] +
+                   u32(index[0]) + u32(index[1]) + u32(index[2]) + u32(index[3]);
     u32 id[10], k = 0;
     for (u32 i = 0; i < kWords && k < 10 && base <= first[q].bound; i++)
       for (u64 b = x[i]; b && k < 10; b &= b - 1)
