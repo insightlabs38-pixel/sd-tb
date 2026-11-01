@@ -1,0 +1,68 @@
+name: B compact exact-key BMI2 architecture
+on:
+  push:
+    branches:
+      - research/b-breakthrough-20261101-compact-bmi2
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compile independent baselines and exact compact variant
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git show c62868a789ef615f932f2816d6574fe78e149c5f:experiments/breakthrough/compressed_exact.rs > /tmp/prior.rs
+          rustc --edition=2021 -C opt-level=3 -C target-cpu=x86-64-v3 /tmp/prior.rs -o /tmp/prior
+          rustc --edition=2021 -C opt-level=3 -C target-cpu=x86-64-v3 experiments/breakthrough/compressed_exact.rs -o /tmp/compact
+          g++ -std=c++20 -O3 -march=x86-64-v3 -mbmi2 -pthread track-b/main.cpp -o /tmp/champion
+      - name: Differential adversarial exactness
+        run: |
+          set -euo pipefail
+          python3 tests/differential.py /tmp/compact
+          python3 tests/frontier_adversarial.py /tmp/compact
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/tiny7
+          mkdir -p /tmp/out /tmp/py7
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/tiny7 --out /tmp/py7
+          /tmp/compact --data /tmp/tiny7 --out /tmp/out
+          cmp /tmp/out/results.txt /tmp/py7/results.txt
+      - name: End-to-end independent full seeds paired 5 times
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/full-$seed"
+            if [ "$seed" != 1 ]; then
+              mkdir -p "/tmp/ref-$seed"
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/full-$seed" --out "/tmp/ref-$seed"
+            fi
+            for round in 1 2 3 4 5; do
+              for bin in compact prior champion; do
+                echo "MEASURE seed=$seed round=$round binary=$bin"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/$bin" --data "/tmp/full-$seed" --out /tmp/out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/out/results.txt "/tmp/ref-$seed/results.txt"
+                fi
+              done
+            done
+          done
+      - name: Pinned offline Docker exactness
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/compbox/src /tmp/compbox-out
+          cp experiments/breakthrough/compressed_exact.rs /tmp/compbox/src/main.rs
+          cp experiments/breakthrough/compressed-Cargo.toml /tmp/compbox/Cargo.toml
+          cp experiments/breakthrough/compressed-Dockerfile /tmp/compbox/Dockerfile
+          docker build --network=none -t b-compact-exact:research /tmp/compbox
+          chmod 777 /tmp/compbox-out
+          docker run --rm --user 65534:65534 --read-only --network=none --memory=4g \
+            -v /tmp/full-1:/data:ro -v /tmp/compbox-out:/out:rw b-compact-exact:research
+          echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/compbox-out/results.txt' | sha256sum -c -
