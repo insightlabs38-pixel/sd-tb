@@ -1,0 +1,60 @@
+name: B breakthrough hot-lexicon paired qualification
+on:
+  push:
+    branches:
+      - research/b-breakthrough-20261101-hot-lexicon
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch independent generator
+        run: git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+      - name: Compile and test exactness
+        run: |
+          set -euo pipefail
+          g++ -O3 -std=c++20 -march=x86-64-v3 -mbmi2 -pthread track-b/main.cpp -o /tmp/base
+          g++ -O3 -std=c++20 -march=x86-64-v3 -mbmi2 -pthread experiments/breakthrough/hot_lexicon.cpp -o /tmp/hot
+          python3 tests/differential.py /tmp/hot
+          python3 tests/frontier_adversarial.py /tmp/hot
+          g++ -O1 -g -std=c++20 -march=x86-64-v3 -mbmi2 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer experiments/breakthrough/hot_lexicon.cpp -o /tmp/hot-sanitized
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/tiny7
+          mkdir -p /tmp/san-out /tmp/py-out
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 /tmp/hot-sanitized --data /tmp/tiny7 --out /tmp/san-out
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/tiny7 --out /tmp/py-out
+          cmp /tmp/san-out/results.txt /tmp/py-out/results.txt
+      - name: Paired end-to-end full-seed testing
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/full-$seed"
+            if [ "$seed" != 1 ]; then
+              mkdir -p "/tmp/py-$seed"
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/full-$seed" --out "/tmp/py-$seed"
+            fi
+            for repeat in 1 2 3 4 5; do
+              for bin in base hot; do
+                echo "MEASURE seed=$seed repeat=$repeat candidate=$bin"
+                /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/$bin" --data "/tmp/full-$seed" --out /tmp/out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/out/results.txt "/tmp/py-$seed/results.txt"
+                fi
+              done
+            done
+          done
+      - name: Pinned offline Docker as unprivileged uid
+        run: |
+          mkdir -p /tmp/dock /tmp/dockout
+          cp track-b/Dockerfile /tmp/dock/Dockerfile
+          cp experiments/breakthrough/hot_lexicon.cpp /tmp/dock/main.cpp
+          docker build --network=none -t b-hotlextest /tmp/dock
+          chmod 777 /tmp/dockout
+          docker run --rm --user 65534:65534 --read-only --network=none -v /tmp/full-1:/data:ro -v /tmp/dockout:/out:rw b-hotlextest
+          echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/dockout/results.txt' | sha256sum -c -
