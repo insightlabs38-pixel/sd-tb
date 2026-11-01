@@ -21,6 +21,7 @@
 using namespace std;
 using u64 = uint64_t;
 using u32 = uint32_t;
+using u16 = uint16_t;
 typedef unsigned char B32 __attribute__((vector_size(32)));
 typedef u64 Q4 __attribute__((vector_size(32)));
 static B32 load32(const void *p) {
@@ -147,8 +148,8 @@ struct Dictionary {
     _mm_prefetch((const char *)&buckets[hash_of(key) & mask()], _MM_HINT_T0);
   }
   // The token's metadata, or zero when it is no query term.
-  u64 find(const char *p, u64 key) const {
-    const Bucket &b = buckets[hash_of(key) & mask()];
+  u64 find(const char *p, u64 key, u32 bucket) const {
+    const Bucket &b = buckets[bucket];
     u32 m = match(b, key);
     if (__builtin_expect((key >> 62 == 2) | (!m & (b.key[3] != 0)), 0))
       return find_slow(p, key);
@@ -195,6 +196,7 @@ struct Dictionary {
 struct Bool {
   u32 query, n, term[6];
   char op[5];
+  u16 shape; // Term count and operators; AND, NOT, OR differ in low bits.
 };
 struct Phrase {
   u32 query, n, anchor, term[8];
@@ -203,7 +205,6 @@ struct Phrase {
 // The ten smallest matching IDs of one query, merged under a spin lock.
 struct First {
   atomic<u64> total{0}; // Packed count << 35 | ID sum, as in Worker::totals.
-  atomic<u32> bound{~0u};
   atomic_flag busy;
   u32 n = 0, id[10];
 };
@@ -235,6 +236,7 @@ struct Engine {
   u32 queries = 0, hot = 0, cols = 1;
   vector<u32> guards, guarded; // guarded[guards[c]...] lists column c's queries
   unique_ptr<First[]> first;
+  unique_ptr<atomic<u32>[]> bound; // The tenth smallest ID once a list is full.
 
   // Threads parse line-aligned parts of the query file, then intern their
   // terms concurrently into a table sized for the term count.
@@ -271,6 +273,9 @@ struct Engine {
           Bool &b = w.bools.emplace_back(Bool{w.lines, n / 2});
           for (u32 i = 1; i < n; i++)
             i % 2 ? b.term[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
+          b.shape = b.n;
+          for (char op : b.op)
+            b.shape = b.shape << 2 | (op & 3);
         } else {
           Phrase &f = w.phrases.emplace_back(Phrase{w.lines, n - 1});
           for (u32 i = 1; i < n; i++)
@@ -310,7 +315,9 @@ struct Engine {
       };
       place(bools, w.bools, nb[t]), place(phrases, w.phrases, np[t]);
     });
-    first.reset(new First[queries]);
+    first.reset(new First[queries]), bound.reset(new atomic<u32>[queries]);
+    for (u32 q = 0; q < queries; q++)
+      bound[q].store(~0u, memory_order_relaxed);
   }
 
   // A corpus prefix ranks the terms. It decides hot rows, phrase anchors and
@@ -327,7 +334,8 @@ struct Engine {
         e.resize(eol - p + 72);
       // Edges 0 and 1 delimit the document ID.
       for (u32 i = 2, n = edges(p, eol - p, e.data()); i < n; i += 2)
-        freq[dict.find(p + e[i], key_of(p + e[i], e[i + 1] - e[i])) & 0xfffff]++;
+        if (u64 key = key_of(p + e[i], e[i + 1] - e[i]); true)
+          freq[dict.find(p + e[i], key, hash_of(key) & dict.mask()) & 0xfffff]++;
     }
     freq[0] = 0;
     for (Bool &b : bools)
@@ -347,14 +355,8 @@ struct Engine {
         b.term[i] = c;
       }
     // Sorting by operator shape makes the evaluator's branches repeat.
-    auto shape = [](const Bool &b) {
-      u32 key = b.n;
-      for (char op : b.op) // AND, NOT, OR and none differ in their low bits.
-        key = key << 2 | (op & 3);
-      return key;
-    };
     sort(bools.begin(), bools.end(),
-         [&](const Bool &a, const Bool &b) { return shape(a) < shape(b); });
+         [](const Bool &a, const Bool &b) { return a.shape < b.shape; });
     plan_guards(weight);
     for (u32 k = 0; k < phrases.size(); k++) {
       Phrase &f = phrases[k];
@@ -399,7 +401,7 @@ struct Engine {
 
   void offer(u32 q, const u32 *id, u32 k) {
     First &f = first[q];
-    if (id[0] > f.bound.load(memory_order_relaxed))
+    if (id[0] > bound[q].load(memory_order_relaxed))
       return;
     while (f.busy.test_and_set(memory_order_acquire))
       ;
@@ -408,7 +410,7 @@ struct Engine {
       out[m++] = j == k || (i < f.n && f.id[i] < id[j]) ? f.id[i++] : id[j++];
     memcpy(f.id, out, m * 4);
     if ((f.n = m) == 10)
-      f.bound.store(out[9], memory_order_relaxed);
+      bound[q].store(out[9], memory_order_relaxed);
     f.busy.clear(memory_order_release);
   }
   // Plan b's per-worker totals and the query's shared first IDs take a set.
@@ -453,7 +455,7 @@ struct Engine {
     w.totals[b] += (n << 35) + n * base + s[0] + s[1] + s[2] + s[3] +
                    u32(index[0]) + u32(index[1]) + u32(index[2]) + u32(index[3]);
     u32 id[10], k = 0;
-    for (u32 i = 0; i < kWords && k < 10 && base <= first[q].bound; i++)
+    for (u32 i = 0, more = base <= bound[q]; more && i < kWords && k < 10; i++)
       for (u64 b = x[i]; b && k < 10; b &= b - 1)
         id[k++] = base + 64 * i + countr_zero(b);
     if (k)
@@ -540,7 +542,7 @@ struct Engine {
     atomic<size_t> next{0};
     parallel(all.size(), [&](u32 me) {
       Worker &w = all[me];
-      w.rows.reserve((2 * hot + 64) * kWords); // Spill rows grow in place.
+      w.rows.reserve((2 * hot + 1024) * kWords); // Spill rows grow in place.
       w.rows.assign((hot + 1) * kWords, 0);
       w.state.assign(cols, 0);
       w.totals.assign(bools.size(), 0);
@@ -548,7 +550,7 @@ struct Engine {
       w.pending.assign(bools.size() / 64 + 1, 0);
       for (size_t from = 0; (from = next.load()) < size;) {
         size_t step = clamp<size_t>((size - from) / (4 * all.size()), 256 << 10,
-                                    1536 << 10);
+                                    6 << 20);
         if (!next.compare_exchange_weak(from, from + step))
           continue;
         u32 base = 0, n = 0;
@@ -609,19 +611,20 @@ struct Engine {
     }
     for (u32 i = 0, k; i < nlong; i++)
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
-    for (u32 k = 0; k < count && k < 8; k++)
-      dict.prefetch(keys[k]);
+    for (u32 k = 0; k < count; k++) // IDs hold bucket indices until found.
+      ids[k] = hash_of(keys[k]) & dict.mask(), _mm_prefetch((const char *)&dict.buckets[ids[k]], _MM_HINT_T0);
+    const u32 hot = this->hot, *bucket = ids;
+    u32 *colds = w.cold.data();
+    auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) {
-      if (k + 8 < count)
-        dict.prefetch(keys[k + 8]);
-      u64 m = dict.find(text + e[2 * k], keys[k]);
+      u64 m = dict.find(text + e[2 * k], keys[k], bucket[k]);
       u32 col = m >> 20 & 0xfffff;
       ids[k] = m & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
-      w.cold[cold] = col;
+      colds[cold] = col;
       cold += col > hot;
       if (m >> 40)
-        w.anchors[anchors++] = {k, int(m >> 40) - 1};
+        anchor[anchors++] = {k, int(m >> 40) - 1};
     }
     for (u32 k = 0; k < cold; k++) {
       u64 &r = w.state[w.cold[k]];
