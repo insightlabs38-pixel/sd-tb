@@ -1,0 +1,63 @@
+name: B exact late-materialization qualification
+on:
+  push:
+    branches:
+      - research/b-breakthrough-20261101-late-materialize
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch official generator
+        run: git clone --depth 1 https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+      - name: Compile baseline and exact late-materialization candidate
+        run: |
+          g++ -std=c++20 -O3 -msse4.2 -pthread experiments/breakthrough/query_postings.cpp -o /tmp/base
+          g++ -std=c++20 -O3 -msse4.2 -pthread experiments/breakthrough/late_materialize.cpp -o /tmp/late
+      - name: Exact differential, adversarial and sanitizer
+        run: |
+          set -euo pipefail
+          python3 tests/differential.py /tmp/late
+          python3 tests/frontier_adversarial.py /tmp/late
+          g++ -std=c++20 -O1 -g -msse4.2 -pthread -fsanitize=address,undefined -fno-omit-frame-pointer experiments/breakthrough/late_materialize.cpp -o /tmp/late-sanitized
+          python3 /tmp/organizer/generators/b_index.py --seed 7 --scale tiny --out /tmp/tiny7
+          mkdir -p /tmp/out /tmp/reference
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 /tmp/late-sanitized --data /tmp/tiny7 --out /tmp/out
+          python3 /tmp/organizer/reference/b_index.py --data /tmp/tiny7 --out /tmp/reference
+          cmp /tmp/out/results.txt /tmp/reference/results.txt
+      - name: Real full data end-to-end, paired runs
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          for seed in 1 2 3; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/full-$seed"
+            if [ "$seed" != 1 ]; then
+              mkdir -p "/tmp/reference-$seed"
+              python3 /tmp/organizer/reference/b_index.py --data "/tmp/full-$seed" --out "/tmp/reference-$seed"
+            fi
+            for round in 1 2 3 4 5; do
+              for bin in base late; do
+                echo "MEASURE seed=$seed round=$round binary=$bin"
+                B_PROFILE=1 /usr/bin/time -f 'WALL_SECONDS=%e PEAK_RSS_KB=%M' "/tmp/$bin" --data "/tmp/full-$seed" --out /tmp/out
+                if [ "$seed" = 1 ]; then
+                  echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/out/results.txt' | sha256sum -c -
+                else
+                  cmp /tmp/out/results.txt "/tmp/reference-$seed/results.txt"
+                fi
+              done
+            done
+          done
+      - name: Offline pinned Docker
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dock /tmp/dockout
+          cp track-b/Dockerfile /tmp/dock/Dockerfile
+          cp experiments/breakthrough/late_materialize.cpp /tmp/dock/main.cpp
+          docker build --network=none -t b-late-qualification /tmp/dock
+          chmod 777 /tmp/dockout
+          docker run --rm --user 65534:65534 --network=none --read-only -v /tmp/full-1:/data:ro -v /tmp/dockout:/out:rw b-late-qualification
+          echo 'f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927  /tmp/dockout/results.txt' | sha256sum -c -
