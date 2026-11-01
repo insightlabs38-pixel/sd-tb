@@ -130,61 +130,87 @@ fn hash(k: __m256i) -> u64 {
 /// term gets the id one past the last term, so callers need no branch.
 const ID_BITS: u32 = 20; // exact-key term dictionary supports adversarial 338k-term corpora
 
-struct Terms {
-    slot: Vec<u64>,
-    keys: Vec<[u8; 32]>,
-    n: usize, // terms
-}
 
+const NO_FAST_KEY: u64 = u64::MAX;
+#[derive(Clone, Copy)]
+struct Slot { value: u64, exact: u64 }
+fn compact_key(word: __m256i, len: usize) -> u64 {
+    let w: [u64; 4] = unsafe { std::mem::transmute(word) };
+    if len <= 8 { return w[0]; }
+    if len <= 12 {
+        let bytes: [u8; 32] = unsafe { std::mem::transmute(word) };
+        let mut result = 1u64 << 63;
+        for i in 0..len {
+            let c = bytes[i];
+            if !(b'a'..=b'z').contains(&c) { return NO_FAST_KEY; }
+            result |= ((c - b'a' + 1) as u64) << (5 * i);
+        }
+        return result;
+    }
+    NO_FAST_KEY
+}
+struct Terms {
+    slot: Vec<Slot>,
+    keys: Vec<[u8; 32]>,
+    n: usize,
+}
 impl Terms {
-    fn find(&self, h: u64, ptr: *const u8, len: usize) -> u32 {
+    fn find(&self, h: u64, ptr: *const u8, len: usize, fast: u64) -> u32 {
         if len > 32 { return self.n as u32; }
         let mask = self.slot.len() - 1;
         let mut i = h as usize & mask;
         loop {
-            let s = unsafe { *self.slot.get_unchecked(i) };
-            if s == 0 { return self.n as u32; }
-            if s >> ID_BITS == h >> ID_BITS {
-                let id = ((s & ((1 << ID_BITS) - 1)) - 1) as usize;
+            let slot = unsafe { *self.slot.get_unchecked(i) };
+            let value = slot.value;
+            if value == 0 { return self.n as u32; }
+            if (value >> ID_BITS) == (h >> ID_BITS) && slot.exact == fast {
+                let id = ((value & ((1 << ID_BITS) - 1)) - 1) as usize;
+                if fast != NO_FAST_KEY { return id as u32; }
                 let candidate = unsafe { _mm256_loadu_si256(self.keys.get_unchecked(id).as_ptr().cast()) };
                 let actual = unsafe { key(ptr, len) };
-                let eq = unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(candidate, actual)) };
-                if eq == -1 { return id as u32; }
+                if unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(candidate, actual)) } == -1 {
+                    return id as u32;
+                }
             }
             i = (i + 1) & mask;
         }
     }
 
-    /// Term i becomes new[i].
     fn renumber(&mut self, new: &[u32]) {
         let mut reordered = vec![[0u8; 32]; self.n];
         for (old, k) in self.keys.iter().enumerate() { reordered[new[old] as usize] = *k; }
         self.keys = reordered;
-        for s in self.slot.iter_mut().filter(|s| **s != 0) {
-            *s = *s >> ID_BITS << ID_BITS | (new[(*s & ((1 << ID_BITS) - 1)) as usize - 1] + 1) as u64;
+        for slot in self.slot.iter_mut().filter(|s| s.value != 0) {
+            let value = slot.value;
+            slot.value = (value >> ID_BITS << ID_BITS) |
+                (new[(value & ((1 << ID_BITS) - 1)) as usize - 1] + 1) as u64;
         }
     }
 
     fn insert(&mut self, term: &[u8]) -> u32 {
         let actual = unsafe { key(term.as_ptr(), term.len()) };
         let h = hash(actual);
-        let mut i = h as usize & (self.slot.len() - 1);
-        while self.slot[i] != 0 {
-            if self.slot[i] >> ID_BITS == h >> ID_BITS {
-                let id = ((self.slot[i] & ((1 << ID_BITS) - 1)) - 1) as usize;
+        let fast = compact_key(actual, term.len());
+        let mask = self.slot.len() - 1;
+        let mut i = h as usize & mask;
+        while self.slot[i].value != 0 {
+            let slot = self.slot[i];
+            if slot.value >> ID_BITS == h >> ID_BITS && slot.exact == fast {
+                let id = ((slot.value & ((1 << ID_BITS) - 1)) - 1) as usize;
+                if fast != NO_FAST_KEY { return id as u32; }
                 let candidate = unsafe { _mm256_loadu_si256(self.keys[id].as_ptr().cast()) };
-                let eq = unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(candidate, actual)) };
-                if eq == -1 { return id as u32; }
+                if unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(candidate, actual)) } == -1 {
+                    return id as u32;
+                }
             }
-            i = (i + 1) & (self.slot.len() - 1);
+            i = (i + 1) & mask;
         }
         self.n += 1;
-        self.slot[i] = h >> ID_BITS << ID_BITS | self.n as u64;
+        self.slot[i] = Slot { value: (h >> ID_BITS << ID_BITS) | self.n as u64, exact: fast };
         self.keys.push(unsafe { std::mem::transmute::<__m256i, [u8; 32]>(actual) });
         self.n as u32 - 1
     }
 }
-
 /// Bits of the 64 bytes at p: token bytes ([A-Za-z0-9]; after OR-ing 0x20 a
 /// letter lies in 'a'..='z', and a digit lies in '0'..='9' as is), and LFs.
 unsafe fn classes(p: *const u8) -> (u64, u64) {
@@ -208,14 +234,14 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 /// later, so the misses overlap.
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
     const LAG: usize = 8;
-    let mut ring = [(0u64, std::ptr::null::<u8>(), 0usize); LAG];
+    let mut ring = [(0u64, std::ptr::null::<u8>(), 0usize, 0u64); LAG];
     let (mut n, mut out) = (0usize, ids.len());
     loop {
         // A window adds at most 32 ids, and the document's end LAG more.
         (ids.set_len(out), ids.reserve(32 + LAG));
         let buf = ids.as_mut_ptr();
-        let mut look = |&(h, ptr, len): &(u64, *const u8, usize)| {
-            let id = t.find(h, ptr, len);
+        let mut look = |&(h, ptr, len, fast): &(u64, *const u8, usize, u64)| {
+            let id = t.find(h, ptr, len, fast);
             _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
             (*buf.add(out), out) = (id, out + 1);
         };
@@ -249,7 +275,7 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
             if n >= LAG {
                 look(&ring[n % LAG]);
             }
-            (ring[n % LAG], n) = ((h, p.add(s as usize), len as usize), n + 1);
+            (ring[n % LAG], n) = ((h, p.add(s as usize), len as usize, compact_key(k, len as usize)), n + 1);
         }
         if nl != 0 {
             (n.saturating_sub(LAG)..n).for_each(|i| look(&ring[i % LAG]));
@@ -543,7 +569,7 @@ fn main() {
     // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let qtext = map("/data/queries.txt");
-    let mut terms = Terms { slot: vec![0; (qtext.len() / 8).next_power_of_two()], keys: Vec::new(), n: 0 };
+    let mut terms = Terms { slot: vec![Slot {value:0,exact:0}; (qtext.len() / 8).next_power_of_two()], keys: Vec::new(), n: 0 };
     // Queries, flat: query q's terms are ids[span.1..span.2], and for BOOL
     // ops[i] joins ids[i] and ids[i + 1].
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
