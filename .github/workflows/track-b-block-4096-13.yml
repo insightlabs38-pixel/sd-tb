@@ -1,9 +1,8 @@
 name: Track B 4096-document block qualification
 on:
   workflow_dispatch:
-  push:
-    branches: [track-b/block-4096-13]
-    paths: [track-b/main.cpp, .github/workflows/track-b-block-4096-13.yml]
+  pull_request:
+    branches: [main]
 permissions:
   contents: read
 concurrency:
