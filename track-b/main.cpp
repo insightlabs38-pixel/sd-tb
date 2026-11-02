@@ -223,7 +223,7 @@ static bool small_has(u64 s, u32 p) {
 }
 
 struct Worker {
-  vector<u64> rows, state, totals, keys, pending;
+  vector<u64> rows, state, totals, keys, pending, popular;
   vector<u32> edge, longs, cold, last, touched;
   vector<pair<u32, int>> anchors;
   u64 value[kWords];
@@ -551,6 +551,7 @@ struct Engine {
       Worker &w = all[me];
       w.rows.reserve((2 * hot + 1024) * kWords); // Spill rows grow in place.
       w.rows.assign((hot + 1) * kWords, 0);
+      w.popular.assign(kDocs, 0);
       w.state.assign(cols, 0);
       w.totals.assign(bools.size(), 0);
       w.last.assign(phrases.size(), ~0u);
@@ -577,7 +578,8 @@ struct Engine {
             flush(w, base), n = 0;
         }
       }
-      vector<u64>().swap(w.rows), vector<u64>().swap(w.state); // Before output.
+      vector<u64>().swap(w.rows), vector<u64>().swap(w.state);
+      vector<u64>().swap(w.popular); // Before output.
     });
   }
 
@@ -585,6 +587,22 @@ struct Engine {
   void flush(Worker &w, u32 base) {
     while (!planned.load(memory_order_acquire))
       this_thread::yield();
+    // Transpose document-major masks of the 64 hottest terms into row bitmaps.
+    for (u32 group = 0; group < kWords; group++) {
+      u64 x[64];
+      memcpy(x, &w.popular[group * 64], sizeof x);
+      u64 mask = 0xffffffffu;
+      for (u32 shift = 32; shift; shift >>= 1) {
+        for (u32 k = 0; k < 64; k = (k + shift + 1) & ~shift) {
+          u64 t = (x[k] ^ (x[k + shift] >> shift)) & mask;
+          x[k] ^= t;
+          x[k + shift] ^= t << shift;
+        }
+        mask ^= mask << (shift >> 1);
+      }
+      for (u32 col = 0; col < min(hot, 64u); col++)
+        w.rows[(col + 1) * kWords + group] |= x[col];
+    }
     for (u32 i = 1; i <= hot; i++)
       if (any_of(&w.rows[i * kWords], &w.rows[i * kWords + kWords],
                  [](u64 x) { return x; }))
@@ -598,6 +616,7 @@ struct Engine {
     w.touched.clear();
     w.rows.resize((hot + 1) * kWords);
     fill(w.rows.begin(), w.rows.end(), 0);
+    fill(w.popular.begin(), w.popular.end(), 0);
   }
 
   // Marks the document's terms in block slot `slot` and matches its phrases.
@@ -628,7 +647,8 @@ struct Engine {
       bucket[k] = hash_of(keys[k]) & dict.mask();
       _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
     }
-    const u32 hot = this->hot;
+    const u32 hot = this->hot, top = min(hot, 64u);
+    u64 popular = 0;
     u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
@@ -643,12 +663,16 @@ struct Engine {
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
-      rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
+      if (col && col <= top)
+        popular |= u64(1) << ((64 - col) & 63);
+      else
+        rows[(col & -u32(col <= hot)) * kWords + word] |= bit;
       colds[cold] = col;
       cold += col > hot;
       if (m >> 40)
         anchor[anchors++] = {k, int(m >> 40) - 1};
     }
+    w.popular[(slot & ~63u) + (63 - (slot & 63))] = popular;
     for (u32 k = 0; k < cold; k++) {
       u64 &r = w.state[w.cold[k]];
       u32 c = count_of(r);
