@@ -3,6 +3,9 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
+  push:
+    branches: [track-b/split-dictionary-11]
+    paths: [track-b/main.cpp, .github/workflows/track-b-split-dictionary-11.yml]
 permissions:
   contents: read
 concurrency:
