@@ -224,7 +224,7 @@ static bool small_has(u64 s, u32 p) {
 
 struct Worker {
   vector<u64> rows, state, totals, keys, pending;
-  vector<u32> edge, longs, cold, last, touched;
+  vector<u32> edge, longs, last, touched;
   vector<pair<u32, int>> anchors;
   u64 value[kWords];
 };
@@ -604,10 +604,9 @@ struct Engine {
   void process(Worker &w, u32 doc, u32 slot, const char *text, size_t n) {
     if (w.edge.size() < n + 72) {
       w.edge.resize(n + 72), w.anchors.resize(n / 2 + 1), w.keys.resize(n / 2 + 1);
-      for (auto *v : {&w.longs, &w.cold})
-        v->resize(n / 2 + 1);
+      w.longs.resize(n / 2 + 1);
     }
-    u32 count = edges(text, n, w.edge.data()) / 2, cold = 0, anchors = 0,
+    u32 count = edges(text, n, w.edge.data()) / 2, anchors = 0,
         nlong = 0, word = slot / 64, *e = w.edge.data();
     u64 bit = u64(1) << slot % 64, *rows = w.rows.data(), *keys = w.keys.data();
     for (u32 k = 0; k < count; k++) { // Long tokens are keyed afterwards.
@@ -629,7 +628,6 @@ struct Engine {
       _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
     }
     const u32 hot = this->hot;
-    u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
     for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
       u32 at = bucket[k % lookahead];
@@ -644,28 +642,27 @@ struct Engine {
       u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
-      colds[cold] = col;
-      cold += col > hot;
+      if (col > hot) {
+        u64 &r = w.state[col];
+        u32 c = count_of(r);
+        if (!r)
+          r = kOne | slot, w.touched.push_back(col);
+        else if (!c)
+          w.rows[r * kWords + word] |= bit;
+        else if (at(r, c - 1) != slot && c < kSmall)
+          r = (r + kOne) | u64(slot) << (12 * c);
+        else if (at(r, c - 1) != slot) {
+          u64 row = w.rows.size() / kWords;
+          w.rows.resize(w.rows.size() + kWords);
+          rows = w.rows.data();
+          for (u32 i = 0; i < kSmall; i++)
+            w.rows[row * kWords + at(r, i) / 64] |= u64(1) << at(r, i) % 64;
+          w.rows[row * kWords + word] |= bit;
+          r = row;
+        }
+      }
       if (m >> 40)
         anchor[anchors++] = {k, int(m >> 40) - 1};
-    }
-    for (u32 k = 0; k < cold; k++) {
-      u64 &r = w.state[w.cold[k]];
-      u32 c = count_of(r);
-      if (!r)
-        r = kOne | slot, w.touched.push_back(w.cold[k]);
-      else if (!c)
-        w.rows[r * kWords + word] |= bit;
-      else if (at(r, c - 1) != slot && c < kSmall)
-        r = (r + kOne) | u64(slot) << (12 * c);
-      else if (at(r, c - 1) != slot) {
-        u64 row = w.rows.size() / kWords;
-        w.rows.resize(w.rows.size() + kWords);
-        for (u32 i = 0; i < kSmall; i++)
-          w.rows[row * kWords + at(r, i) / 64] |= u64(1) << at(r, i) % 64;
-        w.rows[row * kWords + word] |= bit;
-        r = row;
-      }
     }
     for (u32 a = 0; a < anchors; a++)
       for (int k = w.anchors[a].second; k >= 0; k = phrases[k].next) {
