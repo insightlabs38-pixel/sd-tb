@@ -431,3 +431,11 @@ Projected box K against BEST 26.690516 (S 691, M saturated): 30.3 if T equals th
 ## Worker CPU affinity (rejected, November 2)
 
 [Three-full-seed, five-repeat paired CI 41398970810](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41398970810) passed published seed-1 and independent seed-2/3 full hashes, sample/tiny, differential/adversarial checks, ASan/UBSan, TSan and pinned offline Docker. Pinning workers to inherited CPU affinity slots produced runner-local candidate/champion K ratios **1.002271 / 0.977837 / 1.008092**, geometric mean **0.995980 (-0.4020%)**; candidate S=707 versus champion S=695, both D=1. Seed-2 median T worsened from **0.257458 to 0.267882 s**. Reject draft PR #23; retain champion source blob `6450d009a5d07f719f3678becea49d89b136737a`. This is GitHub runner evidence, not official board scoring.
+
+## Mandatory-pair and second-clause pruning (rejected, November 2)
+
+[Mandatory-pair qualification 41406712624](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41406712624) passed full published/independent seed-1/2/3 hashes, sample/tiny, differential/adversarial, ASan/UBSan, TSan and pinned offline Docker. Checking exact co-occurrence of two necessary terms before Boolean evaluation gave three-seed, five-repeat runner-local K ratios **1.008837 / 1.004102 / 0.997113**, geometric mean **1.003339 (+0.3339%)**; S=736 versus champion 695, D=1. One seed lost and the gain was marginal, so no promotion.
+
+[Three-term-and-longer variant 41407574625](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41407574625) passed the same gates but regressed across all three seeds: K ratios **0.995436 / 0.991079 / 0.995257**, geometric mean **0.993922 (-0.6078%)**; S=737 vs 695, D=1. Reject PR #24.
+
+[Second support-clause qualification 41407758499](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41407758499) independently tested a cheaper presence-only prefilter for another necessary Boolean support clause. Full exactness, differential/adversarial, sanitizer and offline Docker gates passed; three-seed, five-repeat K ratios **0.977452 / 0.993507 / 0.992010**, geometric mean **0.987630 (-1.2370%)**, losing all seeds. S=720 vs 695, D=1. Reject PR #25. All measurements are runner-local, not official board scores. Preserve champion source blob `6450d009a5d07f719f3678becea49d89b136737a`.
