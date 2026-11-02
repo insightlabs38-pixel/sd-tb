@@ -1,0 +1,85 @@
+name: Track B full-corpus query vocabulary census
+on:
+  push:
+    branches: [track-b/query-hit-census-13]
+    paths: [.github/workflows/track-b-query-hit-census.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: track-b-query-hit-census
+  cancel-in-progress: true
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate pinned organizer full corpora
+        run: |
+          set -euo pipefail
+          git clone https://github.com/hackathon-raptors/speed-demon-2026.git /tmp/organizer
+          git -C /tmp/organizer checkout 9f059f75384607c7836997063b0901b98f36b5fa
+          for seed in 1 2; do
+            python3 /tmp/organizer/generators/b_index.py --seed "$seed" --scale full --out "/tmp/data-$seed"
+          done
+      - name: Measure exact query-token coverage and locality
+        run: |
+          python3 - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import re, statistics, time
+          rx = re.compile(rb'[a-z0-9]+')
+          for seed in (1, 2):
+              q = Path(f'/tmp/data-{seed}/queries.txt').read_bytes().splitlines()
+              bool_terms, phrase_terms = set(), set()
+              for line in q:
+                  if line.startswith(b'BOOL '):
+                      bool_terms.update(line[5:].split(b' ')[::2])
+                  else:
+                      assert line.startswith(b'PHRASE "')
+                      phrase_terms.update(line[8:-1].split(b' '))
+              all_terms = bool_terms | phrase_terms
+              freq, df = Counter(), Counter()
+              total = hits = bool_hits = phrase_hits = 0
+              doc_hit_counts = []
+              start = time.monotonic()
+              with Path(f'/tmp/data-{seed}/docs.txt').open('rb') as f:
+                  for line in f:
+                      text = line.split(b'\t', 1)[1].lower()
+                      words = rx.findall(text)
+                      total += len(words)
+                      found = set()
+                      for w in words:
+                          if w in all_terms:
+                              hits += 1
+                              freq[w] += 1
+                              found.add(w)
+                              bool_hits += w in bool_terms
+                              phrase_hits += w in phrase_terms
+                      df.update(found)
+                      doc_hit_counts.append(len(found))
+              hot = sum(n for _, n in freq.most_common(3000))
+              bool_only = sum(n for w,n in freq.items() if w in bool_terms and w not in phrase_terms)
+              phrase_only = sum(n for w,n in freq.items() if w in phrase_terms and w not in bool_terms)
+              print('CENSUS', dict(seed=seed, docs=len(doc_hit_counts),
+                  queries=len(q), query_terms=len(all_terms), bool_terms=len(bool_terms),
+                  phrase_terms=len(phrase_terms), overlap=len(bool_terms & phrase_terms),
+                  present_terms=len(freq), total_tokens=total, query_hits=hits,
+                  query_hit_pct=round(100*hits/total,3),
+                  bool_hit_pct=round(100*bool_hits/total,3),
+                  phrase_hit_pct=round(100*phrase_hits/total,3),
+                  bool_only_pct=round(100*bool_only/total,3),
+                  phrase_only_pct=round(100*phrase_only/total,3),
+                  top3000_share_of_query_hits=round(100*hot/hits,3),
+                  doc_term_pairs=sum(df.values()),
+                  mean_query_terms_per_doc=round(statistics.mean(doc_hit_counts),2),
+                  p90_query_terms_per_doc=sorted(doc_hit_counts)[int(.9*len(doc_hit_counts))],
+                  elapsed_s=round(time.monotonic()-start,2)), flush=True)
+              print('DF_BUCKETS', dict(seed=seed,
+                  zero=len(all_terms)-len(df),
+                  one=sum(n==1 for n in df.values()),
+                  two_to_25=sum(2<=n<=25 for n in df.values()),
+                  mid=sum(26<=n<=250 for n in df.values()),
+                  common=sum(n>250 for n in df.values())), flush=True)
+          PY
