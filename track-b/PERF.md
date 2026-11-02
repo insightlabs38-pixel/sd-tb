@@ -495,3 +495,11 @@ Decision: focus architecture experiments on dictionary lookup, term evidence, an
 ## 1536-document block qualification (not promoted, November 2)
 
 [Three-seed, five-repeat paired qualification 41436267143](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41436267143) passed the same full exactness, differential/adversarial, sanitizer and pinned offline Docker gates. Reducing the block from 2,048 to 1,536 documents produced runner-local K ratios **0.999986 / 1.000096 / 1.005261**, geometric mean **1.001778 (+0.1778%)**. S=695 and D=1 unchanged; median T for seed 1 was **0.316983 versus 0.316974 s**, seed 2 **0.327413 versus 0.327476 s**, seed 3 **0.302362 versus 0.305551 s**. The tiny, seed-dependent advantage is below a reliable promotion threshold; preserve 2,048-document champion. No official board score claimed.
+
+## Top-64 document-mask transpose (rejected, November 2)
+
+[Three-seed, five-repeat paired CI 41443376551](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41443376551) passed published/independent full-output hashes, sample/tiny, differential/adversarial tests, ASan/UBSan, TSan and pinned offline Docker. Aggregating the 64 most frequent term hits into per-document masks and transposing 64×64 blocks at flush regressed runner-local K ratios **0.935554 / 0.935498 / 0.934229**, geometric mean **0.935094 (−6.4906%)**. Candidate S=718 versus champion S=695, D=1. Seed-1 median T **0.265532 versus 0.234691 s**. Reject [PR #32](https://github.com/insightlabs38-pixel/sd-tb/pull/32), preserve champion source blob `6450d009a5d07f719f3678becea49d89b136737a`.
+
+## Branchless top-64 transpose (rejected, November 2)
+
+[Three-seed, five-repeat paired CI 41443503006](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41443503006) passed the same full exactness, sanitizer and offline Docker gates. A branchless per-token mask update with sink-row stores and blockwise transpose regressed runner-local K ratios **0.910652 / 0.899101 / 0.892083**, geometric mean **0.900580 (−9.9420%)**. Candidate S=716 versus champion S=695, D=1. Seed-1 median T **0.363340 versus 0.304016 s**. Reject [PR #33](https://github.com/insightlabs38-pixel/sd-tb/pull/33). Both runs are GitHub-runner evidence, not official board scores; the production source and Dockerfile remain unchanged.
