@@ -231,6 +231,8 @@ struct Worker {
 
 struct Engine {
   Dictionary dict;
+  struct HotEntry { u64 key = 0, meta = 0; };
+  HotEntry cache[512]; // Direct-mapped, exact-key L1 cache of frequent query terms.
   vector<Bool> bools;
   vector<Phrase> phrases;
   u32 queries = 0, hot = 0, cols = 1;
@@ -376,6 +378,14 @@ struct Engine {
       for (u64 &m : b.meta)
         if (m)
           m |= u64(column[m]) << 20 | u64(head[m] + 1) << 40;
+    for (u32 i = 0; i < order.size() && i < 256; i++) {
+      const char *p = dict.words[order[i]];
+      u64 key = key_of(p, token_length(p));
+      u32 hash = hash_of(key);
+      HotEntry &c = cache[hash & 511];
+      if (!c.key && key >> 62 != 2)
+        c = {key, dict.find(p, key, hash & dict.mask())};
+    }
   }
 
   // An answer lies within S(t_j) and the OR terms after j, for t_1 and every
@@ -638,7 +648,9 @@ struct Engine {
         bucket[k % lookahead] = next;
         _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
-      keys[k] = dict.find(text + e[2 * k], keys[k], at);
+      const HotEntry &c = cache[at & 511];
+      keys[k] = c.key == keys[k] ? c.meta
+                                 : dict.find(text + e[2 * k], keys[k], at);
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
