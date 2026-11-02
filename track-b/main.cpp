@@ -518,6 +518,12 @@ struct Engine {
         const Bool &b = bools[list[q]];
         r = w.state[b.term[0]];
         for (u32 i = 1; i < b.n; i++) {
+          // An empty left fold stays empty until the next OR.
+          if (!r && b.op[i - 1] != 'O') {
+            while (i + 1 < b.n && b.op[i] != 'O')
+              i++;
+            continue;
+          }
           u64 o = w.state[b.term[i]];
           char op = b.op[i - 1];
           if (op == 'O' ? !o || o == r : !r)
