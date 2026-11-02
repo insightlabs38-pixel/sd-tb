@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: track-b-alderlake-tune-12
+  group: track-b-affinity-pinning-12
   cancel-in-progress: true
 env:
   CHAMPION: 27f55c354ebbc4df3c8216b29c8a67b2bd092720
