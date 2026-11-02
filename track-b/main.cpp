@@ -631,14 +631,21 @@ struct Engine {
     const u32 hot = this->hot;
     u32 *colds = w.cold.data();
     auto *anchor = w.anchors.data();
-    for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
-      u32 at = bucket[k % lookahead];
-      if (k + lookahead < count) {
-        u32 next = hash_of(keys[k + lookahead]) & dict.mask();
-        bucket[k % lookahead] = next;
-        _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
+    for (u32 k = 0; k < count; k += 4) {
+      u32 old[4], n = min(4u, count - k);
+      for (u32 j = 0; j < n; j++) {
+        u32 i = k + j;
+        old[j] = bucket[i % lookahead];
+        if (i + lookahead < count) {
+          u32 next = hash_of(keys[i + lookahead]) & dict.mask();
+          bucket[i % lookahead] = next;
+          _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
+        }
       }
-      keys[k] = dict.find(text + e[2 * k], keys[k], at);
+      for (u32 j = 0; j < n; j++) {
+        u32 i = k + j;
+        keys[i] = dict.find(text + e[2 * i], keys[i], old[j]);
+      }
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
