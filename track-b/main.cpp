@@ -135,8 +135,8 @@ static u32 short_code(const char *p, u32 n) {
     c |= 32;
     return c >= 'a' ? c - 'a' + 11 : c - '0' + 1;
   };
-  u32 a = digit(p[0]);
-  return n == 1 ? a : 37 * a + digit(p[1]);
+  u32 a = digit(p[0]), b = n > 1 ? digit(p[1]) : 0;
+  return 1369 * a + 37 * b + (n == 3 ? digit(p[2]) : 0);
 }
 
 // Query terms in four-way buckets. Metadata holds the term ID in bits 0-19, the
@@ -240,7 +240,7 @@ struct Worker {
 
 struct Engine {
   Dictionary dict;
-  u64 short_meta[1369] = {};
+  u64 short_meta[50653] = {};
   vector<Bool> bools;
   vector<Phrase> phrases;
   u32 queries = 0, hot = 0, cols = 1;
@@ -389,7 +389,7 @@ struct Engine {
           m |= u64(column[id]) << 20 | u64(head[id] + 1) << 40;
           const char *word = dict.words[id];
           u32 n = token_length(word);
-          if (n <= 2)
+          if (n <= 3)
             short_meta[short_code(word, n)] = m;
         }
   }
@@ -655,7 +655,7 @@ struct Engine {
         _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
       u32 len = e[2 * k + 1] - e[2 * k];
-      keys[k] = len <= 2 ? short_meta[short_code(text + e[2 * k], len)]
+      keys[k] = len <= 3 ? short_meta[short_code(text + e[2 * k], len)]
                          : dict.find(text + e[2 * k], keys[k], at);
     }
     for (u32 k = 0; k < count; k++) {
