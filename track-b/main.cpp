@@ -197,6 +197,7 @@ struct Bool {
   u32 query, n, term[6];
   char op[5];
   u16 shape; // Term count and operators; AND, NOT, OR differ in low bits.
+  uint8_t guard2 = 0; // A second necessary support clause, as term-position bits.
 };
 struct Phrase {
   u32 query, n, anchor, term[8];
@@ -393,6 +394,24 @@ struct Engine {
       }
       return n;
     };
+    // Every AND operand and the first term constrain the result, except for
+    // later OR additions. Check a second cheap support clause per block.
+    for (Bool &b : bools) {
+      u32 best = ~0u, second = ~0u, best_mask = 0, second_mask = 0;
+      for (u32 j = 0; j < b.n; j++) {
+        if (j && b.op[j - 1] != 'A')
+          continue;
+        u32 cost = weight[b.term[j]], mask = 1u << j;
+        for (u32 i = j + 1; i < b.n; i++)
+          if (b.op[i - 1] == 'O')
+            cost += weight[b.term[i]], mask |= 1u << i;
+        if (cost < best)
+          second = best, second_mask = best_mask, best = cost, best_mask = mask;
+        else if (cost < second && mask != best_mask)
+          second = cost, second_mask = mask;
+      }
+      b.guard2 = second_mask;
+    }
     guards.assign(cols + 1, 0);
     u32 g[6];
     for (const Bool &b : bools)
@@ -516,6 +535,13 @@ struct Engine {
         if (q + 4 < n)
           _mm_prefetch((const char *)&w.state[bools[list[q + 4]].term[0]], _MM_HINT_T0);
         const Bool &b = bools[list[q]];
+        if (b.guard2) {
+          u32 mask = b.guard2;
+          while (mask && !w.state[b.term[countr_zero(mask)]])
+            mask &= mask - 1;
+          if (!mask)
+            continue;
+        }
         r = w.state[b.term[0]];
         for (u32 i = 1; i < b.n; i++) {
           u64 o = w.state[b.term[i]];
