@@ -329,17 +329,22 @@ struct Engine {
     vector<u32> freq(terms + 1), seen(terms), order, column(terms), e(512);
     vector<int> head(terms, -1);
     const char *stop = line_at(docs, size, 512 << 10);
+    u32 stamp = 0;
     for (const char *p = docs, *eol; p < stop; p = eol + 1) {
+      ++stamp;
       eol = (const char *)memchr(p, '\n', stop - p);
       eol = eol ? eol : stop;
       if (e.size() < size_t(eol - p) + 72)
         e.resize(eol - p + 72);
-      // Edges 0 and 1 delimit the document ID.
-      for (u32 i = 2, n = edges(p, eol - p, e.data()); i < n; i += 2)
-        if (u64 key = key_of(p + e[i], e[i + 1] - e[i]); true)
-          freq[dict.find(p + e[i], key, hash_of(key) & dict.mask()) & 0xfffff]++;
+      // Rank terms by sampled document frequency, not repeated occurrences.
+      for (u32 i = 2, n = edges(p, eol - p, e.data()); i < n; i += 2) {
+        u64 key = key_of(p + e[i], e[i + 1] - e[i]);
+        u32 id = dict.find(p + e[i], key, hash_of(key) & dict.mask()) & 0xfffff;
+        if (id && seen[id] != stamp)
+          seen[id] = stamp, freq[id]++;
+      }
     }
-    freq[0] = 0;
+    fill(seen.begin(), seen.end(), 0);
     for (Bool &b : bools)
       for (u32 i = 0; i < b.n; i++)
         if (freq[b.term[i]] >= 4 && !seen[b.term[i]]++)
