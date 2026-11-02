@@ -233,6 +233,7 @@ struct Engine {
   Dictionary dict;
   vector<Bool> bools;
   vector<Phrase> phrases;
+  vector<u64> long_prefix; // Exact prefilter: false positives are checked.
   u32 queries = 0, hot = 0, cols = 1;
   thread planner;
   atomic<bool> planned{false};
@@ -317,6 +318,12 @@ struct Engine {
       };
       place(bools, w.bools, nb[t]), place(phrases, w.phrases, np[t]);
     });
+    long_prefix.assign(1 << 12, 0); // 2^18 bits, indexed by first 8 bytes.
+    for (const char *p : dict.words)
+      if (p && token_length(p) > 8) {
+        u32 h = _mm_crc32_u64(0, chunk(p, 0, 8)) & ((1u << 18) - 1);
+        long_prefix[h >> 6] |= u64(1) << (h & 63);
+      }
     first.reset(new First[queries]), bound.reset(new atomic<u32>[queries]);
     for (u32 q = 0; q < queries; q++)
       bound[q].store(~0u, memory_order_relaxed);
@@ -618,15 +625,21 @@ struct Engine {
       w.longs[nlong] = k;
       nlong += len > 8;
     }
-    for (u32 i = 0, k; i < nlong; i++)
-      k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
+    for (u32 i = 0; i < nlong; i++) {
+      u32 k = w.longs[i];
+      u32 h = _mm_crc32_u64(0, keys[k]) & ((1u << 18) - 1);
+      keys[k] = (long_prefix[h >> 6] >> (h & 63) & 1)
+                    ? key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k])
+                    : 0;
+    }
     // Keep dictionary prefetches near their use instead of prefetching an
     // entire document's random buckets before the first lookup.
     constexpr u32 lookahead = 8;
     u32 bucket[lookahead];
     for (u32 k = 0; k < min(count, lookahead); k++) {
       bucket[k] = hash_of(keys[k]) & dict.mask();
-      _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
+      if (keys[k])
+        _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
     }
     const u32 hot = this->hot;
     u32 *colds = w.cold.data();
@@ -636,9 +649,11 @@ struct Engine {
       if (k + lookahead < count) {
         u32 next = hash_of(keys[k + lookahead]) & dict.mask();
         bucket[k % lookahead] = next;
-        _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
+        if (keys[k + lookahead])
+          _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
-      keys[k] = dict.find(text + e[2 * k], keys[k], at);
+      if (keys[k])
+        keys[k] = dict.find(text + e[2 * k], keys[k], at);
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
