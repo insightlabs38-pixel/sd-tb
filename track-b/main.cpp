@@ -130,6 +130,40 @@ static u64 key_of(const char *p, size_t n) {
 }
 static u32 hash_of(u64 key) { return _mm_crc32_u64(0, key); }
 
+// Emit token boundaries and short keys together, retaining the long-key pass.
+static u32 edges_keys(const char *b, size_t n, u32 *out, u64 *keys,
+                      u32 *longs, u32 &nlong) {
+  u32 k = 0, made = 0;
+  u64 carry = 0;
+  auto complete = [&](u32 pairs) {
+    for (; made < pairs; made++) {
+      u32 start = out[2 * made], len = out[2 * made + 1] - start;
+      u64 a;
+      memcpy(&a, b + start, 8);
+      keys[made] = (a | 0x2020202020202020) &
+                   (~u64(0) >> (64 - 8 * min(len, 8u)));
+      longs[nlong] = made;
+      nlong += len > 8;
+    }
+  };
+  for (size_t off = 0; off < n; off += 64) {
+    u64 m = alnum64(b + off) &
+            (n - off < 64 ? (u64(1) << (n - off)) - 1 : ~u64(0));
+    u64 t = m ^ (m << 1 | carry);
+    u32 c = popcount(t);
+    carry = m >> 63;
+    for (u32 i = 0; i < c; i += 4)
+      for (u32 j = 0; j < 4; j++, t &= t - 1)
+        out[k + i + j] = off + countr_zero(t);
+    k += c;
+    complete(k / 2);
+  }
+  out[k] = n;
+  complete((k + carry) / 2);
+  return k + carry;
+}
+
+
 // Query terms in four-way buckets. Metadata holds the term ID in bits 0-19, the
 // Boolean column in bits 20-39 and the phrase head plus one above.
 struct Dictionary {
@@ -607,17 +641,11 @@ struct Engine {
       for (auto *v : {&w.longs, &w.cold})
         v->resize(n / 2 + 1);
     }
-    u32 count = edges(text, n, w.edge.data()) / 2, cold = 0, anchors = 0,
-        nlong = 0, word = slot / 64, *e = w.edge.data();
+    u32 nlong = 0;
+    u32 count = edges_keys(text, n, w.edge.data(), w.keys.data(),
+                           w.longs.data(), nlong) / 2;
+    u32 cold = 0, anchors = 0, word = slot / 64, *e = w.edge.data();
     u64 bit = u64(1) << slot % 64, *rows = w.rows.data(), *keys = w.keys.data();
-    for (u32 k = 0; k < count; k++) { // Long tokens are keyed afterwards.
-      u32 len = e[2 * k + 1] - e[2 * k];
-      u64 a;
-      memcpy(&a, text + e[2 * k], 8);
-      keys[k] = (a | 0x2020202020202020) & ~u64(0) >> (64 - 8 * min(len, 8u));
-      w.longs[nlong] = k;
-      nlong += len > 8;
-    }
     for (u32 i = 0, k; i < nlong; i++)
       k = w.longs[i], keys[k] = key_of(text + e[2 * k], e[2 * k + 1] - e[2 * k]);
     // Keep dictionary prefetches near their use instead of prefetching an
