@@ -385,8 +385,9 @@ struct Engine {
     for (auto &b : dict.buckets)
       for (u64 &m : b.meta)
         if (m) {
-          m |= u64(column[m]) << 20 | u64(head[m & 0xfffff] + 1) << 40;
-          const char *word = dict.words[m & 0xfffff];
+          u32 id = m;
+          m |= u64(column[id]) << 20 | u64(head[id] + 1) << 40;
+          const char *word = dict.words[id];
           u32 n = token_length(word);
           if (n <= 2)
             short_meta[short_code(word, n)] = m;
