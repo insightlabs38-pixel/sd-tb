@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [track-b/direct-short-token3-noprefetch-13]
-    paths: [track-b/main.cpp, tests/**, .github/workflows/track-b-direct-short-token3-noprefetch3-noprefetch.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
+    paths: [track-b/main.cpp, tests/**, .github/workflows/track-b-direct-short-token3-noprefetch.yml, experiments/frontier/compare.py, experiments/frontier/summarize_pair.py]
 permissions:
   contents: read
 concurrency:
