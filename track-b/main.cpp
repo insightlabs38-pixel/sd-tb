@@ -197,6 +197,7 @@ struct Bool {
   u32 query, n, term[6];
   char op[5];
   u16 shape; // Term count and operators; AND, NOT, OR differ in low bits.
+  u32 pair_a = 0, pair_b = 0; // Two necessary terms after the final OR.
 };
 struct Phrase {
   u32 query, n, anchor, term[8];
@@ -393,6 +394,25 @@ struct Engine {
       }
       return n;
     };
+    // Every final AND operand is necessary after the last OR in the left fold.
+    // Two rare mandatory terms can reject a block without evaluating the query.
+    for (Bool &b : bools) {
+      u32 last_or = 0;
+      for (u32 i = 1; i < b.n; i++)
+        if (b.op[i - 1] == 'O')
+          last_or = i;
+      for (u32 i = last_or ? last_or + 1 : 0; i < b.n; i++) {
+        if (i && b.op[i - 1] != 'A')
+          continue;
+        u32 c = b.term[i];
+        if (c == b.pair_a || c == b.pair_b)
+          continue;
+        if (!b.pair_a || weight[c] < weight[b.pair_a])
+          b.pair_b = b.pair_a, b.pair_a = c;
+        else if (!b.pair_b || weight[c] < weight[b.pair_b])
+          b.pair_b = c;
+      }
+    }
     guards.assign(cols + 1, 0);
     u32 g[6];
     for (const Bool &b : bools)
@@ -477,6 +497,27 @@ struct Engine {
     auto has = [&](u64 s, u32 p) {
       return count_of(s) ? small_has(s, p) : bits(s)[p / 64] >> p % 64 & 1;
     };
+    auto overlaps = [&](u64 a, u64 b) {
+      if (!a || !b)
+        return false;
+      if (count_of(a)) {
+        for (u32 i = 0; i < count_of(a); i++)
+          if (has(b, at(a, i)))
+            return true;
+        return false;
+      }
+      if (count_of(b)) {
+        for (u32 i = 0; i < count_of(b); i++)
+          if (has(a, at(b, i)))
+            return true;
+        return false;
+      }
+      const u64 *x = bits(a), *y = bits(b);
+      for (u32 i = 0; i < kWords; i++)
+        if (x[i] & y[i])
+          return true;
+      return false;
+    };
     auto filter = [&](u64 s, u64 o, bool keep) { // Positions of s (not) in o.
       u64 out = 0, k = 0;
       for (u32 i = 0; i < count_of(s); i++)
@@ -516,6 +557,8 @@ struct Engine {
         if (q + 4 < n)
           _mm_prefetch((const char *)&w.state[bools[list[q + 4]].term[0]], _MM_HINT_T0);
         const Bool &b = bools[list[q]];
+        if (b.pair_b && !overlaps(w.state[b.pair_a], w.state[b.pair_b]))
+          continue;
         r = w.state[b.term[0]];
         for (u32 i = 1; i < b.n; i++) {
           u64 o = w.state[b.term[i]];
