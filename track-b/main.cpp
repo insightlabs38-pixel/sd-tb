@@ -436,6 +436,27 @@ struct Engine {
   // word w weighs 64w + 8j per set bit, plus each bit's offset in the byte.
   void add_bits(Worker &w, u32 b, const u64 *x, u32 base) {
     u32 q = bools[b].query;
+    // Sparse bitmap results are cheaper to accumulate by enumerating bits.
+    u32 sparse = 0;
+    for (u32 i = 0; i < kWords && sparse <= 16; i++)
+      sparse += popcount(x[i]);
+    if (sparse <= 16) {
+      u32 ids[10], count = 0;
+      u64 sum = 0;
+      for (u32 i = 0; i < kWords; i++)
+        for (u64 v = x[i]; v; v &= v - 1) {
+          u32 id = base + 64 * i + countr_zero(v);
+          sum += id;
+          if (count < 10)
+            ids[count] = id;
+          count++;
+        }
+      if (!count)
+        return;
+      w.totals[b] += (u64(count) << 35) + sum;
+      offer(q, ids, min(count, 10u));
+      return;
+    }
     auto shuffle = [](B32 t, B32 i) { return (B32)_mm256_shuffle_epi8(__m256i(t), __m256i(i)); };
     auto sad = [](B32 v) { return (Q4)_mm256_sad_epu8(__m256i(v), __m256i{}); };
     const B32 pop = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
