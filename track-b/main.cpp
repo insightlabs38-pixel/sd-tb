@@ -585,19 +585,19 @@ struct Engine {
   void flush(Worker &w, u32 base) {
     while (!planned.load(memory_order_acquire))
       this_thread::yield();
-    for (u32 i = 1; i <= hot; i++)
-      if (any_of(&w.rows[i * kWords], &w.rows[i * kWords + kWords],
-                 [](u64 x) { return x; }))
-        w.state[i] = i, w.touched.push_back(i);
+    // Hot rows are marked on first write, avoiding a full row scan.
     for (u32 c : w.touched)
       for (u32 k = guards[c]; k < guards[c + 1]; k++)
         w.pending[guarded[k] / 64] |= u64(1) << guarded[k] % 64;
     evaluate(w, base);
-    for (u32 c : w.touched)
+    for (u32 c : w.touched) {
       w.state[c] = 0;
+      if (c <= hot)
+        fill_n(w.rows.data() + c * kWords, kWords, 0);
+    }
     w.touched.clear();
     w.rows.resize((hot + 1) * kWords);
-    fill(w.rows.begin(), w.rows.end(), 0);
+    fill_n(w.rows.data(), kWords, 0);
   }
 
   // Marks the document's terms in block slot `slot` and matches its phrases.
@@ -644,6 +644,10 @@ struct Engine {
       u64 m = keys[k];
       u32 col = m >> 20 & 0xfffff;
       rows[(col & -u32(col <= hot)) * kWords + word] |= bit; // Cold: row 0.
+      if (col && col <= hot && !w.state[col]) {
+        w.state[col] = col;
+        w.touched.push_back(col);
+      }
       colds[cold] = col;
       cold += col > hot;
       if (m >> 40)
