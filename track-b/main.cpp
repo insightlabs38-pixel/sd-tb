@@ -638,8 +638,7 @@ struct Engine {
     u32 bucket[lookahead];
     for (u32 k = 0; k < min(count, lookahead); k++) {
       bucket[k] = hash_of(keys[k]) & dict.mask();
-      if (keys[k])
-        _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
+      _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
     }
     const u32 hot = this->hot;
     u32 *colds = w.cold.data();
@@ -649,11 +648,9 @@ struct Engine {
       if (k + lookahead < count) {
         u32 next = hash_of(keys[k + lookahead]) & dict.mask();
         bucket[k % lookahead] = next;
-        if (keys[k + lookahead])
-          _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
+        _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
-      if (keys[k])
-        keys[k] = dict.find(text + e[2 * k], keys[k], at);
+      keys[k] = dict.find(text + e[2 * k], keys[k], at);
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
