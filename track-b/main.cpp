@@ -557,7 +557,7 @@ struct Engine {
         if (q + 4 < n)
           _mm_prefetch((const char *)&w.state[bools[list[q + 4]].term[0]], _MM_HINT_T0);
         const Bool &b = bools[list[q]];
-        if (b.pair_b && !overlaps(w.state[b.pair_a], w.state[b.pair_b]))
+        if (b.n > 2 && b.pair_b && !overlaps(w.state[b.pair_a], w.state[b.pair_b]))
           continue;
         r = w.state[b.term[0]];
         for (u32 i = 1; i < b.n; i++) {
