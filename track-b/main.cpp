@@ -48,10 +48,22 @@ static const char *map_file(const string &path, size_t &size) {
 
 // Runs f(0), ..., f(n - 1) on n threads and rethrows the first failure.
 template <class F> static void parallel(u32 n, F &&f) {
+  cpu_set_t allowed;
+  vector<int> cpus;
+  if (!sched_getaffinity(0, sizeof allowed, &allowed))
+    for (int c = 0; c < CPU_SETSIZE; c++)
+      if (CPU_ISSET(c, &allowed))
+        cpus.push_back(c);
   vector<exception_ptr> errors(n);
   vector<thread> pool;
   for (u32 i = 0; i < n; i++)
     pool.emplace_back([&, i] {
+      if (i < cpus.size()) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(cpus[i], &one);
+        sched_setaffinity(0, sizeof one, &one);
+      }
       try {
         f(i);
       } catch (...) {
