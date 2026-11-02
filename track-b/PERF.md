@@ -487,3 +487,11 @@ Decision: focus architecture experiments on dictionary lookup, term evidence, an
 ## Hot-column-only bitmap stores (rejected, November 2)
 
 [Three-full-seed, five-repeat paired CI 41430373256](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41430373256) passed published/independent full hashes, sample/tiny, differential/adversarial, ASan/UBSan, TSan and pinned offline Docker. Skipping the unused row-zero write for absent and cold terms added a per-token branch, regressing runner-local K on all three seeds: **0.961714 / 0.966981 / 0.966205**, geometric mean **0.964964 (-3.5036%)**. Candidate S=696 vs champion S=695, D=1. Median T seed 1 **0.311339 vs 0.288080 s**, seed 2 **0.309453 vs 0.289479 s**, seed 3 **0.309707 vs 0.289252 s**. Reject draft PR #31; retain champion source blob `6450d009a5d07f719f3678becea49d89b136737a`. These are runner-local, not official board results.
+
+## Sparse bitmap accumulation (rejected, November 2)
+
+[Three-seed, five-repeat paired qualification 41435749867](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41435749867) passed published full seed-1 and independent full seed-2/3 hashes, differential/adversarial tests, ASan/UBSan, TSan and pinned offline Docker. A scalar path enumerating up to 16 bitmap hits before the SIMD accumulator regressed runner-local K on all three seeds: **0.969767 / 0.963426 / 0.959640**, geometric mean **0.964269 (-3.5731%)**. Candidate S=715 versus champion S=695, D=1. Reject branch `track-b/sparse-bitmap-11`; the SIMD accumulator remains superior. Runner-local results, not official board scores.
+
+## 1536-document block qualification (not promoted, November 2)
+
+[Three-seed, five-repeat paired qualification 41436267143](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41436267143) passed the same full exactness, differential/adversarial, sanitizer and pinned offline Docker gates. Reducing the block from 2,048 to 1,536 documents produced runner-local K ratios **0.999986 / 1.000096 / 1.005261**, geometric mean **1.001778 (+0.1778%)**. S=695 and D=1 unchanged; median T for seed 1 was **0.316983 versus 0.316974 s**, seed 2 **0.327413 versus 0.327476 s**, seed 3 **0.302362 versus 0.305551 s**. The tiny, seed-dependent advantage is below a reliable promotion threshold; preserve 2,048-document champion. No official board score claimed.
