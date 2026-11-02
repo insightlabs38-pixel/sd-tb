@@ -641,8 +641,12 @@ struct Engine {
     constexpr u32 lookahead = 8;
     u32 bucket[lookahead];
     for (u32 k = 0; k < min(count, lookahead); k++) {
-      bucket[k] = hash_of(keys[k]) & dict.mask();
-      _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
+      if (e[2 * k + 1] - e[2 * k] <= 3)
+        bucket[k] = 0;
+      else {
+        bucket[k] = hash_of(keys[k]) & dict.mask();
+        _mm_prefetch((const char *)&dict.buckets[bucket[k]], _MM_HINT_T0);
+      }
     }
     const u32 hot = this->hot;
     u32 *colds = w.cold.data();
@@ -650,9 +654,14 @@ struct Engine {
     for (u32 k = 0; k < count; k++) { // Keys become metadata words in place.
       u32 at = bucket[k % lookahead];
       if (k + lookahead < count) {
-        u32 next = hash_of(keys[k + lookahead]) & dict.mask();
-        bucket[k % lookahead] = next;
-        _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
+        u32 next = k + lookahead;
+        if (e[2 * next + 1] - e[2 * next] <= 3)
+          bucket[k % lookahead] = 0;
+        else {
+          u32 b = hash_of(keys[next]) & dict.mask();
+          bucket[k % lookahead] = b;
+          _mm_prefetch((const char *)&dict.buckets[b], _MM_HINT_T0);
+        }
       }
       u32 len = e[2 * k + 1] - e[2 * k];
       keys[k] = len <= 3 ? short_meta[short_code(text + e[2 * k], len)]
