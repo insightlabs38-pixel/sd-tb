@@ -155,7 +155,9 @@ struct Dictionary {
     u32 m = match(b, key);
     if (__builtin_expect((key >> 62 == 2) | (!m & (b.key[3] != 0)), 0))
       return find_slow(p, key);
-    return metadata[bucket][countr_zero(m) & 3] & -u64(m != 0);
+    if (!m)
+      return 0;
+    return metadata[bucket][countr_zero(m)];
   }
   u64 find_slow(const char *p, u64 key) const {
     for (u32 i = hash_of(key);; i++) {
