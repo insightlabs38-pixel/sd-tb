@@ -129,6 +129,15 @@ static u64 key_of(const char *p, size_t n) {
   return 2ull << 62 | h;
 }
 static u32 hash_of(u64 key) { return _mm_crc32_u64(0, key); }
+// Collision-free direct code for one- and two-byte ASCII query terms.
+static u32 short_code(const char *p, u32 n) {
+  auto digit = [](unsigned char c) -> u32 {
+    c |= 32;
+    return c >= 'a' ? c - 'a' + 11 : c - '0' + 1;
+  };
+  u32 a = digit(p[0]);
+  return n == 1 ? a : 37 * a + digit(p[1]);
+}
 
 // Query terms in four-way buckets. Metadata holds the term ID in bits 0-19, the
 // Boolean column in bits 20-39 and the phrase head plus one above.
@@ -231,6 +240,7 @@ struct Worker {
 
 struct Engine {
   Dictionary dict;
+  u64 short_meta[1369] = {};
   vector<Bool> bools;
   vector<Phrase> phrases;
   u32 queries = 0, hot = 0, cols = 1;
@@ -374,8 +384,13 @@ struct Engine {
     }
     for (auto &b : dict.buckets)
       for (u64 &m : b.meta)
-        if (m)
-          m |= u64(column[m]) << 20 | u64(head[m] + 1) << 40;
+        if (m) {
+          m |= u64(column[m]) << 20 | u64(head[m & 0xfffff] + 1) << 40;
+          const char *word = dict.words[m & 0xfffff];
+          u32 n = token_length(word);
+          if (n <= 2)
+            short_meta[short_code(word, n)] = m;
+        }
   }
 
   // An answer lies within S(t_j) and the OR terms after j, for t_1 and every
@@ -638,7 +653,9 @@ struct Engine {
         bucket[k % lookahead] = next;
         _mm_prefetch((const char *)&dict.buckets[next], _MM_HINT_T0);
       }
-      keys[k] = dict.find(text + e[2 * k], keys[k], at);
+      u32 len = e[2 * k + 1] - e[2 * k];
+      keys[k] = len <= 2 ? short_meta[short_code(text + e[2 * k], len)]
+                         : dict.find(text + e[2 * k], keys[k], at);
     }
     for (u32 k = 0; k < count; k++) {
       u64 m = keys[k];
