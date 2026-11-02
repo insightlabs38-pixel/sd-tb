@@ -397,3 +397,9 @@ Projected box K against BEST 26.690516 (S 691, M saturated): 30.3 if T equals th
 ## SIMD Boolean bitmap confirmation (not promoted, November 1)
 
 [Five-full-seed, seven-repeat confirmation 41356303092](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41356303092) passed published/independent full hashes, sample/tiny, differential/adversarial tests, ASan/UBSan, TSan and pinned offline Docker. Candidate/champion runner-local K ratios: **1.002844 / 1.003496 / 0.998426 / 1.001326 / 1.002824**, geometric mean **1.001782 (+0.1782%)**, four wins and one loss. Candidate S=702 versus champion S=695, D=1. This is a marginal, noise-sensitive advantage, inconsistent with the larger three-seed estimate; do not promote without stronger evidence. Preserve champion source blob `6450d009a5d07f719f3678becea49d89b136737a`. No official board result claimed.
+
+## Fused dictionary/evidence and L2 prefetch (rejected, November 2)
+
+[Three-seed, five-repeat fused-evidence qualification 41361075676](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41361075676) passed exact full hashes, differential/adversarial tests, ASan/UBSan, TSan and pinned offline Docker. Candidate/champion paired runner-local K ratios **0.967922 / 0.976948 / 0.975600**, geometric mean **0.97348 (-2.652%)**. S=692 vs 695, D=1; median seed-1 T 0.320943 vs 0.300293 s. Reject PR #17.
+
+[Three-seed, five-repeat L2-prefetch qualification 41361269833](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41361269833) passed the same gates. Candidate/champion runner-local K ratios **0.989878 / 0.990545 / 0.995475**, geometric mean **0.99196 (-0.804%)**. S=695 for both, D=1; median seed-1 T 0.240753 vs 0.235904 s. Reject PR #18. Runner-local results are not official box scores. Preserve champion source blob `6450d009a5d07f719f3678becea49d89b136737a`.
