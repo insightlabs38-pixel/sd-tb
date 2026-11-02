@@ -455,3 +455,11 @@ Decision: focus architecture experiments on dictionary lookup, term evidence, an
 ## GCC loop unrolling (rejected, November 2)
 
 [Three-full-seed, five-repeat paired CI 41421146296](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41421146296) passed the same exactness, adversarial, sanitizer and pinned offline Docker gates. Adding `-funroll-loops` to the production GCC build regressed runner-local K on all three seeds: **0.990595 / 0.988074 / 0.996604**, geometric mean **0.991751 (-0.8249%)**. S=695 and D=1 unchanged; seed-1 median T rose from **0.247297 s to 0.252015 s**. Reject the compiler challenger and preserve the promoted `-mtune=alderlake` Dockerfile. These measurements are GitHub-runner evidence, not official board scores.
+
+## Fused token-boundary/key emission (rejected, November 2)
+
+[Three-full-seed, five-repeat paired CI 41423845338](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41423845338) passed published/independent full hashes, sample/tiny, differential/adversarial, ASan/UBSan, TSan and pinned offline Docker. Interleaving SIMD token-edge extraction with short-key emission reduced the separate token-key pass but regressed runner-local K on all three seeds: **0.978046 / 0.981042 / 0.990983**, geometric mean **0.983341 (-1.6659%)**. Candidate S=721 versus champion 695, D=1. Seed-1 median T was **0.314896 versus 0.304559 s**. Reject challenger source blob `573ee4478f348f2c766418c98dfd8caefb63d2da`; preserve champion blob `6450d009a5d07f719f3678becea49d89b136737a`.
+
+## Fused cold-term evidence (rejected, November 2)
+
+[Three-full-seed, five-repeat paired CI 41423982744](https://github.com/insightlabs38-pixel/sd-tb/actions/runs/41423982744) passed the same exactness, sanitizer and Docker gates. Moving cold-column state updates into the metadata loop removed the cold-list pass but regressed runner-local K on all three seeds: **0.972773 / 0.975529 / 0.981705**, geometric mean **0.976662 (-2.3338%)**. Candidate S=692 versus champion 695, D=1. Seed-1 median T was **0.248111 versus 0.234479 s**. Reject challenger source blob `30b53724057225c29bf6959577dd815e921b8aaa`; preserve champion blob `6450d009a5d07f719f3678becea49d89b136737a`. Both comparisons are GitHub-runner measurements, not official board scores.
