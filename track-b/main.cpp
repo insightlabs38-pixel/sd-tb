@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <charconv>
@@ -133,10 +134,11 @@ static u32 hash_of(u64 key) { return _mm_crc32_u64(0, key); }
 // Query terms in four-way buckets. Metadata holds the term ID in bits 0-19, the
 // Boolean column in bits 20-39 and the phrase head plus one above.
 struct Dictionary {
-  struct alignas(64) Bucket {
-    u64 key[4], meta[4];
+  struct alignas(32) Bucket {
+    u64 key[4];
   };
   vector<Bucket> buckets = vector<Bucket>(1024);
+  vector<array<u64, 4>> metadata = vector<array<u64, 4>>(1024);
   vector<const char *> words;
   u32 mask() const { return buckets.size() - 1; }
   static u32 match(const Bucket &b, u64 key) {
@@ -153,14 +155,15 @@ struct Dictionary {
     u32 m = match(b, key);
     if (__builtin_expect((key >> 62 == 2) | (!m & (b.key[3] != 0)), 0))
       return find_slow(p, key);
-    return b.meta[countr_zero(m) & 3] & -u64(m != 0);
+    return metadata[bucket][countr_zero(m) & 3] & -u64(m != 0);
   }
   u64 find_slow(const char *p, u64 key) const {
     for (u32 i = hash_of(key);; i++) {
       const Bucket &b = buckets[i & mask()];
+      const auto &meta = metadata[i & mask()];
       for (u32 m = match(b, key); m; m &= m - 1)
-        if (key >> 62 != 2 || same(b.meta[countr_zero(m)], p))
-          return b.meta[countr_zero(m)];
+        if (key >> 62 != 2 || same(meta[countr_zero(m)], p))
+          return meta[countr_zero(m)];
       if (!b.key[3])
         return 0;
     }
@@ -176,7 +179,7 @@ struct Dictionary {
   u32 intern(const char *p, u64 key, u32 &next) {
     for (u32 i = hash_of(key), j = 0;; j = (j + 1) % 4, i += !j) {
       Bucket &b = buckets[i & mask()];
-      atomic_ref<u64> slot(b.key[j]), meta(b.meta[j]);
+      atomic_ref<u64> slot(b.key[j]), meta(metadata[i & mask()][j]);
       u64 seen = slot.load(memory_order_acquire), id;
       if (!seen && slot.compare_exchange_strong(seen, key)) {
         words[id = next++] = p;
@@ -298,6 +301,7 @@ struct Engine {
     if (first_id[workers] >= 1 << 20)
       throw runtime_error("too many query terms");
     dict.buckets.resize(bit_ceil(first_id[workers] / 4 + 1024));
+    dict.metadata.resize(dict.buckets.size());
     dict.words.resize(first_id[workers]);
     bools.resize(nb[workers]), phrases.resize(np[workers]);
     queries = nq[workers];
@@ -372,8 +376,8 @@ struct Engine {
           f.anchor = i;
       f.next = exchange(head[f.term[f.anchor]], k);
     }
-    for (auto &b : dict.buckets)
-      for (u64 &m : b.meta)
+    for (auto &row : dict.metadata)
+      for (u64 &m : row)
         if (m)
           m |= u64(column[m]) << 20 | u64(head[m] + 1) << 40;
   }
