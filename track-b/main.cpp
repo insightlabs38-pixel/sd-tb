@@ -501,9 +501,16 @@ struct Engine {
         u64 &x = v[at(o, j) / 64], bit = u64(1) << at(o, j) % 64;
         x = op == 'O' ? x | bit : x & ~bit;
       }
-      for (u32 j = 0; !count_of(o) && j < kWords; j++) {
-        u64 x = rows[o * kWords + j];
-        v[j] = op == 'O' ? v[j] | x : op == 'A' ? v[j] & x : v[j] & ~x;
+      if (!count_of(o)) {
+        const u64 *src = rows + o * kWords;
+        for (u32 j = 0; j < kWords; j += 4) {
+          __m256i a = _mm256_loadu_si256((const __m256i *)(v + j));
+          __m256i b = _mm256_loadu_si256((const __m256i *)(src + j));
+          __m256i z = op == 'O' ? _mm256_or_si256(a, b)
+                      : op == 'A' ? _mm256_and_si256(a, b)
+                                  : _mm256_andnot_si256(b, a);
+          _mm256_storeu_si256((__m256i *)(v + j), z);
+        }
       }
     };
     for (u32 word = 0; word < w.pending.size(); word++) {
